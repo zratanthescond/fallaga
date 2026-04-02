@@ -1,0 +1,12 @@
+﻿Microsoft (R) Build Engine version 16.11.2+f32259642 pour .NET Framework
+Copyright (C) Microsoft Corporation. Tous droits réservés.
+
+  Camera.cpp
+  Character.cpp
+  Game.cpp
+C:\Users\honco\OneDrive\Bureau\fallaga\src\Game.cpp(141,20): warning C4244: 'initialisation' : conversion de 'double' en 'float', perte possible de données [C:\Users\honco\OneDrive\Bureau\fallaga\build\RDR2_Prototype.vcxproj]
+  Horse.cpp
+  Terrain.cpp
+  main.cpp
+  Génération de code en cours...
+  RDR2_Prototype.vcxproj -> C:\Users\honco\OneDrive\Bureau\fallaga\build\Release\RDR2_Prototype.exe

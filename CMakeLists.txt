@@ -8,6 +8,7 @@ find_package(OpenGL REQUIRED)
 find_package(GLEW REQUIRED)
 find_package(glfw3 CONFIG REQUIRED)   # <- Switch to GLFW
 find_package(glut REQUIRED)  # FreeGLUT
+find_package(assimp CONFIG REQUIRED)
 # Add source files
 add_executable(RDR2_Prototype
     src/main.cpp
@@ -15,8 +16,12 @@ add_executable(RDR2_Prototype
     src/Character.cpp
     src/Horse.cpp
     src/Terrain.cpp
+    src/HeightmapTerrain.cpp
     src/Camera.cpp
     src/ObjectModel.cpp
+    src/AnimatedModel.cpp
+    src/Sky.cpp
+    src/TerrainData.cpp
 )
 
 # Include directories
@@ -32,4 +37,5 @@ target_link_libraries(RDR2_Prototype
         GLEW::GLEW
         glfw
          GLUT::GLUT
+        assimp::assimp
 )

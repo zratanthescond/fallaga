@@ -1,0 +1,99 @@
+﻿Found assets directory! Working directory set.
+WARNING: No Diffuse texture found for mesh material index: 0
+Successfully loaded animation: FastRun
+Successfully loaded animation: RideHorse
+Successfully loaded animation: Idle
+Successfully loaded animation: Walking
+.\build\Release\RDR2_P
+rototype.exe : ERROR: 
+Animation file assets/
+character/rideIdle.fbx
+ contains no 
+animation data.
+Au caractère Ligne:1 
+: 1
++ .\build\Release\RDR2
+_Prototype.exe > 
+output.txt 2>&1
++ ~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~
+    + CategoryInfo    
+          : NotSpeci  
+  fied: (ERROR: Ani   
+ matio...animation    
+ data.:String) []    
+, RemoteException
+    + FullyQualifiedE 
+   rrorId : NativeCo  
+  mmandError
+ 
+Trying to load model with Assimp: assets/Tree_02/Tree.obj
+Calling Assimp::Importer::ReadFile...
+Assimp::Importer::ReadFile finished.
+Processing materials...
+Texture loaded successfully: assets/Tree_02/bark_0004.jpg
+Texture loaded successfully: assets/Tree_02/DB2X2_L01.png
+Materials processed.
+Processing nodes...
+Nodes processed.
+Successfully loaded model with Assimp. Total meshes: 2
+Trying to load model with Assimp: assets/Rock1/Rock1.obj
+Calling Assimp::Importer::ReadFile...
+Assimp::Importer::ReadFile finished.
+Processing materials...
+Texture loaded successfully: assets/Rock1/Rock-Texture-Surface.jpg
+Materials processed.
+Processing nodes...
+Nodes processed.
+Successfully loaded model with Assimp. Total meshes: 1
+Setting up Terrain Grid (this may take a while with large OBJ)...
+Generating Lague Terrain: 0%
+Generating Lague Terrain: 6%
+Generating Lague Terrain: 12%
+Generating Lague Terrain: 18%
+Generating Lague Terrain: 25%
+Generating Lague Terrain: 31%
+Generating Lague Terrain: 37%
+Generating Lague Terrain: 43%
+Generating Lague Terrain: 50%
+Generating Lague Terrain: 56%
+Generating Lague Terrain: 62%
+Generating Lague Terrain: 68%
+Generating Lague Terrain: 75%
+Generating Lague Terrain: 81%
+Generating Lague Terrain: 87%
+Generating Lague Terrain: 93%
+Generating Lague Terrain: 100%
+Terrain Grid setup complete.
+
+=== TERRAIN ZONE MAP (Ascii) ===
+Map Legend: . = Sea, # = Beach, M = Medina, P = Port, _ = Plain
+    -500 -400 -300 -200 -100    0  100  200  300  400  500  600  700  800  900 1000 1100 1200 1300 1400 1500 
+1000 _    _    _    _    _    _    V    _    _    _    d    d    #    .    .    .    .    .    .    .    .    
+ 900 _    _    _    _    G    V    G    G    G    G    G    #    #    .    .    .    .    .    .    .    .    
+ 800 _    _    G    G    G    V    G    G    G    G    G    #    .    .    .    .    .    .    .    .    .    
+ 700 G    G    G    G    V    G    G    G    G    G    #    #    .    .    .    .    .    .    .    .    .    
+ 600 G    G    G    V    G    G    G    G    G    #    #    .    .    .    .    .    .    .    .    .    .    
+ 500 G    G    G    V    G    G    G    G    G    #    P    P    P    P    P    P    P    P    .    .    .    
+ 400 G    G    V    G    G    G    G    G    G    #    .    .    .    .    .    .    .    .    .    .    .    
+ 300 G    G    V    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    P    .    .    
+ 200 G    V    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    .    .    .    
+ 100 G    V    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    .    P    .    
+   0 G    V    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    .    .    .    
+-100 V    V    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    .    P    .    
+-200 V    G    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    .    .    .    
+-300 V    G    G    M    M    M    M    M    #    .    .    .    .    .    .    .    .    .    P    .    .    
+-400 V    G    G    G    G    G    G    G    G    #    .    .    .    .    .    .    .    .    .    .    .    
+-500 V    G    G    G    G    G    G    G    G    #    P    P    P    P    P    P    P    P    .    .    .    
+-600 V    G    G    G    G    G    G    G    G    G    #    .    .    .    .    .    .    .    .    .    .    
+-700 V    V    G    G    G    G    G    G    G    G    #    #    .    .    .    .    .    .    .    .    .    
+-800 _    V    G    G    G    G    G    G    G    G    G    #    .    .    .    .    .    .    .    .    .    
+-900 H    H    V    G    G    G    G    G    G    G    G    G    #    .    .    .    .    .    .    .    .    
+-1000 H    H    H    V    _    _    _    _    _    _    d    d    #    .    .    .    .    .    .    .    .    
+================================
+
+WARNING: No Diffuse texture found for mesh material index: 0
+Successfully loaded animation: Idle
+Successfully loaded animation: Walk
+Successfully loaded animation: Run
