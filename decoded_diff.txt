@@ -1,0 +1,350 @@
+diff --git a/src/Character.cpp b/src/Character.cpp
+index de259bf..ede7fc8 100644
+--- a/src/Character.cpp
++++ b/src/Character.cpp
+@@ -14,9 +14,12 @@
+ #include "Shader.h" 
+ #include "Horse.h" // N├®cessaire pour les appels de monture
+ #include "PhysicsSystem.h" 
++#include "Weapon.h"
+ 
+-// Supprimer le commentaire sur les variables globales, car elles sont bien d├®finies dans Character.h
+-
++const float MAX_SPEED = 15.0f;
++const float ACCELERATION = 50.0f;
++const float DAMPING = 5.0f;
++const float ROTATION_SPEED = 5.0f;
+ Character::Character() {
+     position = Vec3(-435.0f, 0.0f, 1315.0f); // Spawn at the corrected train station location
+     velocity = Vec3(0, 0, 0);  // CRITICAL: Initialize velocity to zero
+@@ -88,7 +91,7 @@ Vec3 Character::getRight() const {
+ /**
+  * @brief Updates character position, rotation, and animation state.
+  */
+-void Character::update(Camera* camera, float deltaTime, Terrain* terrain) {
++void Character::update(Camera* camera, float deltaTime, Terrain* terrain, float time, ParticleSystem* particleSystem) {
+ 
+     // --- LOGIQUE DE MONTURE (EXISTING) ---
+     // ... (Keep existing mount logic) ... 
+@@ -110,7 +113,7 @@ void Character::update(Camera* camera, float deltaTime, Terrain* terrain) {
+         
+         // Le cheval prend le contr├┤le du mouvement
+         if (m_MountedHorse) {
+-            m_MountedHorse->updateMovement(camera, deltaTime, terrain); 
++            m_MountedHorse->updateMovement(camera, deltaTime, terrain, time); 
+         }
+         
+         // Ô¡É CRITICAL FIX: Update the character's animation while mounted.
+@@ -271,45 +274,125 @@ void Character::update(Camera* camera, float deltaTime, Terrain* terrain) {
+             }
+         }
+         
+-        m_CurrentAnim = animName;
+-        ((AnimatedModel*)model)->updateAnimation(animName, deltaTime);
++        if (m_CurrentAnim != animName) {
++            ((AnimatedModel*)model)->updateAnimation(animName, 0.0f);
++            m_CurrentAnim = animName;
++        } else {
++            ((AnimatedModel*)model)->updateAnimation(animName, deltaTime);
++        }
++    }
++    // Weapon logic
++    if (weaponManager && m_IsWeaponDrawn) {
++        if (m_MuzzleFlashTimer > 0.0f) {
++            m_MuzzleFlashTimer -= deltaTime;
++        }
++        if (m_WeaponKickback > 0.0f) {
++            m_WeaponKickback -= deltaTime * 10.0f; // Quick recovery
++            if (m_WeaponKickback < 0.0f) m_WeaponKickback = 0.0f;
++        }
++        
++        if (keys[(int)' ']) { // Spacebar to shoot for testing
++            if (m_FireTimer <= 0.0f) {
++                // Shoot!
++                m_FireTimer = 0.1f; // 10 shots per second
++                m_MuzzleFlashTimer = 0.05f;
++                m_WeaponKickback = 0.5f;
++                if (camera) {
++                    camera->applyRecoil(1.0f, 0.5f);
++                }
++            }
++        }
++        if (m_FireTimer > 0.0f) {
++            m_FireTimer -= deltaTime;
++        }
++        
++        if (keys['r'] || keys['R']) {
++            m_IsReloading = true;
++        } else {
++            m_IsReloading = false; // Just for testing
++        }
+     }
+ }
+ 
+-void Character::render(const glm::mat4& projection, const glm::mat4& view) {
+-    // ... (Rendu inchang├®)
++void Character::render(const glm::mat4 &projection, const glm::mat4 &view, 
++                       const glm::vec3& lightDir, const glm::vec3& lightColor, Camera* camera) {
+     if (!model || !characterShader) return;
+ 
+-    // 1. Calculate Model Matrix
+-    glm::mat4 modelMatrix = glm::mat4(1.0f);
+-    glm::vec3 characterPos(position.x, position.y, position.z);
+-    
+-    // Apply translation
+-    modelMatrix = glm::translate(modelMatrix, characterPos);
+-    
+-    // Apply Rotation (from Step 3 in update)
++    glm::vec3 upVec = (m_isDriving) ? glm::vec3(0, 1, 0) : m_TerrainNormal;
++    if (glm::length(upVec) < 0.001f) upVec = glm::vec3(0, 1, 0);
++
++    glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), glm::vec3(position.x, position.y, position.z));
+     if (m_RotationAngle != 0.0f && glm::length(m_ForwardDirection) > 0.0f) {
+-        // Rotate around the rotation axis by the calculated angle
+         modelMatrix = glm::rotate(modelMatrix, m_RotationAngle, m_ForwardDirection);
+     }
+-    
+-    // Apply uniform scaling (Adjust scaleFactor as needed for your model)
+-    float scaleFactor = 0.01f; 
+-    modelMatrix = glm::scale(modelMatrix, glm::vec3(scaleFactor)); 
+-    
+-    // 2. Activate the character's shader
+-    characterShader->use();
++    modelMatrix = glm::rotate(modelMatrix, glm::radians(-90.0f), glm::vec3(1, 0, 0));
++    modelMatrix = glm::scale(modelMatrix, glm::vec3(0.01f)); 
+ 
+-    // 3. Set the standard matrices (Projection, View, Model) as uniforms
++    characterShader->use();
+     characterShader->setMat4("projection", projection);
+     characterShader->setMat4("view", view);
+     characterShader->setMat4("model", modelMatrix); 
++    characterShader->setVec3("lightDir", lightDir);
++    characterShader->setVec3("lightColor", lightColor);
++    
++    if (camera) {
++        Vec3 camPos = camera->getPosition();
++        characterShader->setVec3("viewPos", glm::vec3(camPos.x, camPos.y, camPos.z));
++    }
+     
+-    // 4. Pass the calculated bone matrices
+     ((AnimatedModel*)model)->setBoneUniforms(*characterShader);
+-
+-    // 5. Draw the animated mesh
+     ((AnimatedModel*)model)->draw();
++
++    // Render Weapon
++    if (m_IsWeaponDrawn && weaponManager && weaponManager->getCurrentWeapon()) {
++        Weapon *weapon = weaponManager->getCurrentWeapon();
++        if (weapon->model) {
++            glm::mat4 weaponModelMatrix = getWeaponModelMatrix(true);
++
++            weaponShader->use();
++            weaponShader->setMat4("projection", projection);
++            weaponShader->setMat4("view", view);
++            weaponShader->setMat4("model", weaponModelMatrix);
++            weaponShader->setBool("isInstanced", false);
++            weaponShader->setBool("deformToTerrain", false);
++            weaponShader->setVec3("lightDir", lightDir);
++            if (camera) {
++                Vec3 camPos = camera->getPosition();
++                weaponShader->setVec3("viewPos", glm::vec3(camPos.x, camPos.y, camPos.z));
++            }
++            
++            glm::vec3 finalLightColor = lightColor;
++            if (m_MuzzleFlashTimer > 0.0f) {
++                finalLightColor = glm::vec3(5.0f, 4.0f, 2.0f); // Bright Flash
++            }
++            weaponShader->setVec3("lightColor", finalLightColor);
++
++            for (int i = 0; i < weapon->model->getMeshCount(); i++) {
++                std::string meshName = weapon->model->getMeshName(i);
++                std::string lowerName = meshName;
++                std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
++                
++                bool isLoader = (lowerName.find("loader") != std::string::npos || lowerName.find("magazine") != std::string::npos || lowerName.find("mag") != std::string::npos);
++
++                if (isLoader && m_IsReloading) {
++                    glm::mat4 leftHandTransform = ((AnimatedModel*)model)->getBoneWorldTransform("mixamorig:LeftHand");
++                    if (leftHandTransform == glm::mat4(1.0f)) {
++                        leftHandTransform = ((AnimatedModel*)model)->getBoneWorldTransform("LeftHand"); 
++                    }
++                    
++                    glm::mat4 weaponScale = glm::scale(glm::mat4(1.0f), weapon->scaleOffset);
++                    glm::mat4 loaderOffset = glm::translate(glm::mat4(1.0f), glm::vec3(-10.0f, 0.0f, 0.0f)); 
++                    glm::mat4 loaderMatrix = modelMatrix * leftHandTransform * loaderOffset * weaponScale; 
++                    
++                    weaponShader->setMat4("model", loaderMatrix);
++                    weapon->model->renderMesh(i, *weaponShader);
++                    weaponShader->setMat4("model", weaponModelMatrix);
++                } else {
++                    weapon->model->renderMesh(i, *weaponShader);
++                }
++            }
++        }
++    }
+ }
+ 
+ Shader& Character::getShader() {
+@@ -324,4 +407,160 @@ void Character::keyUp(int key) {
+ }
+ 
+ 
+-// NOTE: La derni├¿re accolade '}' a ├®t├® supprim├®e de la fin du fichier pour ├®viter un double '}' si l'utilisateur l'avait mal plac├®e.
+\ No newline at end of file
++// NOTE: La derni├¿re accolade '}' a ├®t├® supprim├®e de la fin du fichier pour ├®viter un double '}' si l'utilisateur l'avait mal plac├®e.
++#include "Weapon.h"
++
++void Character::setMountedCar(Car *car) {
++    m_MountedCar = car;
++    m_isDriving = (car != nullptr);
++}
++void Character::startEnteringCar(Car *car) {
++    m_MountedCar = car;
++    m_isEnteringCar = true;
++}
++void Character::startExitingCar() {
++    m_isExitingCar = true;
++}
++void Character::setDrivingNpcCar(bool driving) {
++    m_isDrivingNpcCar = driving;
++}
++
++void Character::initWeapons() {
++    weaponManager = new WeaponManager();
++    weaponShader = new Shader("src/shaders/model.vert", "src/shaders/model.frag");
++    
++    // MP40
++    Weapon mp40;
++    mp40.model = new ObjModel("assets/guns/mp40/MP40.fbx");
++    mp40.positionOffset = glm::vec3(9.15002f, 4.55f, 0.7f);
++    mp40.rotationOffset = glm::vec3(290.0f, 340.0f, 270.0f);
++    mp40.scaleOffset = glm::vec3(0.5f, 0.5f, 0.5f);
++    mp40.name = "MP40 Submachine Gun";
++    mp40.fireRate = 0.1f;
++    mp40.recoilPitch = 0.5f;
++    mp40.recoilYawMin = -0.2f;
++    mp40.recoilYawMax = 0.2f;
++    mp40.recoilRecovery = 2.0f;
++    mp40.visualRecoilMult = 1.0f;
++    
++    mp40.poseOffsets["Idle"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["Walk"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["Run"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["Aim"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["EnterCar"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["ExitCar"] = { mp40.positionOffset, mp40.rotationOffset };
++    mp40.poseOffsets["Drive"] = { mp40.positionOffset, mp40.rotationOffset };
++    weaponManager->addWeapon(mp40);
++    
++    m_IsWeaponDrawn = true;
++}
++
++void Character::drawWeapon(bool draw) { m_IsWeaponDrawn = draw; }
++
++bool Character::isAiming() const {
++    auto it = keys.find((int)'2');
++    bool isRightClick = (it != keys.end() && it->second);
++    return m_IsWeaponDrawn && isRightClick; 
++}
++
++
++Vec3 Character::getRightHandLocalOffset() const {
++    return Vec3(0,0,0);
++}
++
++glm::mat4 Character::getWeaponModelMatrix(bool applyKickback) const {
++    glm::mat4 modelMatrix = glm::translate(glm::mat4(1.0f), glm::vec3(position.x, position.y, position.z));
++    if (m_RotationAngle != 0.0f && glm::length(m_ForwardDirection) > 0.0f) {
++        modelMatrix = glm::rotate(modelMatrix, m_RotationAngle, m_ForwardDirection);
++    }
++    modelMatrix = glm::rotate(modelMatrix, glm::radians(-90.0f), glm::vec3(1, 0, 0));
++    modelMatrix = glm::scale(modelMatrix, glm::vec3(0.01f));
++
++    glm::mat4 handTransform = ((AnimatedModel*)model)->getBoneWorldTransform("mixamorig:RightHand");
++    if (handTransform == glm::mat4(1.0f)) {
++        handTransform = ((AnimatedModel*)model)->getBoneWorldTransform("RightHand"); // Fallback
++    }
++    
++    Weapon *weapon = weaponManager->getCurrentWeapon();
++    glm::mat4 weaponModelMatrix = glm::mat4(1.0f);
++    
++    glm::mat4 weaponScale = glm::scale(glm::mat4(1.0f), weapon->scaleOffset);
++    
++    const aiNode* handleNode = weapon->model->findNode("weaponHandle");
++    if (handleNode) {
++        glm::mat4 handleTransform = weapon->model->getNodeAbsoluteTransform(handleNode);
++        glm::mat4 invHandle = glm::inverse(handleTransform);
++        
++        auto pose = weapon->poseOffsets.find(m_CurrentAnim);
++        glm::vec3 posOffsetVec = weapon->positionOffset;
++        glm::vec3 rotOffsetVec = weapon->rotationOffset;
++        if (pose != weapon->poseOffsets.end()) {
++            posOffsetVec = pose->second.positionOffset;
++            rotOffsetVec = pose->second.rotationOffset;
++        }
++        
++        if (applyKickback) {
++            rotOffsetVec.x += m_WeaponKickback * 20.0f;
++            posOffsetVec.z -= m_WeaponKickback * 1.5f;
++            posOffsetVec.y += m_WeaponKickback * 1.0f;
++        }
++        
++        glm::mat4 transOffset = glm::translate(glm::mat4(1.0f), posOffsetVec);
++        glm::mat4 rotOffset = glm::rotate(glm::mat4(1.0f), glm::radians(rotOffsetVec.x), glm::vec3(1, 0, 0));
++        rotOffset = glm::rotate(rotOffset, glm::radians(rotOffsetVec.y), glm::vec3(0, 1, 0));
++        rotOffset = glm::rotate(rotOffset, glm::radians(rotOffsetVec.z), glm::vec3(0, 0, 1));
++        
++        // Critical FIX from earlier: multiply invHandle *BEFORE* weaponScale
++        weaponModelMatrix = modelMatrix * handTransform * transOffset * rotOffset * weaponScale * invHandle;
++    } else {
++        // manual fallback
++        glm::mat4 transOffset = glm::translate(glm::mat4(1.0f), weapon->positionOffset);
++        glm::mat4 rotOffset = glm::rotate(glm::mat4(1.0f), glm::radians(weapon->rotationOffset.x), glm::vec3(1, 0, 0));
++        rotOffset = glm::rotate(rotOffset, glm::radians(weapon->rotationOffset.y), glm::vec3(0, 1, 0));
++        rotOffset = glm::rotate(rotOffset, glm::radians(weapon->rotationOffset.z), glm::vec3(0, 0, 1));
++        
++        weaponModelMatrix = modelMatrix * handTransform * transOffset * rotOffset * weaponScale;
++    }
++    
++    return weaponModelMatrix;
++}
++
++bool Character::getWeaponBarrelLine(glm::vec3& outMuzzleWorld, glm::vec3& outBarrelDir) {
++    if (!weaponManager || !weaponManager->getCurrentWeapon() || !weaponManager->getCurrentWeapon()->model) return false;
++    Weapon *weapon = weaponManager->getCurrentWeapon();
++    
++    glm::mat4 weaponModelMatrix = getWeaponModelMatrix(false);
++    
++    bool foundMuzzle = false;
++    glm::vec3 muzzleLocalCenter(0.0f);
++    for (int i = 0; i < weapon->model->getMeshCount(); i++) {
++        std::string meshName = weapon->model->getMeshName(i);
++        std::string lowerName = meshName;
++        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
++        if (lowerName.find("muzzle") != std::string::npos) {
++            muzzleLocalCenter = weapon->model->getMeshCenter(i);
++            foundMuzzle = true;
++            break;
++        }
++    }
++    
++    glm::vec4 muzzleLocal(1.0f);
++    glm::vec4 rearLocal(1.0f);
++    
++    if (foundMuzzle) {
++        muzzleLocal = glm::vec4(muzzleLocalCenter, 1.0f);
++        rearLocal = glm::vec4(muzzleLocalCenter.x, muzzleLocalCenter.y, muzzleLocalCenter.z - 20.0f, 1.0f);
++    } else {
++        float barrelX = -0.7f;
++        float barrelY = 45.3f;
++        muzzleLocal = glm::vec4(barrelX, barrelY, 57.76f, 1.0f);
++        rearLocal = glm::vec4(barrelX, barrelY, -20.0f, 1.0f);
++    }
++    
++    glm::vec4 muzzleWorld = weaponModelMatrix * muzzleLocal;
++    glm::vec4 rearWorld = weaponModelMatrix * rearLocal;
++    
++    outMuzzleWorld = glm::vec3(muzzleWorld);
++    outBarrelDir = glm::normalize(glm::vec3(muzzleWorld - rearWorld));
++    return true;
++}

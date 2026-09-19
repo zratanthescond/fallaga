@@ -1,0 +1,40 @@
+newmtl peach_plaster
+Kd 1.000 1.000 1.000
+Ka 0.200 0.200 0.200
+Ks 0.100 0.100 0.100
+Ns 10.0
+d 1.00
+map_Kd textures/peach_plaster.png
+
+newmtl awning_striped
+Kd 1.000 1.000 1.000
+Ka 0.200 0.200 0.200
+Ks 0.100 0.100 0.100
+Ns 10.0
+d 1.00
+map_Kd textures/awning_striped.png
+
+newmtl wood_shutter
+Kd 1.000 1.000 1.000
+Ka 0.200 0.200 0.200
+Ks 0.100 0.100 0.100
+Ns 10.0
+d 1.00
+map_Kd textures/wood_shutter.png
+
+newmtl cream_plaster
+Kd 1.000 1.000 1.000
+Ka 0.200 0.200 0.200
+Ks 0.100 0.100 0.100
+Ns 10.0
+d 1.00
+map_Kd textures/cream_plaster.png
+
+newmtl wrought_iron
+Kd 1.000 1.000 1.000
+Ka 0.200 0.200 0.200
+Ks 0.100 0.100 0.100
+Ns 10.0
+d 1.00
+map_Kd textures/wrought_iron.png
+

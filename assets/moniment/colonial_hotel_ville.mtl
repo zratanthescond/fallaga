@@ -1,0 +1,45 @@
+newmtl PlasterWall
+Ka 0.2 0.2 0.2
+Kd 0.9500 0.9300 0.8800
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/cream_plaster.png
+
+newmtl AshlarStone
+Ka 0.2 0.2 0.2
+Kd 0.8800 0.8500 0.8000
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/stone_blocks.png
+
+newmtl RoofTiles
+Ka 0.2 0.2 0.2
+Kd 0.8500 0.5000 0.3500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/roof_tile_red.png
+
+newmtl WoodShutters
+Ka 0.2 0.2 0.2
+Kd 0.4000 0.5500 0.5000
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/wood_shutter.png
+
+newmtl IronRailing
+Ka 0.2 0.2 0.2
+Kd 0.2000 0.2200 0.2500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/wrought_iron.png
+

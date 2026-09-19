@@ -1,0 +1,36 @@
+newmtl StoneBase
+Ka 0.2 0.2 0.2
+Kd 0.9000 0.8800 0.8500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/stone_blocks.png
+
+newmtl FloorWood
+Ka 0.2 0.2 0.2
+Kd 0.7000 0.6000 0.4500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/wood_shutter.png
+
+newmtl IronMetal
+Ka 0.2 0.2 0.2
+Kd 0.2000 0.2200 0.2500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/wrought_iron.png
+
+newmtl ZincRoof
+Ka 0.2 0.2 0.2
+Kd 0.8000 0.9000 0.8500
+Ks 0.1 0.1 0.1
+Ns 16.0
+d 1.0000
+illum 2
+map_Kd textures/kiosk_roof.png
+

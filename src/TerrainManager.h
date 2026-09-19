@@ -1,0 +1,47 @@
+#pragma once
+#include <vector>
+#include <string>
+#include <GL/glew.h>
+#include <glm/glm.hpp>
+#include "TerrainChunk.h"
+#include "Shader.h"
+
+class TerrainManager {
+public:
+    TerrainManager(const std::string& hmPath, const std::string& pmPath, float minX, float maxX, float minZ, float maxZ, float minH, float maxH);
+    ~TerrainManager();
+    void update(const glm::vec3& camPos);
+    void render(const glm::mat4& proj, const glm::mat4& view, const glm::vec3& camPos, const glm::vec3& lightDir, const glm::vec3& lightColor, float waterLevel, const glm::vec4& clipPlane = glm::vec4(0.0f, -1.0f, 0.0f, 100000.0f), float maxDrawDistance = 6000.0f);
+    float getHeightAt(float x, float z) const;
+    void exportToOBJ(const std::string& filename, int downsample = 4) const;
+    glm::vec3 getNormalAt(float x, float z) const;
+    float getRoadAt(float x, float z) const;
+    float getRiverAt(float x, float z) const;
+    GLuint getHeightmapTexture() const { return heightmapTexID; }
+    GLuint getRoadMask() const { return roadMask; }
+    void sculpt(float wx, float wz, float radius, float speed, int mode, float dt);
+    void paint(float wx, float wz, float radius, float speed, int layerIdx, float dt);
+    void saveTerrain();
+    void erodeGlobal();
+    void updateGPUHeightmapTexture();
+
+private:
+    void loadHeightmap(const std::string& path);
+    void setupTextures(const std::string& pmPath);
+    void erode(int numDroplets, float brushX, float brushZ, float radius, bool isLocal);
+    std::vector<float> heights;
+    std::vector<float> visualHeights;
+    std::vector<unsigned char> roadMaskData;
+    int gridW=0, gridH=0;
+    int visualW=0, visualH=0;
+    int roadW=0, roadH=0;
+    float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
+    std::vector<TerrainChunk*> chunks;
+    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
+    bool hasRoadMask = false;
+    int activePaintLayerIdx = 2;
+    Shader* terrainShader = nullptr;
+    std::string hmFilePath;
+    time_t lastHmModTime = 0;
+    const int CHUNK_SIZE = 129;
+};
