@@ -747,10 +747,12 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
             if (mtl.textureID) {
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, mtl.textureID);
+                shader.setInt("texture_diffuse1", 0);
                 shader.setBool("hasTexture", true);
             } else {
                 shader.setBool("hasTexture", false);
             }
+            shader.setBool("hasNormalMap", false);
 
             glBindVertexArray(mesh.VAO);
             glDrawElementsInstanced(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mesh.lastUploadedSize);
@@ -790,9 +792,19 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
             if (mtl.textureID) {
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, mtl.textureID);
+                shader.setInt("texture_diffuse1", 0);
                 shader.setBool("hasTexture", true);
             } else {
                 shader.setBool("hasTexture", false);
+            }
+
+            if (mtl.normalMapID) {
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, mtl.normalMapID);
+                shader.setInt("texture_normal1", 1);
+                shader.setBool("hasNormalMap", true);
+            } else {
+                shader.setBool("hasNormalMap", false);
             }
 
             glDrawElementsInstanced(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mutableMesh.lastUploadedSize);

@@ -1,6 +1,6 @@
 size=8129x8129
 worldX=-13938.0..13938.0
 worldZ=-13938.0..13938.0
-minHeight=-40.0m
+minHeight=-70.0m
 maxHeight=87.8m
-source=Updated from UE heightmap measurements (27.876 km size, -40.0m to 87.8m elevation)
+source=Deterministic clean Sousse terrain rebuild; vector roads only

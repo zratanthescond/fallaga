@@ -40,6 +40,7 @@ add_executable(RDR2_Prototype
     src/stb_impl.cpp
     src/AudioSystem.cpp
     src/Car.cpp
+    src/RoadSystem.cpp
 )
 
 # Include directories

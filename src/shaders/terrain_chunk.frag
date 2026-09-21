@@ -143,8 +143,8 @@ void main()
         sampledNorm = mix(sampledNorm, nrmRock, cliffFactor);
     }
 
-    // ── 3. COASTAL SAND TRANSITION (near sea level) ──
-    float coastFactor = 1.0 - smoothstep(waterLevel + 0.5, waterLevel + 3.2, alt);
+    // ── 3. COASTAL SAND TRANSITION (near sea level along the open eastern shoreline) ──
+    float coastFactor = (1.0 - smoothstep(waterLevel + 0.2, waterLevel + 1.8, alt)) * smoothstep(3200.0, 3700.0, WorldPos.x);
     if (coastFactor > 0.01 && !isHarbor) {
         vec3 colCoastSand = texture(terrainTex, vec3(baseUV * 0.9, 0.0)).rgb; // Layer 0: Coastal Sand
         vec3 nrmCoastSand = texture(terrainNormal, vec3(baseUV * 0.9, 0.0)).rgb * 2.0 - 1.0;
@@ -248,9 +248,8 @@ void main()
         }
 
         // B. PHOTOREALISTIC MULTI-TIER ROAD SYSTEM
+        // Hybrid rendering: terrain splatting provides seamless ground foundation
         float rRaw = maskVals.r;
-        rRaw *= (1.0 - smoothstep(0.35, 0.75, ripMask)); // Suppress on outer breakwater riprap
-
         if (rRaw > 0.01 && (alt > waterLevel + 0.3 || isHarbor)) {
             // 1. Multi-scale organic edge breakup (fractal micro-noise for natural dirt-grass boundary)
             vec2 roadNoiseUV = WorldPos.xz * 0.38;
@@ -259,11 +258,11 @@ void main()
             float nEdge3 = noise(roadNoiseUV * 6.8 + vec2(4.1, 7.3));
             float edgeNoise = (nEdge1 * 0.50 + nEdge2 * 0.35 + nEdge3 * 0.15 - 0.5);
 
-            // Warp the distance gradient organically
-            float rWarped = clamp(rRaw + edgeNoise * 0.16 * smoothstep(0.01, 0.40, rRaw), 0.0, 1.0);
+            // Warp the distance gradient subtly and organically (avoiding jagged sawtooth spikes)
+            float rWarped = clamp(rRaw + edgeNoise * 0.025 * smoothstep(0.01, 0.40, rRaw), 0.0, 1.0);
 
-            // Overall road presence: soft shoulder starts at 0.02, full roadbed inside 0.22
-            float roadFactor = smoothstep(0.02, 0.24, rWarped);
+            // Overall road presence: soft shoulder starts at 0.06, full roadbed inside 0.24
+            float roadFactor = smoothstep(0.06, 0.24, rWarped);
 
             if (roadFactor > 0.005) {
                 bool isUrban = (maskVals.g > 0.55 || isHarbor);
@@ -278,7 +277,7 @@ void main()
                 float centerFactor = smoothstep(0.82, 0.98, rWarped);
 
                 // --- 4. Gravel Shoulders & Flanks ---
-                float shoulderFactor = smoothstep(0.02, 0.16, rWarped) * (1.0 - smoothstep(0.24, 0.44, rWarped));
+                float shoulderFactor = smoothstep(0.06, 0.16, rWarped) * (1.0 - smoothstep(0.24, 0.44, rWarped));
 
                 vec3 finalRoadCol;
                 vec3 finalRoadNorm;
@@ -297,13 +296,16 @@ void main()
                     vec3 colRut = colBitumen * vec3(0.78, 0.77, 0.75);
                     vec3 nrmRut = nrmTar * vec3(0.70, 0.70, 1.0);
 
-                    // Subtle fine Mediterranean dust settling on road (crevice dust, NOT whiteout)
+                    // Fine Mediterranean dust on crown
                     vec3 colDust = texture(terrainTex, vec3(WorldPos.xz * 0.15, 6.0)).rgb;
-                    colDust = mix(colDust, vec3(0.65, 0.58, 0.48), 0.40); // Warm Saharan dust
+                    colDust = mix(colDust, vec3(0.65, 0.58, 0.48), 0.40);
+
+                    // Urban curbs/shoulders: authentic crushed cobblestone aggregate (Layer 12)
+                    vec3 colCobbleShoulder = texture(terrainTex, vec3(WorldPos.xz * 0.22, 12.0)).rgb * vec3(0.78, 0.76, 0.73);
 
                     vec3 colUrbanRoad = mix(colBitumen, colRut, rutFactor * 0.65);
                     colUrbanRoad = mix(colUrbanRoad, colDust * 0.85, centerFactor * 0.25);
-                    colUrbanRoad = mix(colUrbanRoad, colDust * 0.80, shoulderFactor * 0.35);
+                    colUrbanRoad = mix(colUrbanRoad, colCobbleShoulder, shoulderFactor * 0.45);
 
                     finalRoadCol = colUrbanRoad;
                     finalRoadNorm = mix(nrmTar, nrmRut, rutFactor * 0.60);

@@ -1,5 +1,6 @@
 #include "Terrain.h"
 #include "PhysicsSystem.h"
+#include "ProceduralMapData.h"
 #include "SousseMapData.h"
 #include "TextureEngine.h"
 #include <cstdlib>
@@ -27,6 +28,57 @@
 static constexpr float WATER_BASE = -48.5f; // Sea level
 static float waterLevelOffset = 0.0f; // Positive raises terrain (lowers water)
 static float waterLevelRuntime = WATER_BASE;  // Real-time editor override
+
+namespace {
+constexpr float HISTORIC_PLAN_OFFSET_X = 3600.0f;
+constexpr float HISTORIC_PLAN_OFFSET_Z = -701.0f;
+
+bool isInsideHistoricCity(const RoadSegment& segment) {
+  for (const RoadPoint& point : segment.controlPoints) {
+    if (point.pos.x >= 2450.0f && point.pos.x <= 4850.0f &&
+        point.pos.y >= -2100.0f && point.pos.y <= 1550.0f) {
+      return true;
+    }
+  }
+  return false;
+}
+
+RoadType historicRoadType(const ProceduralMap::MapStreet& street) {
+  const bool medinaStreet = street.name.find("Souk") != std::string::npos ||
+                            street.name.find("Kasbah") != std::string::npos ||
+                            street.name.find("Bab ") != std::string::npos ||
+                            street.name.find("El Hadjira") != std::string::npos;
+  if (medinaStreet) return RoadType::Medina;
+  if (street.name.find("Marine") != std::string::npos ||
+      street.name.find("Fallieres") != std::string::npos) return RoadType::Port;
+  if (street.width >= 16.0f) return RoadType::ColonialAvenue;
+  return RoadType::UrbanStreet;
+}
+
+void replaceWithHistoricCityRoads(RoadGraph& graph) {
+  graph.segments.erase(
+      std::remove_if(graph.segments.begin(), graph.segments.end(), isInsideHistoricCity),
+      graph.segments.end());
+
+  uint32_t nextId = 0;
+  for (const RoadSegment& segment : graph.segments)
+    nextId = std::max(nextId, segment.id + 1);
+
+  for (const ProceduralMap::MapStreet& street : ProceduralMap::getStreets()) {
+    RoadSegment segment;
+    segment.id = nextId++;
+    segment.type = historicRoadType(street);
+    segment.width = street.width;
+    segment.shoulderWidth = segment.type == RoadType::Medina ? 0.75f : 1.5f;
+
+    for (const glm::vec2& point : street.points) {
+      segment.controlPoints.push_back(
+          {{point.x + HISTORIC_PLAN_OFFSET_X, point.y + HISTORIC_PLAN_OFFSET_Z}});
+    }
+    graph.segments.push_back(std::move(segment));
+  }
+}
+} // namespace
 // ----------------------------------------------------------------
 //  Hash-based value noise — NO sine/cosine grids!
 // ----------------------------------------------------------------
@@ -169,6 +221,52 @@ Terrain::Terrain() {
 
   std::cout << "[Terrain] Initializing Water Mesh..." << std::endl;
   buildWaterMesh();
+
+  // ── GEOMETRY-BASED ROAD SYSTEM ──────────────────────────────────────────
+  std::cout << "[Terrain] Initializing Geometry Road System..." << std::endl;
+  {
+      // 1. Set up height sampler from TerrainManager
+      TerrainCoordinateMapper mapper;
+      mapper.bounds = { terrainManager->getWorldMinX(), terrainManager->getWorldMaxX(),
+                        terrainManager->getWorldMinZ(), terrainManager->getWorldMaxZ(),
+                        terrainManager->getMinHeight(), terrainManager->getMaxHeight() };
+      mapper.heightmapW = terrainManager->getGridW();
+      mapper.heightmapH = terrainManager->getGridH();
+
+      roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
+                             terrainManager->getGridW(), terrainManager->getGridH());
+
+      // 2. Load road graph from JSON
+      roadGraph = new RoadGraph();
+      if (roadGraph->loadFromJSON("assets/roads/roads.json")) {
+          replaceWithHistoricCityRoads(*roadGraph);
+          roadGraph->buildTopology();
+
+          // 3. Evaluate Catmull-Rom splines + sample heights
+          std::cout << "[Terrain] Evaluating road splines..." << std::endl;
+          for (auto& seg : roadGraph->segments) {
+              RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
+          }
+
+          // 4. Build terrain deformation field (2048x2048 = ~1 pixel per 13.6m)
+          roadDeformer = new RoadDeformer();
+          roadDeformer->build(roadGraph->segments, roadHeightSampler, mapper, 2048, 2048);
+          terrainManager->setRoadDeformationTexture(roadDeformer->getDeformationTexture());
+
+          // 5. Generate and upload road ribbon mesh
+          roadMeshBuilder = new RoadMeshBuilder();
+          roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, roadDeformer);
+          roadMeshBuilder->upload();
+
+          std::cout << "[Terrain] Road System ready: "
+                    << roadGraph->segments.size() << " segments, "
+                    << roadMeshBuilder->getVertexCount() << " vertices, "
+                    << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
+      } else {
+          std::cerr << "[Terrain] Road system: no roads.json found, using legacy fallback" << std::endl;
+          buildStreetMesh(); // Legacy fallback
+      }
+  }
   // Load real water normal maps and foam from assets (fall back to procedural if missing)
   auto loadWaterTex = [](const char* path, unsigned int fallback) -> unsigned int {
     int w, h, ch;
@@ -213,11 +311,11 @@ Terrain::Terrain() {
   glBindTexture(GL_TEXTURE_2D, 0);
 
   cityWallModel = new ObjModel("assets/moniment/mycityWall.fbx");
-  rockModel = new ObjModel("assets/terrain/rdr2_assets/models/rock_moss_set_02.fbx");
-  assetCache["assets/terrain/rdr2_assets/models/rock_moss_set_02.fbx"] = rockModel;
+  rockModel = new ObjModel("assets/Rock1/Rock1.obj");
+  assetCache["assets/Rock1/Rock1.obj"] = rockModel;
 
   std::cout << "[Terrain] Pre-loading Tree and Grass models..." << std::endl;
-  assetCache["assets/terrain/rdr2_assets/models/quiver_tree_02.fbx"] = new ObjModel("assets/terrain/rdr2_assets/models/quiver_tree_02.fbx");
+  assetCache["assets/Tree_02/Tree.obj"] = new ObjModel("assets/Tree_02/Tree.obj");
   assetCache["assets/terrain/grass_medium_01_2k.fbx"] = new ObjModel("assets/terrain/grass_medium_01_2k.fbx");
 
   std::cout << "[Terrain] Initialization done." << std::endl;
@@ -234,6 +332,8 @@ Terrain::~Terrain() {
     glDeleteVertexArrays(1, &streetVAO);
   if (streetVBO)
     glDeleteBuffers(1, &streetVBO);
+  if (streetEBO)
+    glDeleteBuffers(1, &streetEBO);
   if (wallVAO)
     glDeleteVertexArrays(1, &wallVAO);
   if (wallVBO)
@@ -260,6 +360,11 @@ Terrain::~Terrain() {
   // Cleanup water FBOs
   if (reflFBO) { glDeleteFramebuffers(1, &reflFBO); glDeleteTextures(1, &reflColorTex); glDeleteRenderbuffers(1, &reflDepthRBO); }
   if (refrFBO) { glDeleteFramebuffers(1, &refrFBO); glDeleteTextures(1, &refrColorTex); glDeleteTextures(1, &refrDepthTex); }
+
+  // Cleanup road system
+  delete roadGraph;
+  delete roadDeformer;
+  delete roadMeshBuilder;
 }
 
 void Terrain::buildWaterFBOs(int width, int height) {
@@ -321,9 +426,6 @@ void Terrain::buildWaterFBOs(int width, int height) {
 }
 
 void Terrain::initStreets() {}
-void Terrain::buildStreetMesh() {}
-void Terrain::renderStreets(const glm::mat4 &proj, const glm::mat4 &view,
-                            const glm::vec3 &lightDir) const {}
 float Terrain::distToSegment(float px, float pz, float x1, float z1, float x2,
                              float z2) const {
   return 0.0f;
@@ -392,6 +494,91 @@ void Terrain::buildWaterMesh() {
   glBindVertexArray(0);
 }
 
+void Terrain::buildStreetMesh() {
+  std::string binPath = "assets/roads/road_mesh.bin";
+  FILE* f = fopen(binPath.c_str(), "rb");
+  if (!f) {
+    std::cout << "[Terrain] No binary road mesh found at " << binPath << std::endl;
+    return;
+  }
+  char magic[4];
+  if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "ROAD", 4) != 0) {
+    fclose(f);
+    return;
+  }
+  uint32_t vCount = 0, iCount = 0;
+  fread(&vCount, sizeof(uint32_t), 1, f);
+  fread(&iCount, sizeof(uint32_t), 1, f);
+
+  std::vector<float> vData((size_t)vCount * 9);
+  fread(vData.data(), sizeof(float), (size_t)vCount * 9, f);
+
+  std::vector<uint32_t> iData((size_t)iCount);
+  fread(iData.data(), sizeof(uint32_t), (size_t)iCount, f);
+  fclose(f);
+
+  streetVertexCount = (int)vCount;
+  streetIndexCount = (int)iCount;
+
+  if (streetVAO == 0) glGenVertexArrays(1, &streetVAO);
+  if (streetVBO == 0) glGenBuffers(1, &streetVBO);
+  if (streetEBO == 0) glGenBuffers(1, &streetEBO);
+
+  glBindVertexArray(streetVAO);
+
+  glBindBuffer(GL_ARRAY_BUFFER, streetVBO);
+  glBufferData(GL_ARRAY_BUFFER, vData.size() * sizeof(float), vData.data(), GL_STATIC_DRAW);
+
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, streetEBO);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER, iData.size() * sizeof(uint32_t), iData.data(), GL_STATIC_DRAW);
+
+  // Layout 0: vec3 aPos
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)0);
+
+  // Layout 1: vec3 aNormal
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(3 * sizeof(float)));
+
+  // Layout 2: vec2 aUV
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(6 * sizeof(float)));
+
+  // Layout 3: float aType
+  glEnableVertexAttribArray(3);
+  glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, 9 * sizeof(float), (void*)(8 * sizeof(float)));
+
+  glBindVertexArray(0);
+  std::cout << "[Terrain] Successfully loaded 3D Road Ribbon Mesh: " << vCount 
+            << " vertices, " << (iCount / 3) << " triangles." << std::endl;
+}
+
+void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
+                            const glm::vec3& lightDir) const {
+  if (streetVAO == 0 || streetIndexCount == 0 || !streetShader) return;
+
+  glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LEQUAL);
+  glDepthMask(GL_TRUE);
+  glEnable(GL_POLYGON_OFFSET_FILL);
+  glPolygonOffset(-3.0f, -3.0f);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+  streetShader->use();
+  streetShader->setMat4("projection", proj);
+  streetShader->setMat4("view", view);
+  streetShader->setMat4("model", glm::mat4(1.0f));
+  streetShader->setVec3("lightDir", lightDir);
+
+  glBindVertexArray(streetVAO);
+  glDrawElements(GL_TRIANGLES, streetIndexCount, GL_UNSIGNED_INT, 0);
+  glBindVertexArray(0);
+
+  glDisable(GL_BLEND);
+  glDisable(GL_POLYGON_OFFSET_FILL);
+}
+
 void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
                            const glm::vec3 &cam, const glm::vec3 &light,
                            const glm::vec3 &lightColor, int selectedIdx,
@@ -422,10 +609,37 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
   static bool proceduralInitialized = false;
 
   if (!proceduralInitialized && terrainManager) {
-      std::cout << "[Terrain] Generating RDR2-style procedural foliage (lightweight budget)..." << std::endl;
-      srand(12345); // Seed for deterministic generation
+      FILE* f = fopen("assets/terrain/foliage.bin", "rb");
+      if (f) {
+          char magic[4];
+          if (fread(magic, 1, 4, f) == 4 && memcmp(magic, "FOLI", 4) == 0) {
+              uint32_t numTrees = 0, numRocks = 0, numGrass = 0;
+              fread(&numTrees, sizeof(uint32_t), 1, f);
+              fread(&numRocks, sizeof(uint32_t), 1, f);
+              fread(&numGrass, sizeof(uint32_t), 1, f);
 
-      glm::vec2 medinaCenter = {-530.0f, -1502.0f};
+              proceduralTrees.resize(numTrees);
+              proceduralRocks.resize(numRocks);
+              proceduralGrass.resize(numGrass);
+
+              fread(proceduralTrees.data(), sizeof(glm::mat4), numTrees, f);
+              fread(proceduralRocks.data(), sizeof(glm::mat4), numRocks, f);
+              fread(proceduralGrass.data(), sizeof(glm::mat4), numGrass, f);
+
+              proceduralInitialized = true;
+              std::cout << "[Terrain] Successfully loaded binary roadside foliage: " 
+                        << numTrees << " trees, " 
+                        << numRocks << " rocks, " 
+                        << numGrass << " grass patches." << std::endl;
+          }
+          fclose(f);
+      }
+
+      if (!proceduralInitialized) {
+          std::cout << "[Terrain] Generating RDR2-style procedural foliage (lightweight budget)..." << std::endl;
+          srand(12345); // Seed for deterministic generation
+
+          glm::vec2 medinaCenter = {-530.0f, -1502.0f};
 
       // --- Simple noise function for natural patchiness ---
       auto noiseAt = [](float x, float z) -> float {
@@ -539,11 +753,12 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           }
       }
 
-      proceduralInitialized = true;
-      std::cout << "[Terrain] RDR2-Style Foliage Generated: " 
-                << proceduralTrees.size() << " trees, " 
-                << proceduralRocks.size() << " rocks, "
-                << proceduralGrass.size() << " grass patches." << std::endl;
+          proceduralInitialized = true;
+          std::cout << "[Terrain] RDR2-Style Foliage Generated: " 
+                    << proceduralTrees.size() << " trees, " 
+                    << proceduralRocks.size() << " rocks, "
+                    << proceduralGrass.size() << " grass patches." << std::endl;
+      }
   }
 
   double t_tm_start = glfwGetTime();
@@ -558,6 +773,18 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     } else {
       float effectiveDrawDist = (cam.y > 100.0f) ? 6000.0f : 2500.0f;
       terrainManager->render(proj, view, cam, light, lightColor, waterLevelRuntime, glm::vec4(0.0f, -1.0f, 0.0f, 100000.0f), effectiveDrawDist);
+    }
+    if (!isReflectionPass) {
+      if (roadMeshBuilder && roadMeshBuilder->getTriangleCount() > 0 && streetShader) {
+        streetShader->use();
+        streetShader->setMat4("projection", proj);
+        streetShader->setMat4("view", view);
+        streetShader->setMat4("model", glm::mat4(1.0f));
+        streetShader->setVec3("lightDir", light);
+        roadMeshBuilder->render(*streetShader);
+      } else {
+        renderStreets(proj, view, light);
+      }
     }
   }
   double t_tm_end = glfwGetTime();
@@ -742,10 +969,10 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     
     if (proceduralInitialized) {
         for (auto const &mat : proceduralTrees) {
-            cachedBatches["assets/terrain/rdr2_assets/models/quiver_tree_02.fbx"].push_back(mat);
+            cachedBatches["assets/Tree_02/Tree.obj"].push_back(mat);
         }
         for (auto const &mat : proceduralRocks) {
-            cachedBatches["assets/terrain/rdr2_assets/models/rock_moss_set_02.fbx"].push_back(mat);
+            cachedBatches["assets/Rock1/Rock1.obj"].push_back(mat);
         }
         for (auto const &mat : proceduralGrass) {
             cachedBatches["assets/terrain/grass_medium_01_2k.fbx"].push_back(mat);
@@ -800,6 +1027,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
       ObjModel *m = assetCache[path];
       if (m) {
         bool isDebris = (path.find("rock") != std::string::npos ||
+                         path.find("Rock") != std::string::npos ||
                          path.find("rubble") != std::string::npos);
         bool isTree = (path.find("Tree") != std::string::npos ||
                        path.find("tree") != std::string::npos);
@@ -882,6 +1110,10 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
             std::cout << "[Foliage Debug] Rendering " << culledMatrices.size()
                       << " grass patches (culled from " << matrices.size()
                       << "). CamPos: " << cam.x << ", " << cam.y << ", " << cam.z << std::endl;
+        }
+        if (isTree && printCount % 60 == 0) {
+            std::cout << "[Tree Debug] Rendering " << culledMatrices.size()
+                      << " trees (culled from " << matrices.size() << ")" << std::endl;
         }
 
         // Only re-upload the GPU instance buffer when the culled set actually changed
@@ -1418,16 +1650,25 @@ void Terrain::renderWater(const glm::mat4 &proj, const glm::mat4 &view,
 float Terrain::getHeight(float x, float z) const {
   if (isFlatMode)
     return WATER_BASE;
-  return terrainManager ? terrainManager->getHeightAt(x, z) : 0.0f;
+  float baseH = terrainManager ? terrainManager->getHeightAt(x, z) : 0.0f;
+  // Apply road deformation
+  if (roadDeformer && roadDeformer->isBuilt()) {
+      baseH += roadDeformer->getDeformation(x, z);
+  }
+  return baseH;
 }
 glm::vec3 Terrain::getNormalAt(float x, float z) const {
-  if (terrainManager)
-    return terrainManager->getNormalAt(x, z);
-  return glm::vec3(0, 1, 0);
+  const float sampleDistance = 1.0f;
+  float hL = getHeight(x - sampleDistance, z);
+  float hR = getHeight(x + sampleDistance, z);
+  float hS = getHeight(x, z - sampleDistance);
+  float hN = getHeight(x, z + sampleDistance);
+  return glm::normalize(glm::vec3(hL - hR, 2.0f * sampleDistance, hS - hN));
 }
 float Terrain::getRoadAt(float x, float z) const {
-  return 0.0f; // Roads temporarily disabled
-  // return terrainManager ? terrainManager->getRoadAt(x, z) : 0.0f;
+  if (roadDeformer && roadDeformer->isBuilt())
+    return roadDeformer->getRoadInfluence(x, z);
+  return 0.0f;
 }
 
 Terrain::Zone Terrain::getZoneAt(float x, float z) const { return Zone::PLAIN; }

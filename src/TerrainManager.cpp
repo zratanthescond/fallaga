@@ -337,6 +337,8 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
     glActiveTexture(GL_TEXTURE3); glBindTexture(GL_TEXTURE_2D, roadMask); terrainShader->setInt("roadMask", 3);
     glActiveTexture(GL_TEXTURE4); glBindTexture(GL_TEXTURE_2D, albedoTex); terrainShader->setInt("splatmap1", 4);
     glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, splatmap2Tex); terrainShader->setInt("splatmap2", 5);
+    glActiveTexture(GL_TEXTURE6); glBindTexture(GL_TEXTURE_2D, roadDeformationTex); terrainShader->setInt("roadDeformationMap", 6);
+    terrainShader->setBool("hasRoadDeformation", roadDeformationTex != 0);
     terrainShader->setBool("hasRoadMask", hasRoadMask);
     terrainShader->setInt("activePaintLayerIdx", activePaintLayerIdx);
     

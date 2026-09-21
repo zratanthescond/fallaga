@@ -9,6 +9,7 @@
 #include <glm/glm.hpp>
 #include "ObjectModel.h"
 #include "HeightmapTerrain.h"
+#include "RoadSystem.h"
 #include "Shader.h"
 #include "TerrainManager.h"
 
@@ -98,6 +99,12 @@ public:
 
 private:
     HeightmapTerrain* heightmapTerrain = nullptr;
+
+    // Geometry-based road system
+    RoadGraph*       roadGraph       = nullptr;
+    RoadDeformer*    roadDeformer    = nullptr;
+    RoadMeshBuilder* roadMeshBuilder = nullptr;
+    HeightSampler    roadHeightSampler;
     ObjModel* trainStationModel = nullptr;
     ObjModel* cityWallModel = nullptr;
     ObjModel* rockModel = nullptr;
@@ -142,8 +149,9 @@ private:
     mutable bool firstWallBuild = true;
 
     // Street rendering
-    unsigned int streetVAO = 0, streetVBO = 0;
+    unsigned int streetVAO = 0, streetVBO = 0, streetEBO = 0;
     int          streetVertexCount = 0;
+    int          streetIndexCount = 0;
 
     std::vector<Monument>       monuments;
     std::vector<Street>         streets;

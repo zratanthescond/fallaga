@@ -19,11 +19,23 @@ public:
     float getRiverAt(float x, float z) const;
     GLuint getHeightmapTexture() const { return heightmapTexID; }
     GLuint getRoadMask() const { return roadMask; }
+    void setRoadDeformationTexture(GLuint texture) { roadDeformationTex = texture; }
     void sculpt(float wx, float wz, float radius, float speed, int mode, float dt);
     void paint(float wx, float wz, float radius, float speed, int layerIdx, float dt);
     void saveTerrain();
     void erodeGlobal();
     void updateGPUHeightmapTexture();
+
+    // Accessors for road system integration
+    const float* getHeightsData() const { return heights.data(); }
+    int getGridW() const { return gridW; }
+    int getGridH() const { return gridH; }
+    float getWorldMinX() const { return worldMinX; }
+    float getWorldMaxX() const { return worldMaxX; }
+    float getWorldMinZ() const { return worldMinZ; }
+    float getWorldMaxZ() const { return worldMaxZ; }
+    float getMinHeight() const { return minHeight; }
+    float getMaxHeight() const { return maxHeight; }
 
 private:
     void loadHeightmap(const std::string& path);
@@ -37,7 +49,7 @@ private:
     int roadW=0, roadH=0;
     float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
     std::vector<TerrainChunk*> chunks;
-    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
+    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0, roadDeformationTex=0;
     bool hasRoadMask = false;
     int activePaintLayerIdx = 2;
     Shader* terrainShader = nullptr;
