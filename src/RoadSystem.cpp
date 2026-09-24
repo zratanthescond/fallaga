@@ -8,6 +8,61 @@
 #include <unordered_map>
 #include <glm/gtc/type_ptr.hpp>
 
+namespace {
+// Horizontal road frame helper:
+// Computes purely horizontal right vectors perpendicular to the road tangent in the XZ plane.
+// Roads on terrain must maintain constant width in world space and must not roll or twist
+// on slopes, over crests, or around closed loops (roundabouts).
+void computeRoadFrames(std::vector<glm::vec3>& rightVecs,
+                       const std::vector<glm::vec3>& tangents,
+                       bool closed) {
+    const int m = (int)tangents.size();
+    if (m <= 0) return;
+    rightVecs.resize(m);
+    for (int i = 0; i < m; ++i) {
+        const glm::vec3& t = tangents[i];
+        glm::vec2 t_xz(t.x, t.z);
+        float len = glm::length(t_xz);
+        if (len > 1e-5f) {
+            t_xz /= len;
+            rightVecs[i] = glm::vec3(t_xz.y, 0.0f, -t_xz.x);
+        } else {
+            rightVecs[i] = glm::vec3(1.0f, 0.0f, 0.0f);
+        }
+    }
+    // Cyclic/moving-average smoothing pass
+    for (int pass = 0; pass < 2; ++pass) {
+        std::vector<glm::vec3> smoothed = rightVecs;
+        if (closed) {
+            for (int i = 0; i < m; ++i) {
+                int pr = (i - 1 + m) % m;
+                int nx = (i + 1) % m;
+                glm::vec3 r = rightVecs[pr] * 0.25f + rightVecs[i] * 0.50f + rightVecs[nx] * 0.25f;
+                r.y = 0.0f;
+                float rLen = glm::length(r);
+                smoothed[i] = (rLen > 1e-5f) ? (r / rLen) : rightVecs[i];
+            }
+        } else {
+            for (int i = 1; i < m - 1; ++i) {
+                glm::vec3 r = rightVecs[i - 1] * 0.25f + rightVecs[i] * 0.50f + rightVecs[i + 1] * 0.25f;
+                r.y = 0.0f;
+                float rLen = glm::length(r);
+                smoothed[i] = (rLen > 1e-5f) ? (r / rLen) : rightVecs[i];
+            }
+        }
+        rightVecs = smoothed;
+    }
+}
+
+// Backward-compatible forwarder
+void computeParallelFrames(std::vector<glm::vec3>& rightVecs,
+                           const std::vector<glm::vec3>& tangents,
+                           int from) {
+    (void)from;
+    computeRoadFrames(rightVecs, tangents, false);
+}
+}  // namespace
+
 // ═════════════════════════════════════════════════════════════════════════════
 //  HeightSampler
 // ═════════════════════════════════════════════════════════════════════════════
@@ -23,31 +78,31 @@ void HeightSampler::init(const TerrainCoordinateMapper& mapper,
 float HeightSampler::sample(float x, float z) const {
     if (!m_heights || m_w <= 0 || m_h <= 0) return 0.0f;
 
-    // World → normalized UV [0,1]
-    float ux = (x - m_mapper.bounds.minX) / (m_mapper.bounds.maxX - m_mapper.bounds.minX);
-    float uz = (z - m_mapper.bounds.minZ) / (m_mapper.bounds.maxZ - m_mapper.bounds.minZ);
+    glm::vec2 uv = m_mapper.worldToUV(x, z);
+    if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+        return 0.0f;
+    }
 
-    ux = std::clamp(ux, 0.0f, 1.0f);
-    uz = std::clamp(uz, 0.0f, 1.0f);
+    float fx = uv.x * float(m_w - 1);
+    float fy = uv.y * float(m_h - 1);
 
-    // UV → pixel.  TerrainManager maps row 0 to worldMinZ.
-    float fx = ux * (m_w - 1);
-    float fz = uz * (m_h - 1);
+    int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, m_w - 1);
+    int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, m_h - 1);
+    int x1 = std::min(x0 + 1, m_w - 1);
+    int y1 = std::min(y0 + 1, m_h - 1);
 
-    int x0 = (int)fx, x1 = std::min(x0 + 1, m_w - 1);
-    int z0 = (int)fz, z1 = std::min(z0 + 1, m_h - 1);
-    float tx = fx - x0, tz = fz - z0;
+    float tx = fx - float(x0);
+    float ty = fy - float(y0);
 
-    // Bilinear interpolation
-    float h00 = m_heights[z0 * m_w + x0];
-    float h10 = m_heights[z0 * m_w + x1];
-    float h01 = m_heights[z1 * m_w + x0];
-    float h11 = m_heights[z1 * m_w + x1];
+    float h00 = m_heights[y0 * m_w + x0];
+    float h10 = m_heights[y0 * m_w + x1];
+    float h01 = m_heights[y1 * m_w + x0];
+    float h11 = m_heights[y1 * m_w + x1];
 
-    return h00 * (1 - tx) * (1 - tz)
-         + h10 *    tx    * (1 - tz)
-         + h01 * (1 - tx) *    tz
-         + h11 *    tx    *    tz;
+    return h00 * (1.0f - tx) * (1.0f - ty)
+         + h10 *    tx    * (1.0f - ty)
+         + h01 * (1.0f - tx) *    ty
+         + h11 *    tx    *    ty;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -72,6 +127,24 @@ static RoadType parseRoadType(const std::string& s) {
     if (s == "port")             return RoadType::Port;
     if (s == "medina")           return RoadType::Medina;
     return RoadType::CountryDirt;
+}
+
+// Hierarchy-based road dimensions (world meters).  Used when a JSON segment
+// omits width/shoulder so road sizes stay consistent with the road type.
+static float roadTypeDefaultWidth(RoadType t) {
+    switch (t) {
+        case RoadType::ColonialAvenue:  return 11.5f;
+        case RoadType::UrbanStreet:     return 8.0f;
+        case RoadType::CountryHighway:  return 8.5f;
+        case RoadType::CountryDirt:     return 6.0f;
+        case RoadType::Port:            return 10.0f;
+        case RoadType::Medina:          return 5.0f;
+    }
+    return 6.0f;
+}
+
+static float roadTypeDefaultShoulder(RoadType t) {
+    return (t == RoadType::Medina) ? 0.75f : 1.5f;
 }
 
 static const char* roadTypeToString(RoadType t) {
@@ -149,6 +222,7 @@ bool RoadGraph::loadFromJSON(const std::string& path) {
         RoadSegment seg;
         seg.width = 6.0f;
         seg.shoulderWidth = 1.5f;
+        bool hasWidth = false, hasShoulder = false;
 
         // Parse key-value pairs inside the object
         while (pos < content.size() && content[pos] != '}') {
@@ -166,8 +240,10 @@ bool RoadGraph::loadFromJSON(const std::string& path) {
                 seg.type = parseRoadType(typeStr);
             } else if (key == "width") {
                 seg.width = parseNumber();
+                hasWidth = true;
             } else if (key == "shoulder") {
                 seg.shoulderWidth = parseNumber();
+                hasShoulder = true;
             } else if (key == "points") {
                 skipWS();
                 expectChar('[');
@@ -198,6 +274,11 @@ bool RoadGraph::loadFromJSON(const std::string& path) {
         }
         expectChar('}');
         skipWS();
+
+        // Resolve missing width/shoulder from the road-type hierarchy so sizes
+        // are always well-defined in world meters.
+        if (!hasWidth)  seg.width = roadTypeDefaultWidth(seg.type);
+        if (!hasShoulder) seg.shoulderWidth = roadTypeDefaultShoulder(seg.type);
 
         if (seg.controlPoints.size() >= 2) {
             segments.push_back(std::move(seg));
@@ -334,79 +415,184 @@ void RoadSpline::evaluate(RoadSegment& seg, const HeightSampler& sampler,
     for (int i = 0; i < n; ++i)
         pts[i] = cps[i].pos;
 
-    // Generate Catmull-Rom samples between each pair of control points
-    std::vector<glm::vec2> sampled;
-    sampled.push_back(pts[0]); // always include first point
+    // Detect a closed loop (round road / roundabout): first control point lands back
+    // on the last one. Such roads are rendered as continuous rings.
+    seg.closed = (n >= 3 &&
+        glm::length(pts.front() - pts.back()) < glm::max(seg.width, 10.0f));
 
-    for (int i = 0; i < n - 1; ++i) {
-        // Catmull-Rom needs 4 points: p[i-1], p[i], p[i+1], p[i+2]
-        glm::vec2 p0 = pts[std::max(0, i - 1)];
-        glm::vec2 p1 = pts[i];
-        glm::vec2 p2 = pts[std::min(n - 1, i + 1)];
-        glm::vec2 p3 = pts[std::min(n - 1, i + 2)];
+    // ── Adaptive sampling ────────────────────────────────────────────────
+    // Straight stretches resample at the requested base step (samplesPerMeter);
+    // curved sections (the rounded corners) tessellate by turn angle instead, so
+    // tight Medina turns get far more samples than long straight avenues without
+    // wasting triangle density on the straights.
+    const float baseStep = glm::max(0.5f, 1.0f / glm::max(samplesPerMeter, 0.1f));
+    const float maxArcAngle = 0.045f;  // one sample per ~2.6 degrees of corner turn
 
-        // Estimate segment length for adaptive sampling
-        float segLen = glm::length(p2 - p1);
-        int numSamples = std::max(2, (int)(segLen * samplesPerMeter));
-
-        for (int s = 1; s <= numSamples; ++s) {
-            float t = float(s) / float(numSamples);
-            glm::vec2 pt = catmullRom(p0, p1, p2, p3, t);
-
-            // Avoid duplicate points
-            if (glm::length(pt - sampled.back()) > 0.01f) {
-                sampled.push_back(pt);
-            }
+    auto rsewTo = [&](std::vector<glm::vec2>& out, const glm::vec2& p, float step) {
+        if (out.empty()) { out.push_back(p); return; }
+        glm::vec2 a = out.back();
+        float len = glm::length(p - a);
+        if (len < 0.01f) return;
+        int c = std::max(1, (int)std::ceil(len / glm::max(step, 0.25f)));
+        for (int k = 1; k <= c; ++k) {
+            glm::vec2 q = glm::mix(a, p, float(k) / float(c));
+            if (glm::length(q - out.back()) > 0.01f) out.push_back(q);
         }
+    };
+
+    // ── Build the smooth centerline path ──────────────────────────────────
+    //  * open roads : circular fillet arcs round every interior corner, so the
+    //    ribbon edge-lines and curbs curve through the turn like real streets.
+    //  * closed loops: sampled around the ring continuously; the seam corner
+    //    (between the last and first anchors) is rounded exactly like the others
+    //    instead of letting the closing sliver cut straight across the corner.
+    std::vector<glm::vec2> path;
+    auto emitCorner = [&](std::vector<glm::vec2>& out, const glm::vec2& a,
+                          const glm::vec2& b, const glm::vec2& c, float step) {
+        // Returns true when the corner at b is rounded by a fillet arc.
+        if (glm::length(b - a) < 1e-4f || glm::length(c - b) < 1e-4f) return false;
+        glm::vec2 u1 = glm::normalize(b - a);
+        glm::vec2 u2 = glm::normalize(c - b);
+        const float dotC = glm::clamp(glm::dot(u1, u2), -1.0f, 1.0f);
+        float r = (dotC < 0.93f)
+            ? glm::min(seg.width * 0.5f,
+                       glm::min(glm::length(b - a) * 0.5f, glm::length(c - b) * 0.5f))
+            : 0.0f;
+        if (r < 0.15f) r = 0.0f;
+        if (r <= 0.0f) return false;
+        const glm::vec2 T1 = b - u1 * r;            // arc touch on incoming edge
+        const glm::vec2 T2 = b + u2 * r;            // arc touch on outgoing edge
+        rsewTo(out, T1, step);
+        const float theta = std::acos(dotC);
+        // Circle center from the chord T1T2 (exact for any corner angle; the
+        // old r/cos(theta/2) bisector guess drifts off the arc off 90 degrees).
+        const glm::vec2 mid = (T1 + T2) * 0.5f;
+        const glm::vec2 chord = T2 - T1;
+        const float halfChord = glm::length(chord) * 0.5f;
+        glm::vec2 C;
+        if (halfChord <= r) {
+            const float h = std::sqrt(std::max(r * r - halfChord * halfChord, 0.0f));
+            glm::vec2 perp = glm::dot(chord, chord) > 1e-8f
+                ? glm::normalize(glm::vec2(-chord.y, chord.x)) : glm::vec2(0.0f);
+            glm::vec2 c1 = mid + perp * h;
+            glm::vec2 c2 = mid - perp * h;
+            C = (glm::dot(c1 - b, c1 - b) > glm::dot(c2 - b, c2 - b)) ? c1 : c2; // bulge away from apex
+        } else {
+            C = mid;                                  // degenerate: straight across
+        }
+        const float a0 = std::atan2(T1.y - C.y, T1.x - C.x);
+        const float ccw = (u1.x * u2.y - u1.y * u2.x >= 0.0f) ? 1.0f : -1.0f;
+        const int na = std::max(2, (int)std::ceil(theta / maxArcAngle));
+        for (int k = 1; k <= na; ++k) {
+            const float an = a0 + ccw * (theta * float(k) / float(na));
+            const glm::vec2 p = C + glm::vec2(std::cos(an), std::sin(an)) * r;
+            if (glm::length(p - out.back()) > 0.01f) out.push_back(p);
+        }
+        return true;
+    };
+
+    if (seg.closed) {
+        // Collect unique loop control points (discard duplicate closing point if present)
+        std::vector<glm::vec2> loopPts;
+        loopPts.reserve(n);
+        for (int i = 0; i < n; ++i) {
+            if (i == n - 1 && glm::length(pts[i] - pts[0]) < glm::max(seg.width, 15.0f))
+                continue;
+            loopPts.push_back(pts[i]);
+        }
+        const int N = (int)loopPts.size();
+        if (N >= 3) {
+            // Periodic Catmull-Rom spline around the loop: perfectly smooth curve, zero seam kinks!
+            for (int k = 0; k < N; ++k) {
+                const glm::vec2& p0 = loopPts[(k - 1 + N) % N];
+                const glm::vec2& p1 = loopPts[k];
+                const glm::vec2& p2 = loopPts[(k + 1) % N];
+                const glm::vec2& p3 = loopPts[(k + 2) % N];
+
+                float chordLen = glm::length(p2 - p1);
+                int numSteps = std::max(2, (int)std::ceil(chordLen / baseStep));
+                for (int s = 0; s < numSteps; ++s) {
+                    float t = float(s) / float(numSteps);
+                    glm::vec2 pt = catmullRom(p0, p1, p2, p3, t);
+                    if (path.empty() || glm::length(pt - path.back()) > 0.05f) {
+                        path.push_back(pt);
+                    }
+                }
+            }
+        } else {
+            for (const auto& p : pts) path.push_back(p);
+        }
+    } else {
+        path.push_back(pts[0]);
+        for (int j = 1; j < n - 1; ++j) {
+            const glm::vec2& a = pts[j - 1];
+            const glm::vec2& b = pts[j];
+            const glm::vec2& c = pts[j + 1];
+            if (!emitCorner(path, a, b, c, baseStep))
+                rsewTo(path, b, baseStep);
+        }
+        rsewTo(path, pts.back(), baseStep);
     }
 
-    // Sample heightmap for elevation
-    int m = (int)sampled.size();
+    // Sampling at >0.5/m is already done above; store as sampled geometry.
+    // Sample heightmap for elevation directly without alteration
+    int m = (int)path.size();
     seg.splinePoints.resize(m);
     for (int i = 0; i < m; ++i) {
-        float y = sampler.isValid() ? sampler.sample(sampled[i].x, sampled[i].y) : 0.0f;
-        seg.splinePoints[i] = glm::vec3(sampled[i].x, y, sampled[i].y);
+        float y = sampler.isValid() ? sampler.sample(path[i].x, path[i].y) : 0.0f;
+        seg.splinePoints[i] = glm::vec3(path[i].x, y, path[i].y);
     }
 
-    // Smooth elevation
-    smoothElevation(seg.splinePoints, 0.08f, 3.0f);
+    // smoothElevation disabled initially for direct terrain projection verification
+    // smoothElevation(seg.splinePoints, 0.08f, 3.0f);
 
-    // Compute tangents (central differences)
+    // Compute tangents (central differences, wrapping for closed rings)
     seg.tangents.resize(m);
     for (int i = 0; i < m; ++i) {
         glm::vec3 fwd;
-        if (i == 0)
+        if (seg.closed) {
+            int pr = (i - 1 + m) % m;
+            int nx = (i + 1) % m;
+            fwd = (seg.splinePoints[nx] - seg.splinePoints[pr]) * 0.5f;
+        } else if (i == 0)
             fwd = seg.splinePoints[1] - seg.splinePoints[0];
         else if (i == m - 1)
             fwd = seg.splinePoints[m - 1] - seg.splinePoints[m - 2];
         else
             fwd = (seg.splinePoints[i + 1] - seg.splinePoints[i - 1]) * 0.5f;
 
-        float len = glm::length(fwd);
-        seg.tangents[i] = (len > 1e-6f) ? (fwd / len) : glm::vec3(1, 0, 0);
+        float len = glm::length(glm::vec2(fwd.x, fwd.z));
+        seg.tangents[i] = (len > 1e-6f) ? glm::normalize(glm::vec3(fwd.x, 0.0f, fwd.z)) : glm::vec3(1, 0, 0);
     }
 
     // Smooth tangents (Gaussian-like: 3-tap moving average, 2 passes)
     for (int pass = 0; pass < 2; ++pass) {
         std::vector<glm::vec3> smoothed = seg.tangents;
-        for (int i = 1; i < m - 1; ++i) {
-            smoothed[i] = glm::normalize(
-                seg.tangents[i - 1] * 0.25f +
-                seg.tangents[i]     * 0.50f +
-                seg.tangents[i + 1] * 0.25f
-            );
+        if (seg.closed) {
+            // cyclic smoothing so the ring seam is as smooth as the rest
+            for (int i = 0; i < m; ++i) {
+                int pv = (i - 1 + m) % m;
+                int nx = (i + 1) % m;
+                glm::vec3 t = seg.tangents[pv] * 0.25f +
+                              seg.tangents[i] * 0.50f +
+                              seg.tangents[nx] * 0.25f;
+                float tLen = glm::length(glm::vec2(t.x, t.z));
+                smoothed[i] = (tLen > 1e-6f) ? glm::normalize(glm::vec3(t.x, 0.0f, t.z)) : seg.tangents[i];
+            }
+        } else {
+            for (int i = 1; i < m - 1; ++i) {
+                glm::vec3 t = seg.tangents[i - 1] * 0.25f +
+                              seg.tangents[i]     * 0.50f +
+                              seg.tangents[i + 1] * 0.25f;
+                float tLen = glm::length(glm::vec2(t.x, t.z));
+                smoothed[i] = (tLen > 1e-6f) ? glm::normalize(glm::vec3(t.x, 0.0f, t.z)) : seg.tangents[i];
+            }
         }
         seg.tangents = smoothed;
     }
 
-    // Compute right vectors (tangent × up)
-    seg.rightVecs.resize(m);
-    for (int i = 0; i < m; ++i) {
-        glm::vec3 up(0, 1, 0);
-        glm::vec3 right = glm::normalize(glm::cross(up, seg.tangents[i]));
-        if (glm::length(right) < 0.01f) right = glm::vec3(1, 0, 0);
-        seg.rightVecs[i] = right;
-    }
+    // Compute right vectors with horizontal perpendicular (no holonomy, no twist)
+    computeRoadFrames(seg.rightVecs, seg.tangents, seg.closed);
 
     // Cumulative distance
     seg.cumulativeDist.resize(m);
@@ -692,86 +878,481 @@ void RoadMeshBuilder::destroy() {
     m_indices.clear();
 }
 
-void RoadMeshBuilder::build(const std::vector<RoadSegment>& segments,
+void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
                             const HeightSampler& sampler,
                             const RoadDeformer* deformer) {
     m_vertices.clear();
     m_indices.clear();
 
-    const float Z_BIAS = 0.12f;     // Tiny offset above terrain to prevent z-fighting
-    const float CAMBER = 0.035f;    // Road crown height at center
+    const float Z_BIAS = 0.25f;     // Clean clearance above terrain for projection testing
+    const float CAMBER = 0.0f;      // Flat cross-section to eliminate edge twisting
     const float TEX_SCALE = 0.20f;  // UV repeat scale along road
+    const float JN_TOL = 2.5f;      // junction merge tolerance (meters)
+    const float PI = 3.14159265f;
 
-    for (const auto& seg : segments) {
+    // Dense cross-section so lane markings / edges get crisp geometry.
+    // Vertex pillars sit exactly on marking boundaries (u across road).
+    static const float kCross[] = {
+        0.000f,  // left rim
+        0.055f,  // left edge-line outer
+        0.105f,  // left edge-line inner
+        0.435f,  // center zone
+        0.455f,  // double-yellow left outer
+        0.495f,  // double-yellow left inner
+        0.505f,  // double-yellow right inner
+        0.545f,  // double-yellow right outer
+        0.565f,  // center zone
+        0.895f,  // right edge-line inner
+        0.945f,  // right edge-line outer
+        1.000f   // right rim
+    };
+    static const int kCrossCount = (int)(sizeof(kCross) / sizeof(kCross[0]));
+
+    const int S = (int)segments.size();
+    if (S == 0) { m_indexCount = 0; return; }
+
+    auto segLen = [&](const RoadSegment& s) {
+        if (s.cumulativeDist.size() < 2) return 0.0f;
+        return s.cumulativeDist.back() - s.cumulativeDist[0];
+    };
+    auto isPaved = [&](int t) { return t == 0 || t == 1 || t == 4; };
+
+    std::vector<char> branchLift(S, 0);
+
+    // ─── 0. Branch alignment to host edge ──────────────────────────────────
+    // An open endpoint that lands INSIDE another road's corridor is aligned
+    // to that road's near edge corridor, so the branch fuses edge-to-edge
+    // with the host without burying or twisting its ribbon.
+    for (int s = 0; s < S; ++s) {
+        RoadSegment& seg = segments[s];
+        const int n = (int)seg.splinePoints.size();
+        if (seg.closed || n < 2) continue;
+
+        for (int end = 0; end < 2; ++end) {
+            const glm::vec2 pos = (end == 0)
+                ? glm::vec2(seg.splinePoints.front().x, seg.splinePoints.front().z)
+                : glm::vec2(seg.splinePoints.back().x,  seg.splinePoints.back().z);
+
+            // Check if already shared with another endpoint
+            bool sharedEnd = false;
+            for (int h = 0; h < S && !sharedEnd; ++h) {
+                const RoadSegment& ho = segments[h];
+                if (h == s || ho.splinePoints.size() < 2) continue;
+                glm::vec2 a(ho.splinePoints.front().x, ho.splinePoints.front().z);
+                glm::vec2 b(ho.splinePoints.back().x,  ho.splinePoints.back().z);
+                if (glm::length(a - pos) <= JN_TOL + 0.05f ||
+                    glm::length(b - pos) <= JN_TOL + 0.05f) sharedEnd = true;
+            }
+            if (sharedEnd) continue;
+
+            // Check if endpoint lands inside another road's corridor (T-junction)
+            int hSeg = -1; float hDist = 1e9f;
+            glm::vec3 hP; glm::vec3 hR; float hHw = 0.0f;
+            for (int h = 0; h < S; ++h) {
+                if (h == s) continue;
+                const RoadSegment& ho = segments[h];
+                if (ho.splinePoints.size() < 2) continue;
+                const float tol = ho.width * 0.5f + 1.5f;
+                for (int k = 0; k < (int)ho.splinePoints.size(); ++k) {
+                    float d = glm::length(glm::vec2(ho.splinePoints[k].x - pos.x,
+                                                    ho.splinePoints[k].z - pos.y));
+                    if (d < tol && d < hDist) {
+                        hDist = d; hSeg = h;
+                        hP = ho.splinePoints[k]; hR = ho.rightVecs[k]; hHw = ho.width * 0.5f;
+                    }
+                }
+            }
+            if (hSeg < 0) continue;
+
+            branchLift[s] = 1; // merge onto host road -> slight lift to eliminate z-fighting
+            // Align endpoint to host road edge
+            glm::vec2 dP(pos.x - hP.x, pos.y - hP.z);
+            float sgn = (glm::dot(dP, glm::vec2(hR.x, hR.z)) >= 0.0f) ? 1.0f : -1.0f;
+            glm::vec2 edgePt = glm::vec2(hP.x, hP.z) + glm::vec2(hR.x, hR.z) * (sgn * hHw);
+            float newY = sampler.isValid() ? sampler.sample(edgePt.x, edgePt.y) : hP.y;
+
+            if (end == 0) {
+                seg.splinePoints[0] = glm::vec3(edgePt.x, newY, edgePt.y);
+            } else {
+                seg.splinePoints.back() = glm::vec3(edgePt.x, newY, edgePt.y);
+            }
+        }
+    }
+
+    // ─── 1. Endpoint clustering ─────────────────────────────────────────────
+    struct EndRef { int seg; bool isBack; glm::vec2 pos; float hw; };
+    std::vector<EndRef> ends;
+    std::vector<std::pair<int, int>> segEndRef(S, { -1, -1 });
+    for (int s = 0; s < S; ++s) {
+        const RoadSegment& seg = segments[s];
+        if (seg.splinePoints.size() < 2) continue;
+        const int fi = (int)ends.size();
+        ends.push_back({ s, false, glm::vec2(seg.splinePoints.front().x, seg.splinePoints.front().z), seg.width * 0.5f });
+        ends.push_back({ s, true,  glm::vec2(seg.splinePoints.back().x,  seg.splinePoints.back().z),  seg.width * 0.5f });
+        segEndRef[s] = { fi, fi + 1 };
+    }
+    const int E = (int)ends.size();
+    std::vector<int> cid(E, -1);
+    int nc = 0;
+    for (int i = 0; i < E; ++i) {
+        if (cid[i] >= 0) continue;
+        cid[i] = nc;
+        for (int j = i + 1; j < E; ++j)
+            if (cid[j] < 0 && glm::length(ends[i].pos - ends[j].pos) <= JN_TOL) cid[j] = nc;
+        ++nc;
+    }
+    std::vector<std::vector<int>> cluster(nc);
+    for (int i = 0; i < E; ++i) cluster[cid[i]].push_back(i);
+
+    auto countRealSegsInCluster = [&](const std::vector<int>& cl) {
+        int seen = 0;
+        for (size_t a = 0; a < cl.size(); ++a) {
+            bool dup = false;
+            for (size_t b = 0; b < a; ++b) if (ends[cl[b]].seg == ends[cl[a]].seg) { dup = true; break; }
+            if (!dup) ++seen;
+        }
+        return seen;
+    };
+
+    // ─── 2. Network-continuous texture distance v ───────────────────────────
+    std::vector<float> vStart(S, 0.0f);
+    std::vector<bool>  vDone(S, false);
+    for (int s = 0; s < S && !vDone[s]; ++s) {
+        if (segments[s].closed) { vDone[s] = true; continue; }
+        vStart[s] = 0.0f; vDone[s] = true;
+        bool ch = true;
+        while (ch) {
+            ch = false;
+            for (int c = 0; c < nc; ++c) {
+                if (countRealSegsInCluster(cluster[c]) != 2) continue;
+                int known = -1;
+                for (int id : cluster[c])
+                    if (vDone[ends[id].seg]) { known = id; break; }
+                if (known < 0) continue;
+                const EndRef& ek = ends[known];
+                float vK = vStart[ek.seg] + (ek.isBack ? segLen(segments[ek.seg]) : 0.0f);
+                for (int id : cluster[c]) {
+                    const EndRef& eu = ends[id];
+                    if (vDone[eu.seg] || segments[eu.seg].closed) continue;
+                    vStart[eu.seg] = vK - (eu.isBack ? segLen(segments[eu.seg]) : 0.0f);
+                    vDone[eu.seg] = true;
+                    ch = true;
+                }
+            }
+        }
+    }
+
+    int capCount = 0, jnCount = 0, jointCount = 0;
+    std::vector<uint32_t> firstRingBase(S, 0);
+    std::vector<uint32_t> lastRingBase(S, 0);
+
+    // ─── 3. Ribbon rings per segment ────────────────────────────────────────
+    for (int s = 0; s < S; ++s) {
+        const RoadSegment& seg = segments[s];
         int n = (int)seg.splinePoints.size();
         if (n < 2) continue;
 
-        float hw = seg.width * 0.5f;
-        float rtype = float((int)seg.type);
-        uint32_t baseIdx = (uint32_t)m_vertices.size();
+        const bool closed = seg.closed;
+        const float hw = seg.width * 0.5f;
+        const float rtype = float((int)seg.type);
+        const float vOff = vStart[s];
+        const float stripLift = branchLift[s] ? 0.02f : 0.0f;
+        const uint32_t baseIdx = (uint32_t)m_vertices.size();
+        firstRingBase[s] = baseIdx;
 
+        if (closed) {
+            float closingDist = glm::length(seg.splinePoints[0] - seg.splinePoints[n - 1]);
+            float totalDist = seg.cumulativeDist[n - 1] + closingDist;
+            const float dashCycle = 2.3f;
+            float targetCycles = std::max(1.0f, std::round((totalDist * TEX_SCALE) / dashCycle));
+            float ringTexScale = (targetCycles * dashCycle) / totalDist;
+
+            // Emit rings 0 .. n - 1
+            for (int i = 0; i < n; ++i) {
+                const glm::vec3& center = seg.splinePoints[i];
+                const glm::vec3& right  = seg.rightVecs[i];
+                glm::vec3 across = right * (2.0f * hw);
+                float v = seg.cumulativeDist[i] * ringTexScale;
+
+                glm::vec3 tangent = seg.tangents[i];
+                glm::vec3 surfNorm = glm::normalize(glm::cross(tangent, across));
+                if (surfNorm.y < 0.0f) surfNorm = -surfNorm;
+
+                for (int j = 0; j < kCrossCount; ++j) {
+                    float uc = kCross[j];
+                    float off = uc * 2.0f - 1.0f;
+
+                    glm::vec3 pos = center + right * (off * hw);
+                    float y = sampler.isValid() ? sampler.sample(pos.x, pos.z) : center.y;
+                    if (deformer && deformer->isBuilt())
+                        y += deformer->getDeformation(pos.x, pos.z);
+                    pos.y = y + Z_BIAS + CAMBER + stripLift;
+
+                    m_vertices.push_back({pos, surfNorm, glm::vec2(uc, v), rtype});
+                }
+            }
+
+            // Emit closing ring n: identical position and normal to ring 0, but v = totalDist * ringTexScale
+            lastRingBase[s] = (uint32_t)m_vertices.size();
+            {
+                const glm::vec3& center = seg.splinePoints[0];
+                const glm::vec3& right  = seg.rightVecs[0];
+                glm::vec3 across = right * (2.0f * hw);
+                float v = totalDist * ringTexScale;
+
+                glm::vec3 tangent = seg.tangents[0];
+                glm::vec3 surfNorm = glm::normalize(glm::cross(tangent, across));
+                if (surfNorm.y < 0.0f) surfNorm = -surfNorm;
+
+                for (int j = 0; j < kCrossCount; ++j) {
+                    float uc = kCross[j];
+                    float off = uc * 2.0f - 1.0f;
+
+                    glm::vec3 pos = center + right * (off * hw);
+                    float y = sampler.isValid() ? sampler.sample(pos.x, pos.z) : center.y;
+                    if (deformer && deformer->isBuilt())
+                        y += deformer->getDeformation(pos.x, pos.z);
+                    pos.y = y + Z_BIAS + CAMBER + stripLift;
+
+                    m_vertices.push_back({pos, surfNorm, glm::vec2(uc, v), rtype});
+                }
+            }
+
+            // Build quads for i = 0 .. n - 1 (last connects ring n-1 to closing ring n)
+            for (int i = 0; i < n; ++i) {
+                uint32_t r0 = baseIdx + (uint32_t)i * kCrossCount;
+                uint32_t r1 = baseIdx + (uint32_t)(i + 1) * kCrossCount;
+                for (int j = 0; j < kCrossCount - 1; ++j) {
+                    uint32_t a0 = r0 + j, a1 = r0 + j + 1;
+                    uint32_t b0 = r1 + j, b1 = r1 + j + 1;
+                    m_indices.push_back(a0); m_indices.push_back(b0); m_indices.push_back(a1);
+                    m_indices.push_back(a1); m_indices.push_back(b0); m_indices.push_back(b1);
+                }
+            }
+            continue; // Closed loop is complete and self-contained!
+        }
+
+        // Open road: emit rings 0 .. n - 1
+        lastRingBase[s] = baseIdx + (uint32_t)(n - 1) * kCrossCount;
         for (int i = 0; i < n; ++i) {
             const glm::vec3& center = seg.splinePoints[i];
             const glm::vec3& right  = seg.rightVecs[i];
+            glm::vec3 across = right * (2.0f * hw);
+            float v = (seg.cumulativeDist[i] - seg.cumulativeDist[0] + vOff) * TEX_SCALE;
 
-            // Left, center, right positions
-            glm::vec3 leftPos  = center - right * hw;
-            glm::vec3 rightPos = center + right * hw;
-
-            // Sample terrain height for each vertex
-            float ly = sampler.isValid() ? sampler.sample(leftPos.x, leftPos.z) : center.y;
-            float cy = center.y;
-            float ry = sampler.isValid() ? sampler.sample(rightPos.x, rightPos.z) : center.y;
-
-            if (deformer && deformer->isBuilt()) {
-                ly += deformer->getDeformation(leftPos.x, leftPos.z);
-                cy += deformer->getDeformation(center.x, center.z);
-                ry += deformer->getDeformation(rightPos.x, rightPos.z);
-            }
-
-            // Blend with road elevation + bias
-            leftPos.y  = ly + Z_BIAS;
-            rightPos.y = ry + Z_BIAS;
-            float centerY = cy + Z_BIAS + CAMBER;
-
-            glm::vec3 centerPos = glm::vec3(center.x, centerY, center.z);
-
-            // UV: u = across [0, 0.5, 1], v = distance along road
-            float v = seg.cumulativeDist[i] * TEX_SCALE;
-
-            // Normal (approximate: up vector, will be refined by shader)
-            glm::vec3 norm(0.0f, 1.0f, 0.0f);
-
-            // Compute proper normal from cross-section
-            glm::vec3 leftToRight = rightPos - leftPos;
             glm::vec3 tangent = seg.tangents[i];
-            glm::vec3 surfNorm = glm::normalize(glm::cross(tangent, leftToRight));
+            glm::vec3 surfNorm = glm::normalize(glm::cross(tangent, across));
             if (surfNorm.y < 0.0f) surfNorm = -surfNorm;
 
-            // Emit 3 vertices per ring: left, center, right
-            m_vertices.push_back({leftPos,   surfNorm, glm::vec2(0.0f, v), rtype});
-            m_vertices.push_back({centerPos, surfNorm, glm::vec2(0.5f, v), rtype});
-            m_vertices.push_back({rightPos,  surfNorm, glm::vec2(1.0f, v), rtype});
+            for (int j = 0; j < kCrossCount; ++j) {
+                float uc = kCross[j];
+                float off = uc * 2.0f - 1.0f;
+
+                glm::vec3 pos = center + right * (off * hw);
+                float y = sampler.isValid() ? sampler.sample(pos.x, pos.z) : center.y;
+                if (deformer && deformer->isBuilt())
+                    y += deformer->getDeformation(pos.x, pos.z);
+                pos.y = y + Z_BIAS + CAMBER + stripLift;
+
+                m_vertices.push_back({pos, surfNorm, glm::vec2(uc, v), rtype});
+            }
         }
 
-        // Generate indices (two quads per ring pair: left-center and center-right)
+        // Quads for open road: i = 0 .. n - 2
         for (int i = 0; i < n - 1; ++i) {
-            uint32_t r0 = baseIdx + i * 3;
-            uint32_t r1 = baseIdx + (i + 1) * 3;
+            uint32_t r0 = baseIdx + (uint32_t)i * kCrossCount;
+            uint32_t r1 = baseIdx + (uint32_t)(i + 1) * kCrossCount;
+            for (int j = 0; j < kCrossCount - 1; ++j) {
+                uint32_t a0 = r0 + j, a1 = r0 + j + 1;
+                uint32_t b0 = r1 + j, b1 = r1 + j + 1;
+                m_indices.push_back(a0); m_indices.push_back(b0); m_indices.push_back(a1);
+                m_indices.push_back(a1); m_indices.push_back(b0); m_indices.push_back(b1);
+            }
+        }
 
-            // Left-center quad
-            m_indices.push_back(r0 + 0); m_indices.push_back(r1 + 0); m_indices.push_back(r0 + 1);
-            m_indices.push_back(r0 + 1); m_indices.push_back(r1 + 0); m_indices.push_back(r1 + 1);
+        // ─── 4. Rounded end caps for true dead ends ──────────────────────────
+        for (int end = 0; end < 2; ++end) {
+            int refId = (end == 0) ? segEndRef[s].first : segEndRef[s].second;
+            if (refId < 0) continue;
+            int c = cid[refId];
+            if (c >= 0 && countRealSegsInCluster(cluster[c]) > 1) continue; // connects to another road!
+            if (branchLift[s]) continue; // branch mouth meets host road!
 
-            // Center-right quad
-            m_indices.push_back(r0 + 1); m_indices.push_back(r1 + 1); m_indices.push_back(r0 + 2);
-            m_indices.push_back(r0 + 2); m_indices.push_back(r1 + 1); m_indices.push_back(r1 + 2);
+            const int i0 = (end == 0) ? 0 : n - 1;
+            const glm::vec3& P = seg.splinePoints[i0];
+            glm::vec3 tang = seg.tangents[i0];
+            glm::vec3 right = seg.rightVecs[i0];
+            glm::vec3 outward = (end == 0) ? -tang : tang;
+            glm::vec3 surfNorm = glm::normalize(glm::cross(tang, right * (2.0f * hw)));
+            if (surfNorm.y < 0.0f) surfNorm = -surfNorm;
+
+            const int M = 12;
+            const float vEnd = (seg.cumulativeDist[i0] - seg.cumulativeDist[0] + vOff) * TEX_SCALE;
+
+            glm::vec3 capO = P; capO.y += Z_BIAS + CAMBER + stripLift;
+            const uint32_t capBase = (uint32_t)m_vertices.size();
+            m_vertices.push_back({capO, surfNorm, glm::vec2(0.5f, vEnd), rtype});
+
+            for (int k = 0; k <= M; ++k) {
+                float ang = float(k) / float(M) * PI;
+                glm::vec3 d = -right * hw * std::cos(ang) + outward * hw * std::sin(ang);
+                glm::vec3 pos = P + d;
+                float y = (sampler.isValid()) ? sampler.sample(pos.x, pos.z) : pos.y;
+                if (deformer && deformer->isBuilt()) y += deformer->getDeformation(pos.x, pos.z);
+                pos.y = y + Z_BIAS + CAMBER + stripLift;
+                float uu = float(k) / float(M);
+                float vv = vEnd + (hw * std::sin(ang)) * TEX_SCALE;
+                m_vertices.push_back({pos, surfNorm, glm::vec2(uu, vv), rtype});
+            }
+
+            for (int k = 0; k < M; ++k) {
+                m_indices.push_back(capBase);
+                m_indices.push_back(capBase + 1 + k);
+                m_indices.push_back(capBase + 1 + k + 1);
+            }
+            ++capCount;
+        }
+    }
+
+    // ─── 4b. End-to-End Joints (connecting two roads cleanly) ───────────────
+    // Connects matching cross-section pillars between two adjacent segments.
+    // Preserves lane lines, center double-yellows, and curbs without any grey blotches.
+    for (int c = 0; c < nc; ++c) {
+        if (countRealSegsInCluster(cluster[c]) != 2) continue;
+        int idA = cluster[c][0];
+        int idB = cluster[c][1];
+        int segA = ends[idA].seg;
+        int segB = ends[idB].seg;
+        if (segA == segB || segments[segA].closed || segments[segB].closed) continue;
+
+        bool isBackA = ends[idA].isBack;
+        bool isBackB = ends[idB].isBack;
+        uint32_t ringBaseA = isBackA ? lastRingBase[segA] : firstRingBase[segA];
+        uint32_t ringBaseB = isBackB ? lastRingBase[segB] : firstRingBase[segB];
+
+        // Harmonize pillar alignment:
+        // When one segment enters and the other leaves (isBackA != isBackB),
+        // left meets left (j connects to j).
+        // When both enter or both leave, directions are opposite, so left meets right
+        // relative to the segment's local frame: j connects to (kCrossCount - 1 - j).
+        bool flipB = (isBackA == isBackB);
+
+        for (int j = 0; j < kCrossCount - 1; ++j) {
+            uint32_t a0 = ringBaseA + j;
+            uint32_t a1 = ringBaseA + j + 1;
+            uint32_t b0, b1;
+            if (!flipB) {
+                b0 = ringBaseB + j;
+                b1 = ringBaseB + j + 1;
+            } else {
+                b0 = ringBaseB + (kCrossCount - 1 - j);
+                b1 = ringBaseB + (kCrossCount - 2 - j);
+            }
+            m_indices.push_back(a0); m_indices.push_back(b0); m_indices.push_back(a1);
+            m_indices.push_back(a1); m_indices.push_back(b0); m_indices.push_back(b1);
+            m_indices.push_back(a0); m_indices.push_back(a1); m_indices.push_back(b0);
+            m_indices.push_back(a1); m_indices.push_back(b1); m_indices.push_back(b0);
+        }
+        ++jointCount;
+    }
+
+    // ─── 5. Multi-way Branching Junctions (3+ roads meeting) ─────────────────
+    for (int c = 0; c < nc; ++c) {
+        if (countRealSegsInCluster(cluster[c]) < 3) continue;
+
+        glm::vec2 C(0.0f);
+        float maxHw = 0.0f;
+        int widestType = -1;
+        for (int id : cluster[c]) {
+            const EndRef& e = ends[id];
+            C += e.pos;
+            maxHw = std::max(maxHw, e.hw);
+            if (e.hw >= maxHw || widestType < 0) widestType = (int)segments[e.seg].type;
+        }
+        C /= (float)cluster[c].size();
+
+        int jnType = isPaved(widestType) ? widestType : (int)segments[ends[cluster[c][0]].seg].type;
+        for (int id : cluster[c]) if (isPaved((int)segments[ends[id].seg].type)) { jnType = (int)segments[ends[id].seg].type; break; }
+        if (jnType < 0) jnType = 1;
+
+        struct JnM { glm::vec2 rimL, rimR, tan; float hw; };
+        std::vector<JnM> mem;
+        mem.reserve(cluster[c].size());
+        for (int id : cluster[c]) {
+            const EndRef& e = ends[id];
+            const RoadSegment& s = segments[e.seg];
+            int n = (int)s.splinePoints.size();
+            if (n < 2) continue;
+            const int i0 = e.isBack ? n - 1 : 0;
+            glm::vec2 p(s.splinePoints[i0].x, s.splinePoints[i0].z);
+            glm::vec3 r3 = s.rightVecs[i0];
+            glm::vec2 r2(r3.x, r3.z);
+            float lenR = glm::length(r2);
+            if (lenR > 0.01f) r2 /= lenR; else r2 = glm::vec2(1, 0);
+            glm::vec3 t3 = s.tangents[i0];
+            glm::vec2 tanOut = e.isBack ? -glm::vec2(t3.x, t3.z) : glm::vec2(t3.x, t3.z);
+            if (glm::length(tanOut) > 0.01f) tanOut = glm::normalize(tanOut); else tanOut = glm::vec2(1, 0);
+
+            JnM m = { p - r2 * e.hw, p + r2 * e.hw, tanOut, e.hw };
+            mem.push_back(m);
+        }
+        const int M = (int)mem.size();
+        if (M < 3) continue;
+
+        struct Pt { int m; float ang; glm::vec2 p; };
+        std::vector<Pt> ring;
+        ring.reserve(M * 2);
+        for (int i = 0; i < M; ++i) {
+            ring.push_back({ i, 0.0f, mem[i].rimR });
+            ring.push_back({ i, 0.0f, mem[i].rimL });
+        }
+        for (auto& pt : ring) pt.ang = std::atan2(pt.p.y - C.y, pt.p.x - C.x);
+        std::sort(ring.begin(), ring.end(),
+                  [](const Pt& a, const Pt& b) { return a.ang < b.ang; });
+
+        const glm::vec3 up(0, 1, 0);
+
+        auto emitPoly = [&](glm::vec2 origin, const std::vector<glm::vec2>& bnd, float lift = 0.0f) {
+            if (bnd.size() < 2) return;
+            uint32_t wBase = (uint32_t)m_vertices.size();
+            auto add = [&](const glm::vec2& p2) {
+                float y = sampler.isValid() ? sampler.sample(p2.x, p2.y) : 0.0f;
+                if (deformer && deformer->isBuilt()) y += deformer->getDeformation(p2.x, p2.y);
+                // u = 0.35f gives clean asphalt without center or edge marking lines
+                m_vertices.push_back({ glm::vec3(p2.x, y + Z_BIAS + CAMBER + lift, p2.y), up,
+                                       glm::vec2(0.35f, glm::length(p2) * TEX_SCALE), (float)jnType });
+            };
+            add(origin);
+            for (const auto& p2 : bnd) add(p2);
+            uint32_t wN = (uint32_t)bnd.size() + 1;
+            for (uint32_t k = 1; k + 1 < wN; ++k) {
+                m_indices.push_back(wBase);
+                m_indices.push_back(wBase + k);
+                m_indices.push_back(wBase + k + 1);
+            }
+            ++jnCount;
+        };
+
+        const int RINGN = (int)ring.size();
+        for (int i = 0; i < RINGN; ++i) {
+            const Pt& A = ring[i];
+            const Pt& B = ring[(i + 1) % RINGN];
+            if (A.m == B.m) continue;
+
+            const glm::vec2 va = A.p, vb = B.p;
+            if (glm::length(va - vb) < 0.5f) continue;
+
+            std::vector<glm::vec2> bnd;
+            bnd.push_back(va);
+            bnd.push_back(vb);
+            emitPoly(C, bnd, 0.015f);
         }
     }
 
     m_indexCount = (int)m_indices.size();
     std::cout << "[RoadMeshBuilder] Generated " << m_vertices.size() << " vertices, "
-              << (m_indexCount / 3) << " triangles" << std::endl;
+              << (m_indexCount / 3) << " triangles (" << capCount << " caps, "
+              << jointCount << " joints, " << jnCount << " junction wedges)" << std::endl;
 }
 
 void RoadMeshBuilder::upload() {

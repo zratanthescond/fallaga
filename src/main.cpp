@@ -20,6 +20,42 @@
 #include "Car.h"
 #include "Terrain.h"
 
+// Seeds the standard 5-road test network (A..E, world coords) used by the
+// harnesses that need a real road graph.
+static void seedTestRoadNetwork(RoadGraph* g) {
+    if (!g || !g->segments.empty()) return;
+    RoadSegment a; a.id = 101; a.width = 12.0f; a.type = RoadType::UrbanStreet;
+    a.controlPoints.push_back(RoadPoint{ glm::vec2(4190.0f, -505.0f) });
+    a.controlPoints.push_back(RoadPoint{ glm::vec2(4280.0f, -540.0f) });
+    a.controlPoints.push_back(RoadPoint{ glm::vec2(4370.0f, -600.0f) });
+
+    RoadSegment b; b.id = 102; b.width = 7.0f; b.type = RoadType::CountryDirt;
+    b.controlPoints.push_back(RoadPoint{ glm::vec2(4190.0f, -505.0f) }); // shared endpoint -> junction
+    b.controlPoints.push_back(RoadPoint{ glm::vec2(4190.0f, -440.0f) });
+
+    RoadSegment c; c.id = 103; c.width = 6.0f; c.type = RoadType::CountryDirt;
+    c.controlPoints.push_back(RoadPoint{ glm::vec2(4480.0f, -700.0f) });
+    c.controlPoints.push_back(RoadPoint{ glm::vec2(4540.0f, -720.0f) });
+
+    RoadSegment e; e.id = 105; e.width = 8.0f; e.type = RoadType::ColonialAvenue;
+    e.controlPoints.push_back(RoadPoint{ glm::vec2(4235.0f, -462.0f) });
+    e.controlPoints.push_back(RoadPoint{ glm::vec2(4235.0f, -640.0f) }); // snapped onto 101 after evaluate
+
+    RoadSegment d; d.id = 104; d.width = 10.0f; d.type = RoadType::UrbanStreet;
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4500.0f, -500.0f) });
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4590.0f, -470.0f) });
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4650.0f, -550.0f) });
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4600.0f, -630.0f) });
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4510.0f, -600.0f) });
+    d.controlPoints.push_back(RoadPoint{ glm::vec2(4503.0f, -503.0f) }); // revisit start -> closed loop
+
+    g->segments.push_back(a);
+    g->segments.push_back(b);
+    g->segments.push_back(c);
+    g->segments.push_back(e);
+    g->segments.push_back(d);
+}
+
 
 // --- Function Prototypes ---
 void framebuffer_size_callback(GLFWwindow* window, int width, int height);
@@ -198,6 +234,8 @@ int main() {
         double t_gap = (lastSwapEnd > 0.0) ? (glfwGetTime() - lastSwapEnd) * 1000.0 : 0.0;
 
         // --- Update and Render the game ---
+        game->roadShiftHeld = (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                               glfwGetKey(window, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
         double t0 = glfwGetTime();
         game->update(xoffset, yoffset, static_cast<float>(scrollOffset));
         double t1 = glfwGetTime();
@@ -214,8 +252,21 @@ int main() {
             static const char* shotEnv = std::getenv("FALLAGA_SHOT");
             static long shotFrame = shotEnv ? atol(shotEnv) : -1;
             static const char* carSeqEnv = std::getenv("FALLAGA_CAR_SEQUENCE");
+            static const char* roadProjEnv = std::getenv("FALLAGA_ROAD_PROJECT");
             static long frameNo = 0;
             ++frameNo;
+
+            if (roadProjEnv && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 3;
+                game->roadPanelsVisible = true;
+                const char* refIdxEnv = std::getenv("FALLAGA_REFIDX");
+                if (refIdxEnv) game->roadRefIdx = atoi(refIdxEnv);
+                game->camera->setAngles(120.0f, 40.0f);
+                game->camera->distance = 500.0f;
+                game->camera->reset();
+            }
 
             auto saveCapture = [&](const char* outPath) {
                 int fw = 0, fh = 0;
@@ -230,6 +281,189 @@ int main() {
                 stbi_write_png(outPath, fw, fh, 3, flip.data(), fw * 3);
                 std::cout << "[SHOT] wrote " << outPath << "\n";
             };
+
+            // ── DRAW-ROAD HARNESS: preview → commit → captured frames ──
+            static const char* rdrawEnv2 = std::getenv("FALLAGA_RDRAW");
+            if (rdrawEnv2 && frameNo == 1) {
+                    game->editMode = true;
+                    game->activeEditorMode = 5;
+                    game->roadToolMode = 1;
+                    game->roadDraftPoints.clear();
+                    game->roadPanelsVisible = false;
+                    game->camera->setAngles(120.0f, 40.0f);
+                    game->camera->distance = 500.0f;
+                    game->camera->reset();
+                    std::cout << "[RDRAW] draw tool armed\n";
+            }
+            if (rdrawEnv2 && frameNo == 2) {
+                    for (int i = 0; i < 25; ++i) {
+                        float x = 4190.0f + i * 15.0f, z = -505.0f - i * 3.0f;
+                        float h = game->terrain->getHeight(x, z);
+                        game->roadDraftPoints.push_back(glm::vec3(x, h, z));
+                    }
+                    std::cout << "[RDRAW] pushed 25 draft points (straight drag)\n";
+            }
+            if (rdrawEnv2 && frameNo == 4) saveCapture("scratch/draw_draft.png");
+            if (rdrawEnv2 && frameNo == 5) { game->keyDown(GLFW_KEY_ENTER); std::cout << "[RDRAW] enter committed\n"; }
+            if (rdrawEnv2 && frameNo == 30) saveCapture("scratch/draw_done.png");
+            if (rdrawEnv2 && frameNo == 31) { game->keyDown(GLFW_KEY_F2); std::cout << "[RDRAW] manual roads JSON saved\n"; }
+            if (rdrawEnv2 && frameNo == 35) { std::cout << "[RDRAW] quit\n"; glfwSetWindowShouldClose(window, GLFW_TRUE); }
+
+            // ── DRAW PANEL RENDER VERIFY (status + OK COMMIT / X CANCEL buttons) ──
+            static const char* drawPanelEnv = std::getenv("FALLAGA_DRAWPANEL");
+            if (drawPanelEnv && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 1;
+                game->roadPanelsVisible = true;
+                game->camera->setAngles(120.0f, 40.0f);
+                game->camera->distance = 500.0f;
+                game->camera->reset();
+            }
+            if (drawPanelEnv && frameNo == 2) {
+                const float pts[3][2] = { { 4190.0f, -505.0f }, { 4260.0f, -540.0f }, { 4330.0f, -585.0f } };
+                for (int i = 0; i < 3; ++i) {
+                    float h = game->terrain->getHeight(pts[i][0], pts[i][1]);
+                    game->roadDraftPoints.push_back(glm::vec3(pts[i][0], h, pts[i][1]));
+                }
+            }
+            if (drawPanelEnv && frameNo == 4) saveCapture("scratch/draw_panel.png");
+            if (drawPanelEnv && frameNo == 5) { game->keyDown(GLFW_KEY_S); game->keyDown(GLFW_KEY_J); }   // straight ON, snap OFF
+            if (drawPanelEnv && frameNo == 6) saveCapture("scratch/draw_panel2.png"); // toggled state
+            if (drawPanelEnv && frameNo == 7) { game->keyDown(GLFW_KEY_2); }          // re-enter Draw tool -> must NOT wipe draft
+            if (drawPanelEnv && frameNo == 8) { std::cout << "[DRAWPANEL] draft after re-key-2: " << game->roadDraftPoints.size() << " pts\n";
+                                                glfwSetWindowShouldClose(window, GLFW_TRUE); }
+
+            // ── PROJECTION SAVE/RESTORE HARNESS ──
+            static const char* projSaveEnv = std::getenv("FALLAGA_PROJSAVE");
+            if (projSaveEnv && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 3;
+                game->roadPanelsVisible = true;
+                game->projRefVisible = true;
+                game->camera->setAngles(120.0f, 40.0f);
+                game->camera->distance = 500.0f;
+                game->camera->reset();
+                std::cout << "[PROJSAVE] armed\n";
+            }
+            if (projSaveEnv && frameNo == 3) {
+                game->projRefCenter = glm::vec2(4400.0f, -700.0f);
+                game->projRefScale = 1.35f;
+                game->projRefFlipX = true;
+                game->projRefOpacity = 0.6f;
+                game->projRefYOffset = 3.0f;
+                game->roadRefIdx = 1;
+                game->saveProjRefMap();
+            }
+            if (projSaveEnv && frameNo == 4) saveCapture("scratch/projsave_flash.png"); // flash still active
+
+            // ── SELECT/EDIT PANEL VERIFY (width +/- and delete buttons on selected road) ──
+            static const char* panel0Env = std::getenv("FALLAGA_PANEL0");
+            if (panel0Env && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 0;
+                game->roadPanelsVisible = true;
+                game->camera->setAngles(120.0f, 40.0f);
+                game->camera->distance = 500.0f;
+                game->camera->reset();
+            }
+            if (panel0Env && frameNo == 2) {
+                RoadGraph* g = game->terrain->getRoadGraph();
+                if (g && g->segments.empty()) {
+                    RoadSegment s;
+                    s.id = 999;
+                    s.width = 12.0f;
+                    s.type = RoadType::UrbanStreet;
+                    s.controlPoints.push_back(RoadPoint{ glm::vec2(4190.0f, -505.0f) });
+                    s.controlPoints.push_back(RoadPoint{ glm::vec2(4260.0f, -540.0f) });
+                    s.controlPoints.push_back(RoadPoint{ glm::vec2(4330.0f, -585.0f) });
+                    g->segments.push_back(s);
+                }
+                game->selectedRoadIdx = 0;
+                game->selectedRoadPointIdx = 1;
+                std::cout << "[PANEL0] selected road 0, point 1\n";
+            }
+            if (panel0Env && frameNo == 4) saveCapture("scratch/panel0.png");
+            if (panel0Env && frameNo == 5) glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+            // ── ROAD NETWORK MESH VERIFY (junction patch + closed ring + end caps) ──
+            static const char* meshNetEnv = std::getenv("FALLAGA_MESHNET");
+            if (meshNetEnv && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 0;
+                game->roadPanelsVisible = true;
+                game->player->setPosition(Vec3(4350.0f, -46.5f, -560.0f));
+                game->camera->setAngles(0.0f, 62.0f);
+                game->camera->distance = 420.0f;
+                game->camera->reset();
+            }
+            if (meshNetEnv && frameNo == 2 && game->terrain) {
+                RoadGraph* g = game->terrain->getRoadGraph();
+                if (g && g->segments.empty()) {
+                    seedTestRoadNetwork(g);
+                    game->projRefVisible = false;
+                    game->terrain->rebuildRoadMesh();
+                    // Snap branch E's back endpoint onto road 101's evaluated spline
+                    // (mid-edge) so the T-junction is a real connection test.
+                    {
+                        const RoadSegment& ar = g->segments[0];
+                        const int k = (int)ar.splinePoints.size() / 2;
+                        RoadSegment& er = g->segments[3];
+                        er.controlPoints[1].pos = glm::vec2(ar.splinePoints[k].x, ar.splinePoints[k].z);
+                        std::cout << "[MESHNET] T snap onto road101 spline idx " << k
+                                  << " -> (" << ar.splinePoints[k].x << "," << ar.splinePoints[k].z << ")\n";
+                    }
+                    game->terrain->rebuildRoadMesh();
+                    std::cout << "[MESHNET] rebuilt with " << g->segments.size()
+                              << " segments, tris=" << game->terrain->getRoadMeshBuilder()->getTriangleCount() << "\n";
+                }
+            }
+            if (meshNetEnv && frameNo == 4) {
+                const char* dv = std::getenv("FALLAGA_DEBUGVIEW");
+                saveCapture(dv ? "scratch/meshnet_dbg.png" : "scratch/meshnet.png");
+            }
+            if (meshNetEnv && frameNo == 5) glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+            // ── SAVE/LOAD ROUND-TRIP HARNESS (prove drawn roads persist) ──
+            static const char* roundEnv = std::getenv("FALLAGA_ROADROUND");
+            if (roundEnv && frameNo == 2 && game->terrain) {
+                RoadGraph* g = game->terrain->getRoadGraph();
+                if (g && g->segments.empty()) {
+                    seedTestRoadNetwork(g);
+                    game->terrain->rebuildRoadMesh();
+                    game->terrain->saveRoadsToJSON("assets/roads/roads_manual.json");
+                    std::cout << "[ROUND] seeded 5 roads and saved to roads_manual.json\n";
+                }
+            }
+            if (roundEnv && frameNo == 3) glfwSetWindowShouldClose(window, GLFW_TRUE);
+
+            // ── AUTO-SAVE PERSISTENCE HARNESS (no button: move/scale then quit, verify file) ──
+            static const char* autoSaveEnv = std::getenv("FALLAGA_AUTOSAVE");
+            if (autoSaveEnv && frameNo == 1) {
+                game->editMode = true;
+                game->activeEditorMode = 5;
+                game->roadToolMode = 3;
+                game->roadPanelsVisible = true;
+                game->projRefVisible = true;
+                game->camera->setAngles(120.0f, 40.0f);
+                game->camera->distance = 500.0f;
+                game->camera->reset();
+            }
+            if (autoSaveEnv && frameNo == 3) {
+                game->projRefCenter = glm::vec2(4530.0f, -620.0f);
+                game->projRefScale = 1.6f;
+                game->projRefOpacity = 0.55f;
+                game->projRefYOffset = -4.0f;
+                game->roadRefIdx = 2;
+                std::cout << "[AUTOSAVE] placement changed without pressing any button\n";
+            }
+            if (autoSaveEnv && frameNo == 90) {
+                saveCapture("scratch/autosave_done.png");
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
+            }
 
             if (carSeqEnv && atoi(carSeqEnv) == 1) {
                 // Ensure camera is locked at a cinematic angle looking directly at the driver side

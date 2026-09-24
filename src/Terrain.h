@@ -72,6 +72,20 @@ public:
     glm::vec3 getNormalAt(float x, float z) const;
     float     getRoadAt  (float x, float z) const;
 
+    // Road Edit mode API (in-game road editor)
+    RoadGraph*       getRoadGraph()       const { return roadGraph; }
+    RoadMeshBuilder* getRoadMeshBuilder() const { return roadMeshBuilder; }
+    HeightSampler&   getRoadHeightSampler()     { return roadHeightSampler; }
+    void rebuildRoadMesh();
+    void saveRoadsToJSON(const std::string& path) const;
+
+    // Whole-road-network graph transforms (world space, pivot = center of network)
+    void mirrorRoads(bool flipX);
+    void rotateRoads(float angleDeg);
+    void scaleRoads(float factor);
+    void connectRoads(float tolerance);
+    void translateRoads(float dx, float dz);
+
     // Real-time water level control (editor)
     void  setWaterLevel(float level);  // absolute world Y
     float getWaterLevel() const;
@@ -161,7 +175,7 @@ private:
     void initStreets();
     void buildStreetMesh();
     void renderStreets(const glm::mat4& proj, const glm::mat4& view,
-                       const glm::vec3& lightDir) const;
+                       const glm::vec3& lightDir, const glm::vec3& viewPos) const;
     float distToSegment(float px, float pz,
                         float x1, float z1, float x2, float z2) const;
 };

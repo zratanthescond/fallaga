@@ -43,6 +43,93 @@ bool isInsideHistoricCity(const RoadSegment& segment) {
   return false;
 }
 
+// Four terrain anchors used to validate the projected road network.
+// Plan coordinates come from ProceduralMapData.h "Key anchors (verified against
+// map)"; their world coordinates are the same points translated into the DEM
+// game world by the historic plan offset below.
+constexpr glm::vec2 kAnchorPlan[] = {
+    {-114.0f, -929.0f},  // Kasbah
+    { 530.0f,   71.0f},  // Medina (Place Pichon)
+    { 585.0f,  200.0f},  // Port (user-built quay front: bollards plan x 572-585, z 51..387)
+    { -73.0f,  247.0f},  // Gare PLM
+};
+const char* const kAnchorNames[] = {"Kasbah", "Medina (Pichon)", "Port", "Gare PLM"};
+
+// Translate the traced road network from the projected-plan coordinate space
+// (X in [-1250,2500], Z in [-2500,2500], see ProceduralMapData.h) into the DEM
+// world where the historic city sits.  This is the same plan->world mapping
+// the legacy historic-city roads used (HISTORIC_PLAN_OFFSET).
+void offsetRoadGraphToWorld(RoadGraph& graph, float dx, float dz) {
+  for (auto& seg : graph.segments) {
+    for (auto& p : seg.controlPoints) {
+      p.pos.x += dx;
+      p.pos.y += dz;
+    }
+  }
+}
+
+void verifyRoadAnchors(const RoadGraph& graph) {
+  std::cout << "\n[Terrain] ===== ROAD ANCHOR VERIFICATION (DEM world) =====" << std::endl;
+  for (int ai = 0; ai < 4; ++ai) {
+    const glm::vec2 aPlan = kAnchorPlan[ai];
+    const glm::vec2 aWorld = aPlan + glm::vec2(HISTORIC_PLAN_OFFSET_X, HISTORIC_PLAN_OFFSET_Z);
+
+    float best = 1e9f;
+    for (const auto& seg : graph.segments) {
+      const auto& cps = seg.controlPoints;
+      for (size_t i = 0; i + 1 < cps.size(); ++i) {
+        const glm::vec2& p0 = cps[i].pos;
+        const glm::vec2& p1 = cps[i + 1].pos;
+        const glm::vec2 d = p1 - p0;
+        const float len2 = glm::dot(d, d);
+        float t = (len2 > 1e-8f)
+                      ? glm::clamp(glm::dot(aWorld - p0, d) / len2, 0.0f, 1.0f)
+                      : 0.0f;
+        const glm::vec2 proj = p0 + d * t;
+        best = std::min(best, glm::length(aWorld - proj));
+      }
+    }
+    const bool ok = best < 50.0f;
+    std::cout << "[Terrain]   " << std::left << std::setw(16) << kAnchorNames[ai]
+              << " world(" << std::setw(7) << aWorld.x << ", " << std::setw(7) << aWorld.y
+              << ") plan(" << std::setw(7) << aPlan.x << ", " << std::setw(7) << aPlan.y
+              << ") -> nearest road " << std::setw(6) << std::setprecision(1)
+              << std::fixed << best << " m  " << (ok ? "OK" : "MISS") << std::endl;
+  }
+  std::cout << "[Terrain] ===================================================\n" << std::endl;
+}
+
+const char* roadTypeName(RoadType t) {
+  switch (t) {
+    case RoadType::ColonialAvenue: return "colonial_avenue";
+    case RoadType::UrbanStreet:    return "urban_street";
+    case RoadType::CountryHighway: return "country_highway";
+    case RoadType::CountryDirt:    return "country_dirt";
+    case RoadType::Port:           return "port";
+    case RoadType::Medina:         return "medina";
+  }
+  return "country_dirt";
+}
+
+// Print resolved road sizes (width/shoulder per type) so widths are visible
+// and auditable against the world meter scale used by the mesh builder.
+void reportRoadSizes(const RoadGraph& graph) {
+  std::map<RoadType, int> counts;
+  std::map<RoadType, float> sumW, sumS;
+  for (const auto& seg : graph.segments) {
+    counts[seg.type]++;
+    sumW[seg.type] += seg.width;
+    sumS[seg.type] += seg.shoulderWidth;
+  }
+  std::cout << "[Terrain] Road sizes (resolved by type):" << std::endl;
+  for (const auto& kv : counts) {
+    std::cout << "[Terrain]   " << std::left << std::setw(18) << roadTypeName(kv.first)
+              << std::setw(4) << kv.second << " segs   width=" << std::setprecision(1)
+              << std::fixed << (sumW[kv.first] / kv.second) << " m   shoulder="
+              << (sumS[kv.first] / kv.second) << " m" << std::endl;
+  }
+}
+
 RoadType historicRoadType(const ProceduralMap::MapStreet& street) {
   const bool medinaStreet = street.name.find("Souk") != std::string::npos ||
                             street.name.find("Kasbah") != std::string::npos ||
@@ -236,36 +323,33 @@ Terrain::Terrain() {
       roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
                              terrainManager->getGridW(), terrainManager->getGridH());
 
-      // 2. Load road graph from JSON
+      // 2. Road graph: the old auto-traced road network is REMOVED — roads are
+      //    now drawn by hand in the Road Editor. Only manual roads saved to
+      //    roads_manual.json are restored at startup (empty slate otherwise).
       roadGraph = new RoadGraph();
-      if (roadGraph->loadFromJSON("assets/roads/roads.json")) {
-          replaceWithHistoricCityRoads(*roadGraph);
+      if (roadGraph->loadFromJSON("assets/roads/roads_manual.json")) {
+          // The JSON stores plan coordinates; translate into DEM world space
+          // (mirrors what saveRoadsToJSON does in reverse).
+          offsetRoadGraphToWorld(*roadGraph, HISTORIC_PLAN_OFFSET_X, HISTORIC_PLAN_OFFSET_Z);
           roadGraph->buildTopology();
-
-          // 3. Evaluate Catmull-Rom splines + sample heights
-          std::cout << "[Terrain] Evaluating road splines..." << std::endl;
-          for (auto& seg : roadGraph->segments) {
-              RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
-          }
-
-          // 4. Build terrain deformation field (2048x2048 = ~1 pixel per 13.6m)
-          roadDeformer = new RoadDeformer();
-          roadDeformer->build(roadGraph->segments, roadHeightSampler, mapper, 2048, 2048);
-          terrainManager->setRoadDeformationTexture(roadDeformer->getDeformationTexture());
-
-          // 5. Generate and upload road ribbon mesh
-          roadMeshBuilder = new RoadMeshBuilder();
-          roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, roadDeformer);
-          roadMeshBuilder->upload();
-
-          std::cout << "[Terrain] Road System ready: "
-                    << roadGraph->segments.size() << " segments, "
-                    << roadMeshBuilder->getVertexCount() << " vertices, "
-                    << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
+          std::cout << "[Terrain] Road system: restored " << roadGraph->segments.size()
+                    << " manually drawn road segments\n";
       } else {
-          std::cerr << "[Terrain] Road system: no roads.json found, using legacy fallback" << std::endl;
-          buildStreetMesh(); // Legacy fallback
+          std::cout << "[Terrain] Road system: no manual roads yet (roads_manual.json) — blank slate, draw roads in Road Editor\n";
       }
+
+      // 4. Initial test: Build road ribbon mesh directly without deformation
+      for (auto& seg : roadGraph->segments) {
+          RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
+      }
+      roadMeshBuilder = new RoadMeshBuilder();
+      roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
+      roadMeshBuilder->upload();
+
+      std::cout << "[Terrain] Road System ready: "
+                << roadGraph->segments.size() << " segments, "
+                << roadMeshBuilder->getVertexCount() << " vertices, "
+                << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
   }
   // Load real water normal maps and foam from assets (fall back to procedural if missing)
   auto loadWaterTex = [](const char* path, unsigned int fallback) -> unsigned int {
@@ -553,8 +637,15 @@ void Terrain::buildStreetMesh() {
             << " vertices, " << (iCount / 3) << " triangles." << std::endl;
 }
 
+namespace {
+bool roadDebugView() {
+    static const bool on = (std::getenv("FALLAGA_DEBUGVIEW") != nullptr);
+    return on;
+}
+}  // namespace
+
 void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
-                            const glm::vec3& lightDir) const {
+                            const glm::vec3& lightDir, const glm::vec3& viewPos) const {
   if (streetVAO == 0 || streetIndexCount == 0 || !streetShader) return;
 
   glEnable(GL_DEPTH_TEST);
@@ -570,11 +661,16 @@ void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
   streetShader->setMat4("view", view);
   streetShader->setMat4("model", glm::mat4(1.0f));
   streetShader->setVec3("lightDir", lightDir);
+  streetShader->setVec3("viewPos", viewPos);
+
+  const bool dbg = roadDebugView();
+  if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
 
   glBindVertexArray(streetVAO);
   glDrawElements(GL_TRIANGLES, streetIndexCount, GL_UNSIGNED_INT, 0);
   glBindVertexArray(0);
 
+  if (dbg) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
   glDisable(GL_BLEND);
   glDisable(GL_POLYGON_OFFSET_FILL);
 }
@@ -781,9 +877,13 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         streetShader->setMat4("view", view);
         streetShader->setMat4("model", glm::mat4(1.0f));
         streetShader->setVec3("lightDir", light);
+        streetShader->setVec3("viewPos", cam);
+        const bool dbg = roadDebugView();
+        if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
         roadMeshBuilder->render(*streetShader);
+        if (dbg) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
       } else {
-        renderStreets(proj, view, light);
+        renderStreets(proj, view, light, cam);
       }
     }
   }
@@ -1687,6 +1787,228 @@ void Terrain::saveTerrain() {
   if (terrainManager) {
     terrainManager->saveTerrain();
   }
+}
+
+void Terrain::rebuildRoadMesh() {
+  if (!roadGraph || !roadMeshBuilder) return;
+  for (auto& seg : roadGraph->segments) {
+    RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
+  }
+  roadGraph->buildTopology();
+  roadMeshBuilder->destroy();
+  roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
+  roadMeshBuilder->upload();
+  std::cout << "[Terrain] Road mesh rebuilt: " << roadGraph->segments.size()
+            << " segments, " << roadMeshBuilder->getVertexCount() << " vertices, "
+            << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
+}
+
+void Terrain::saveRoadsToJSON(const std::string& path) const {
+  if (!roadGraph) return;
+  // The in-memory graph lives in world coordinates (plan + offset); the JSON on
+  // disk is stored in plan space, so translate back before writing.
+  RoadGraph planSpace;
+  planSpace.segments.reserve(roadGraph->segments.size());
+  for (const auto& seg : roadGraph->segments) {
+    RoadSegment copy = seg;
+    copy.splinePoints.clear();
+    copy.tangents.clear();
+    copy.rightVecs.clear();
+    copy.curvature.clear();
+    copy.cumulativeDist.clear();
+    for (auto& p : copy.controlPoints) {
+      p.pos.x -= HISTORIC_PLAN_OFFSET_X;
+      p.pos.y -= HISTORIC_PLAN_OFFSET_Z;
+    }
+    planSpace.segments.push_back(copy);
+  }
+  if (planSpace.saveToJSON(path)) {
+    std::cout << "[Terrain] Saved road graph -> " << path << " ("
+              << planSpace.segments.size() << " segments, plan space)" << std::endl;
+  } else {
+    std::cerr << "[Terrain] FAILED to write road graph to " << path << std::endl;
+  }
+}
+
+// Compute the center of the whole road network (average of every control point).
+static glm::vec2 roadNetworkCenter(const RoadGraph& graph) {
+  glm::vec2 c(0.0f);
+  size_t n = 0;
+  for (const auto& seg : graph.segments) {
+    for (const auto& p : seg.controlPoints) {
+      c += p.pos;
+      ++n;
+    }
+  }
+  if (n > 0) c /= (float)n;
+  return c;
+}
+
+void Terrain::mirrorRoads(bool flipX) {
+  if (!roadGraph || roadGraph->segments.empty()) return;
+  const glm::vec2 c = roadNetworkCenter(*roadGraph);
+  for (auto& seg : roadGraph->segments) {
+    for (auto& p : seg.controlPoints) {
+      if (flipX) p.pos.x = 2.0f * c.x - p.pos.x;
+      else       p.pos.y = 2.0f * c.y - p.pos.y;
+    }
+  }
+  rebuildRoadMesh();
+  std::cout << "[Road] Mirrored road network across the " << (flipX ? "Z-axis (X)" : "X-axis (Z)")
+            << " (pivot at " << c.x << ", " << c.y << ")" << std::endl;
+}
+
+void Terrain::rotateRoads(float angleDeg) {
+  if (!roadGraph || roadGraph->segments.empty()) return;
+  const glm::vec2 c = roadNetworkCenter(*roadGraph);
+  const float a = angleDeg * 3.14159265f / 180.0f;
+  const float ca = std::cos(a), sa = std::sin(a);
+  for (auto& seg : roadGraph->segments) {
+    for (auto& p : seg.controlPoints) {
+      const float x = p.pos.x - c.x, z = p.pos.y - c.y;
+      p.pos.x = c.x + ca * x - sa * z;
+      p.pos.y = c.y + sa * x + ca * z;
+    }
+  }
+  rebuildRoadMesh();
+  std::cout << "[Road] Rotated road network by " << angleDeg << " deg"
+            << " (pivot at " << c.x << ", " << c.y << ")" << std::endl;
+}
+
+void Terrain::scaleRoads(float factor) {
+  if (!roadGraph || roadGraph->segments.empty()) return;
+  const glm::vec2 c = roadNetworkCenter(*roadGraph);
+  for (auto& seg : roadGraph->segments) {
+    for (auto& p : seg.controlPoints) {
+      p.pos.x = c.x + (p.pos.x - c.x) * factor;
+      p.pos.y = c.y + (p.pos.y - c.y) * factor;
+    }
+    // Widths and shoulders follow the scale so roads stay proportional.
+    seg.width *= factor;
+    seg.shoulderWidth *= factor;
+  }
+  rebuildRoadMesh();
+  std::cout << "[Road] Scaled road network by " << factor << "x"
+            << " (pivot at " << c.x << ", " << c.y << ")" << std::endl;
+}
+
+void Terrain::translateRoads(float dx, float dz) {
+  if (!roadGraph || roadGraph->segments.empty()) return;
+  for (auto& seg : roadGraph->segments) {
+    for (auto& p : seg.controlPoints) {
+      p.pos.x += dx;
+      p.pos.y += dz;
+    }
+  }
+  rebuildRoadMesh();
+  std::cout << "[Road] Moved road network by (" << dx << ", " << dz << ")m" << std::endl;
+}
+
+void Terrain::connectRoads(float tolerance) {
+  if (!roadGraph || roadGraph->segments.empty()) return;
+  auto& segs = roadGraph->segments;
+
+  // ── Pass 1: snap each segment endpoint onto the nearest other road's
+  //    centerline (forms true T-junctions instead of gaps).
+  auto distPt = [](const RoadPoint& a, const RoadPoint& b) {
+    const float dx = a.pos.x - b.pos.x, dz = a.pos.y - b.pos.y;
+    return std::sqrt(dx * dx + dz * dz);
+  };
+  int snapped = 0;
+  for (auto& seg : segs) {
+    if (seg.controlPoints.empty()) continue;
+    const int eIdx[2] = { 0, (int)seg.controlPoints.size() - 1 };
+    for (int e = 0; e < 2; ++e) {
+      RoadPoint& cp = seg.controlPoints[eIdx[e]];
+      bool found = false; float bestPx = 0.0f, bestPz = 0.0f;
+      for (auto& os : segs) {
+        if (&os == &seg) continue;
+        for (size_t k = 0; k + 1 < os.controlPoints.size(); ++k) {
+          const float dx = os.controlPoints[k + 1].pos.x - os.controlPoints[k].pos.x;
+          const float dz = os.controlPoints[k + 1].pos.y - os.controlPoints[k].pos.y;
+          const float len2 = dx * dx + dz * dz;
+          const float t = (len2 > 1e-8f)
+                              ? glm::clamp(((cp.pos.x - os.controlPoints[k].pos.x) * dx +
+                                            (cp.pos.y - os.controlPoints[k].pos.y) * dz) / len2, 0.0f, 1.0f)
+                              : 0.0f;
+          const float px = os.controlPoints[k].pos.x + t * dx;
+          const float pz = os.controlPoints[k].pos.y + t * dz;
+          const float d = std::sqrt((cp.pos.x - px) * (cp.pos.x - px) +
+                                    (cp.pos.y - pz) * (cp.pos.y - pz));
+          // Only connect to a road's interior (true T) — ignore hits on the
+          // other road's own near endpoints to avoid squashing parallel roads.
+          const bool nearEnd = (t * len2 <= tolerance * tolerance && t < 0.2f) ||
+                               (len2 * (1.0f - t) * (1.0f - t) <= tolerance * tolerance && t > 0.8f);
+          if (d < tolerance && !nearEnd && (!found || d < std::sqrt((cp.pos.x - bestPx) * (cp.pos.x - bestPx) + (cp.pos.y - bestPz) * (cp.pos.y - bestPz)))) {
+            found = true; bestPx = px; bestPz = pz;
+          }
+        }
+      }
+      if (found) {
+        cp.pos.x = bestPx;
+        cp.pos.y = bestPz;
+        ++snapped;
+      }
+    }
+  }
+
+  // ── Pass 2: merge segments whose endpoints coincide into one polyline.
+  int merged = 0;
+  bool anyChange = true;
+  while (anyChange) {
+    anyChange = false;
+    for (int i = 0; i < (int)segs.size() && !anyChange; ++i) {
+      auto& A = segs[i];
+      if (A.controlPoints.size() < 2) continue;
+      for (int j = 0; j < (int)segs.size(); ++j) {
+        if (i == j || anyChange) continue;
+        auto& B = segs[j];
+        if (B.controlPoints.size() < 2) continue;
+
+        bool attached = false;
+        // A.last -> B.first : extend A with B
+        if (distPt(A.controlPoints.back(), B.controlPoints.front()) <= tolerance) {
+          A.controlPoints.pop_back();
+          for (const auto& p : B.controlPoints) A.controlPoints.push_back(p);
+          attached = true;
+        }
+        // A.first -> B.first : reverse A, then extend with B
+        else if (distPt(A.controlPoints.front(), B.controlPoints.front()) <= tolerance) {
+          std::reverse(A.controlPoints.begin(), A.controlPoints.end());
+          A.controlPoints.pop_back();
+          for (const auto& p : B.controlPoints) A.controlPoints.push_back(p);
+          attached = true;
+        }
+        // A.last -> B.last : reverse B, then extend A with B
+        else if (distPt(A.controlPoints.back(), B.controlPoints.back()) <= tolerance) {
+          std::reverse(B.controlPoints.begin(), B.controlPoints.end());
+          A.controlPoints.pop_back();
+          for (const auto& p : B.controlPoints) A.controlPoints.push_back(p);
+          attached = true;
+        }
+        // A.first -> B.last : prepend B to A
+        else if (distPt(A.controlPoints.front(), B.controlPoints.back()) <= tolerance) {
+          std::vector<RoadPoint> combined;
+          for (const auto& p : B.controlPoints) combined.push_back(p);
+          combined.pop_back();
+          for (const auto& p : A.controlPoints) combined.push_back(p);
+          A.controlPoints = std::move(combined);
+          attached = true;
+        }
+        if (attached) {
+          segs.erase(segs.begin() + j);
+          ++merged;
+          anyChange = true;
+          break;
+        }
+      }
+    }
+  }
+
+  rebuildRoadMesh();
+  std::cout << "[Road] connectRoads(tolerance=" << tolerance << "m): " << snapped
+            << " endpoints snapped, " << merged << " segments merged, "
+            << segs.size() << " segments left" << std::endl;
 }
 
 void Terrain::setWaterLevel(float level) {

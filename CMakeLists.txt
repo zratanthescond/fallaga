@@ -41,11 +41,14 @@ add_executable(RDR2_Prototype
     src/AudioSystem.cpp
     src/Car.cpp
     src/RoadSystem.cpp
-)
+    src/terrain/TerrainSystem.cpp
+    src/terrain/Heightfield.cpp
+    )
 
 # Include directories
 target_include_directories(RDR2_Prototype
     PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${GLEW_INCLUDE_DIRS}
 )
 

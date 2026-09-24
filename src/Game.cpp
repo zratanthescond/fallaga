@@ -11,8 +11,10 @@
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
 #include <cstdlib>
+#include <cmath>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
 #include "Shader.h"
 #include "AudioSystem.h"
 #include "Car.h"
@@ -20,9 +22,55 @@
 #include "TextureEngine.h"
 #include "GameEditorUtils.h"
 #include "GameplayUtils.h"
+#include <stb_image.h>
 
 #define WINDOW_WIDTH 800
 #define WINDOW_HEIGHT 600
+
+// ── Road Edit mode helpers ──
+namespace {
+const char* roadTypeLabel(int t) {
+    switch ((RoadType)t) {
+        case RoadType::ColonialAvenue: return "Colonial Avenue";
+        case RoadType::UrbanStreet:    return "Urban Street";
+        case RoadType::CountryHighway: return "Country Highway";
+        case RoadType::CountryDirt:    return "Country Dirt";
+        case RoadType::Port:           return "Port";
+        case RoadType::Medina:         return "Medina";
+    }
+    return "?";
+}
+float roadDefaultWidthFor(RoadType t) {
+    switch (t) {
+        case RoadType::ColonialAvenue: return 11.5f;
+        case RoadType::UrbanStreet:    return 8.0f;
+        case RoadType::CountryHighway: return 8.5f;
+        case RoadType::CountryDirt:    return 6.0f;
+        case RoadType::Port:           return 10.0f;
+        case RoadType::Medina:         return 5.0f;
+    }
+    return 6.0f;
+}
+float roadDefaultShoulderFor(RoadType t) {
+    return (t == RoadType::Medina) ? 0.75f : 1.5f;
+}
+// Distance from point (px,pz) to the segment (ax,az)-(bx,bz)
+float distPointToPolylineSegment(float px, float pz, float ax, float az, float bx, float bz) {
+    float dx = bx - ax, dz = bz - az;
+    float len2 = dx * dx + dz * dz;
+    float t = (len2 > 1e-8f) ? glm::clamp(((px - ax) * dx + (pz - az) * dz) / len2, 0.0f, 1.0f) : 0.0f;
+    float cx = ax + t * dx, cz = az + t * dz;
+    return std::sqrt((px - cx) * (px - cx) + (pz - cz) * (pz - cz));
+}
+// Reference map files shown as a picture-in-picture overlay in road edit mode ([ ] cycles)
+// NOTE: roadMap.png is a generated all-black mask - NEVER include it here (renders as a black frame).
+const char* roadRefPaths[] = {
+    "assets/terrain/sousseMap1899.png",
+    "assets/terrain/sousseMap1899-roads.png",
+    "assets/terrain/sousseMap1899-roads+monimet.png"
+};
+const int roadRefPathCount = (int)(sizeof(roadRefPaths) / sizeof(roadRefPaths[0]));
+} // namespace
 
 Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
     AudioSystem::getInstance().init();
@@ -85,6 +133,18 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     deltaTime = currentTime - lastFrameTime;
     lastFrameTime = currentTime;
     totalTime += deltaTime;
+    if (projSaveFlash > 0.0f) projSaveFlash = glm::max(0.0f, projSaveFlash - (float)deltaTime);
+
+    // Auto-persist projected map placement whenever it changes (throttled, no button needed)
+    bool projChanged =
+        projRefCenter.x != projSavedCenter.x || projRefCenter.y != projSavedCenter.y ||
+        projRefScale != projSavedScale || projRefOpacity != projSavedOpacity ||
+        projRefYOffset != projSavedYOffset || projRefFlipX != projSavedFlipX ||
+        projRefFlipZ != projSavedFlipZ || roadRefIdx != projSavedIdx ||
+        projRefMapW != projSavedMapW;
+    if (projChanged && (currentTime - projLastSave) > 0.5) {
+        saveProjRefMap();
+    }
    // std::cout << "Delta Time: " << deltaTime << " seconds\n";
     player->update(camera, static_cast<float>(deltaTime), terrain);
     camera->update(mouseDeltaX, mouseDeltaY, mouseScroll, static_cast<float>(deltaTime), editMode);
@@ -138,43 +198,27 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
 
             // Check Mode Switcher Clicks (Top Bar)
             if (mouseY >= 0 && mouseY <= 32) {
-                float center = (float)windowWidth / 2.0f;
+                const float tabW = 110.0f, tabGap = 8.0f, edgeM = 10.0f;
+                float spanW = 6 * tabW + 5 * tabGap;
+                float startX = (float)windowWidth * 0.5f - spanW * 0.5f;
+                if (startX < edgeM) startX = edgeM;
                 if (leftMouseClicked) {
-                    if (mouseX >= center - 300 && mouseX <= center - 190) {
-                        activeEditorMode = 0;
-                        editMode = false;
-                        std::cout << "[Editor Mode] Switched to Game Mode\n";
-                    }
-                    else if (mouseX >= center - 180 && mouseX <= center - 70) {
-                        activeEditorMode = 1;
-                        editMode = true;
-                        editorBrushMode = 0;
-                        std::cout << "[Editor Mode] Switched to Actor Edit Mode\n";
-                    }
-                    else if (mouseX >= center - 60 && mouseX <= center + 50) {
-                        activeEditorMode = 2;
-                        editMode = true;
-                        editorBrushMode = 1;
-                        std::cout << "[Editor Mode] Switched to Terrain Sculpt Mode\n";
-                    }
-                    else if (mouseX >= center + 60 && mouseX <= center + 170) {
-                        activeEditorMode = 3;
-                        editMode = true;
-                        editorBrushMode = 4;
-                        std::cout << "[Editor Mode] Switched to Terrain Paint Mode\n";
-                    }
-                    else if (mouseX >= center + 180 && mouseX <= center + 290) {
-                        activeEditorMode = 4;
-                        editMode = true;
-                        editorBrushMode = 0;
-                        std::cout << "[Editor Mode] Switched to Water Level Mode\n";
+                    for (int i = 0; i < 6; ++i) {
+                        float tx = startX + i * (tabW + tabGap);
+                        if (mouseX >= tx && mouseX <= tx + tabW) {
+                            activeEditorMode = i;
+                            editMode = (i != 0);
+                            editorBrushMode = (i == 2) ? 1 : (i == 3) ? 4 : 0;
+                            std::cout << "[Editor Mode] Switched to Mode " << i << "...\n";
+                            break;
+                        }
                     }
                 }
                 clickedUI = true;
             }
 
             // Check Left Panel Clicks
-            if (!clickedUI && mouseX >= lpX && mouseX <= lpX + lpW && mouseY >= lpY && mouseY <= lpY + lpH) {
+            if (!clickedUI && roadPanelsVisible && mouseX >= lpX && mouseX <= lpX + lpW && mouseY >= lpY && mouseY <= lpY + lpH) {
                 clickedUI = true;
                 if (leftMouseDown) {
                     if (activeEditorMode == 1) {
@@ -256,9 +300,259 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         waterSim.setOceanWaterLevel(waterLevelAdjust);
                         terrain->updateWaterMapTexture(waterSim.getTextureData());
                     }
+                    else if (activeEditorMode == 5) {
+                        // Road Edit Mode: tool buttons
+                        for (int i = 0; i < 4; ++i) {
+                            float btnY = lpY + 45 + i * 26;
+                            if (leftMouseClicked && mouseY >= btnY - 2 && mouseY <= btnY + 20) {
+                                roadToolMode = i;
+                                if (roadToolMode == 1 && i != 1) roadDraftPoints.clear();
+                                std::cout << "[Road] Tool -> " << roadToolMode << "\n";
+                            }
+                        }
+                        RoadGraph* rg2 = terrain->getRoadGraph();
+                        if (roadToolMode == 1) {
+                            // NEW ROAD PROPERTY EDITOR (type, width, shoulder)
+                            for (int i = 0; i < 6; ++i) {
+                                float btnY = lpY + 215 + i * 22;
+                                if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 20) {
+                                    roadDrawType = i;
+                                    roadDrawWidth = roadDefaultWidthFor((RoadType)i);
+                                    roadDrawShoulder = roadDefaultShoulderFor((RoadType)i);
+                                    std::cout << "[Road] New road type -> " << roadTypeLabel(i)
+                                              << " (w " << roadDrawWidth << "m, s " << roadDrawShoulder << "m)\n";
+                                }
+                            }
+                            float wY = lpY + 358;
+                            if (leftMouseClicked && mouseY >= wY && mouseY <= wY + 24) {
+                                if (mouseX >= lpX + 8 && mouseX <= lpX + 68) roadDrawWidth = glm::max(2.0f, roadDrawWidth - 0.5f);
+                                else if (mouseX >= lpX + 78 && mouseX <= lpX + 138) roadDrawWidth = glm::min(30.0f, roadDrawWidth + 0.5f);
+                                std::cout << "[Road] New road width = " << roadDrawWidth << "m\n";
+                            }
+                            float sY = lpY + 396;
+                            if (leftMouseClicked && mouseY >= sY && mouseY <= sY + 24) {
+                                if (mouseX >= lpX + 8 && mouseX <= lpX + 68) roadDrawShoulder = glm::max(0.0f, roadDrawShoulder - 0.25f);
+                                else if (mouseX >= lpX + 78 && mouseX <= lpX + 138) roadDrawShoulder = glm::min(10.0f, roadDrawShoulder + 0.25f);
+                                std::cout << "[Road] New road shoulder = " << roadDrawShoulder << "m\n";
+                            }
+                            // Draw-tool option toggles (STRAIGHT / SNAP)
+                            float sLy = lpY + 480;
+                            if (leftMouseClicked && mouseY >= sLy && mouseY <= sLy + 22) {
+                                roadStraightMode = !roadStraightMode;
+                                std::cout << "[Road] Straight-line drawing " << (roadStraightMode ? "ON" : "OFF")
+                                          << " (or hold Shift for one-shot)\n";
+                            }
+                            float sNy = lpY + 502;
+                            if (leftMouseClicked && mouseY >= sNy && mouseY <= sNy + 22) {
+                                roadSnapToRoads = !roadSnapToRoads;
+                                std::cout << "[Road] Snap-to-road-endpoints " << (roadSnapToRoads ? "ON" : "OFF") << "\n";
+                            }
+                            // DEL PT / OK COMMIT / X CANCEL buttons for the active drawing
+                            float oY = lpY + 548, thirdW = (lpW - 16 - 12) / 3.0f;
+                            if (leftMouseClicked && mouseY >= oY && mouseY <= oY + 22) {
+                                if (mouseX >= lpX + 8 && mouseX <= lpX + 8 + thirdW) {
+                                    if (!roadDraftPoints.empty()) {
+                                        roadDraftPoints.pop_back();
+                                        draftDragIdx = -1;
+                                        std::cout << "[Road] Removed last draft point (" << roadDraftPoints.size() << " left)\n";
+                                    }
+                                } else if (mouseX >= lpX + 8 + thirdW + 6 && mouseX <= lpX + 8 + 2 * (thirdW + 6)) commitRoadDraft();
+                                else if (mouseX >= lpX + 8 + 2 * (thirdW + 6) && mouseX <= lpX + 8 + lpW - 16) cancelRoadDraft();
+                            }
+                        } else if (roadToolMode == 3) {
+                            // PROJECTED REFERENCE MAP CONTROLS
+                            if (leftMouseClicked && mouseY >= lpY + 210 && mouseY <= lpY + 232) {
+                                projRefVisible = !projRefVisible;
+                                std::cout << "[Road] Terrain projection " << (projRefVisible ? "shown" : "hidden") << "\n";
+                            }
+                            const float cW = 140.0f, cGap = 12.0f;
+                            const float x1 = lpX + 8, x2 = lpX + 8 + cW + cGap;
+                            // Move X
+                            if (leftMouseClicked && mouseY >= lpY + 244 && mouseY <= lpY + 266) {
+                                const float step = 20.0f;
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefCenter.x -= step;
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefCenter.x += step;
+                            }
+                            // Move Y (height)
+                            if (leftMouseClicked && mouseY >= lpY + 278 && mouseY <= lpY + 300) {
+                                const float step = 5.0f;
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefYOffset = glm::max(-200.0f, projRefYOffset - step);
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefYOffset = glm::min(200.0f, projRefYOffset + step);
+                                std::cout << "[Road] Projection height = " << projRefYOffset << "m\n";
+                            }
+                            // Move Z
+                            if (leftMouseClicked && mouseY >= lpY + 312 && mouseY <= lpY + 334) {
+                                const float step = 20.0f;
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefCenter.y -= step;
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefCenter.y += step;
+                            }
+                            // Scale
+                            if (leftMouseClicked && mouseY >= lpY + 354 && mouseY <= lpY + 376) {
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefScale = glm::max(0.1f, projRefScale - 0.1f);
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefScale = glm::min(10.0f, projRefScale + 0.1f);
+                            }
+                            // Flip
+                            if (leftMouseClicked && mouseY >= lpY + 388 && mouseY <= lpY + 410) {
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefFlipX = !projRefFlipX;
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefFlipZ = !projRefFlipZ;
+                                std::cout << "[Road] Flip X=" << projRefFlipX << " Z=" << projRefFlipZ << "\n";
+                            }
+                            // Opacity
+                            if (leftMouseClicked && mouseY >= lpY + 422 && mouseY <= lpY + 444) {
+                                if (mouseX >= x1 && mouseX <= x1 + cW) projRefOpacity = glm::max(0.1f, projRefOpacity - 0.1f);
+                                else if (mouseX >= x2 && mouseX <= x2 + cW) projRefOpacity = glm::min(1.0f, projRefOpacity + 0.1f);
+                            }
+                            // Reset
+                            if (leftMouseClicked && mouseY >= lpY + 456 && mouseY <= lpY + 478) {
+                                projRefVisible = true;
+                                projRefScale = 1.0f;
+                                projRefFlipX = projRefFlipZ = false;
+                                projRefOpacity = 0.85f;
+                                projRefYOffset = 0.0f;
+                                projRefInitialized = false;
+                                std::cout << "[Road] Projection reset (next render re-places from saved file or Port)\n";
+                            }
+                            // Save placement & scale to disk (restored on next launch)
+                            if (leftMouseClicked && mouseY >= lpY + 494 && mouseY <= lpY + 516) {
+                                saveProjRefMap();
+                            }
+                            // Reference map image: prev / next
+                            const float mapBtnW = (lpW - 16 - 6) * 0.5f;
+                            float mY = lpY + 556;
+                            if (leftMouseClicked && mouseY >= mY && mouseY <= mY + 22) {
+                                int dir = 0;
+                                if (mouseX >= lpX + 8 && mouseX <= lpX + 8 + mapBtnW) dir = -1;
+                                else if (mouseX >= lpX + 8 + mapBtnW + 6 && mouseX <= lpX + 8 + lpW - 16) dir = +1;
+                                if (dir) {
+                                    int next = (roadRefIdx + dir + roadRefPathCount) % roadRefPathCount;
+                                    if (next != roadRefIdx) {
+                                        roadRefIdx = next;
+                                        roadRefLoaded = false;
+                                        std::cout << "[Road] Reference map -> " << roadRefPaths[roadRefIdx] << "\n";
+                                    }
+                                }
+                            }
+                            // Picture-in-picture toggle
+                            float ppY = lpY + 586;
+                            if (leftMouseClicked && mouseY >= ppY && mouseY <= ppY + 22) {
+                                roadRefVisible = !roadRefVisible;
+                                std::cout << "[Road] Reference image " << (roadRefVisible ? "shown" : "hidden") << "\n";
+                            }
+                        } else if (rg2 && selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg2->segments.size()) {
+                            // Texture (road type) buttons for the selected road
+                            for (int i = 0; i < 6; ++i) {
+                                float btnY = lpY + 260 + i * 22;
+                                if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 18) {
+                                    auto& seg = rg2->segments[selectedRoadIdx];
+                                    seg.type = (RoadType)i;
+                                    seg.width = roadDefaultWidthFor(seg.type);
+                                    seg.shoulderWidth = roadDefaultShoulderFor(seg.type);
+                                    roadGraphDirty = true;
+                                    std::cout << "[Road] Segment texture -> " << roadTypeLabel(i) << "\n";
+                                }
+                            }
+                            // Width -10% / +10% for the selected road (was '=' / '-')
+                            float wYb = lpY + 438;
+                            if (leftMouseClicked && mouseY >= wYb && mouseY <= wYb + 22) {
+                                auto& segW = rg2->segments[selectedRoadIdx];
+                                if (mouseX >= lpX + 70 && mouseX <= lpX + 130) segW.width = glm::clamp(segW.width / 1.1f, 2.0f, 40.0f);
+                                else if (mouseX >= lpX + 136 && mouseX <= lpX + 196) segW.width = glm::clamp(segW.width * 1.1f, 2.0f, 40.0f);
+                                roadGraphDirty = true;
+                                std::cout << "[Road] Selected width -> " << segW.width << "m (id=" << segW.id << ")\n";
+                            }
+                            // Delete selected point/road (was Del key)
+                            float dYb = lpY + 468;
+                            if (leftMouseClicked && mouseY >= dYb && mouseY <= dYb + 22) {
+                                if (selectedRoadPointIdx >= 0 &&
+                                    (int)rg2->segments[selectedRoadIdx].controlPoints.size() > 2) {
+                                    rg2->segments[selectedRoadIdx].controlPoints.erase(
+                                        rg2->segments[selectedRoadIdx].controlPoints.begin() + selectedRoadPointIdx);
+                                    selectedRoadPointIdx = -1;
+                                    std::cout << "[Road] Removed control point\n";
+                                } else {
+                                    rg2->segments.erase(rg2->segments.begin() + selectedRoadIdx);
+                                    selectedRoadIdx = -1;
+                                    selectedRoadPointIdx = -1;
+                                    std::cout << "[Road] Deleted selected road\n";
+                                }
+                                roadGraphDirty = true;
+                            }
+                        }
+                    }
                     float saveBtnY = lpH - 35 + lpY;
                     if (leftMouseClicked && mouseY >= saveBtnY && mouseY <= saveBtnY + 26) {
                         performSave();
+                    }
+                }
+            }
+            // Check Right Panel Clicks (Road Graph Transform, mode 5)
+            else if (activeEditorMode == 5 && roadPanelsVisible && mouseX >= rpX && mouseX <= rpX + rpW && mouseY >= rpY && mouseY <= rpY + rpH) {
+                clickedUI = true;
+                if (leftMouseClicked) {
+                    const float colW = 150.0f, gap = 10.0f, smallColW = 96.0f;
+                    float dy = rpY + 45;
+
+                    // Mirror buttons
+                    float mbY = dy + 22;
+                    if (mouseY >= mbY && mouseY <= mbY + 26) {
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) terrain->mirrorRoads(true);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) terrain->mirrorRoads(false);
+                    }
+                    dy = mbY + 40;
+
+                    // Rotate buttons
+                    float rbY = dy + 22;
+                    if (mouseY >= rbY && mouseY <= rbY + 26) {
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + smallColW) terrain->rotateRoads(-90.0f);
+                        else if (mouseX >= rpX + 15 + smallColW + gap && mouseX <= rpX + 15 + 2 * (smallColW + gap)) terrain->rotateRoads(180.0f);
+                        else if (mouseX >= rpX + 15 + 2 * (smallColW + gap) && mouseX <= rpX + 15 + 3 * smallColW + 2 * gap) terrain->rotateRoads(90.0f);
+                    }
+                    dy = rbY + 40;
+
+                    // Scale buttons
+                    float scY = dy + 22;
+                    if (mouseY >= scY && mouseY <= scY + 26) {
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) roadTransformScale = glm::clamp(roadTransformScale - 0.05f, 0.2f, 3.0f);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) roadTransformScale = glm::clamp(roadTransformScale + 0.05f, 0.2f, 3.0f);
+                    }
+                    float applyY = scY + 32;
+                    if (mouseY >= applyY && mouseY <= applyY + 26 && mouseX >= rpX + 15 && mouseX <= rpX + rpW - 15) {
+                        terrain->scaleRoads(roadTransformScale);
+                    }
+                    float resetY = applyY + 32;
+                    if (mouseY >= resetY && mouseY <= resetY + 26 && mouseX >= rpX + 15 && mouseX <= rpX + rpW - 15) {
+                        roadTransformScale = 1.0f;
+                        std::cout << "[Road] Scale reset to 1.0x\n";
+                    }
+                    dy = resetY + 40;
+
+                    // Connect buttons
+                    float cbY = dy + 22;
+                    if (mouseY >= cbY && mouseY <= cbY + 26 && mouseX >= rpX + 15 && mouseX <= rpX + rpW - 15) {
+                        terrain->connectRoads(roadConnectTolerance);
+                    }
+                    float tolY = cbY + 32;
+                    if (mouseY >= tolY && mouseY <= tolY + 26) {
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) roadConnectTolerance = glm::clamp(roadConnectTolerance - 5.0f, 5.0f, 100.0f);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) roadConnectTolerance = glm::clamp(roadConnectTolerance + 5.0f, 5.0f, 100.0f);
+                    }
+                    float mdy = tolY + 40;
+                    float mY1 = mdy + 22;
+                    if (mouseY >= mY1 && mouseY <= mY1 + 26) {
+                        const float st = roadMoveStep;
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) terrain->translateRoads(-st, 0.0f);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) terrain->translateRoads(st, 0.0f);
+                    }
+                    float mY2 = mY1 + 32;
+                    if (mouseY >= mY2 && mouseY <= mY2 + 26) {
+                        const float st = roadMoveStep;
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) terrain->translateRoads(0.0f, -st);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) terrain->translateRoads(0.0f, st);
+                    }
+                    float mY3 = mY2 + 32;
+                    if (mouseY >= mY3 && mouseY <= mY3 + 26) {
+                        if (mouseX >= rpX + 15 && mouseX <= rpX + 15 + colW) roadMoveStep = glm::clamp(roadMoveStep - 5.0f, 5.0f, 200.0f);
+                        else if (mouseX >= rpX + 15 + colW + gap && mouseX <= rpX + 15 + colW + gap + colW) roadMoveStep = glm::clamp(roadMoveStep + 5.0f, 5.0f, 200.0f);
                     }
                 }
             }
@@ -434,7 +728,197 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                 }
 
                 if (hit) {
-                    if (editorBrushMode == 0) { // Select / Move
+                    if (activeEditorMode == 5) {
+                        // ── Road Edit tool interactions ──
+                        RoadGraph* rg = terrain->getRoadGraph();
+                        if (rg) {
+                            if (roadToolMode == 0) { // Select road
+                                if (leftMouseClicked) {
+                                    int best = -1; float bestD = 10.0f;
+                                    for (size_t s = 0; s < rg->segments.size(); ++s) {
+                                        const auto& cps = rg->segments[s].controlPoints;
+                                        for (size_t i = 0; i + 1 < cps.size(); ++i) {
+                                            float d = distPointToPolylineSegment(lastRayHitPos.x, lastRayHitPos.z,
+                                                                                cps[i].pos.x, cps[i].pos.y,
+                                                                                cps[i+1].pos.x, cps[i+1].pos.y);
+                                            if (d < bestD) { bestD = d; best = (int)s; }
+                                        }
+                                    }
+                                    selectedRoadIdx = best;
+                                    selectedRoadPointIdx = -1;
+                                    if (best >= 0) {
+                                        std::cout << "[Road] Selected id=" << rg->segments[best].id
+                                                  << " type=" << roadTypeLabel((int)rg->segments[best].type)
+                                                  << " (" << rg->segments[best].controlPoints.size() << " pts)\n";
+                                    } else {
+                                        std::cout << "[Road] No road within 10m of click (Select tool)\n";
+                                    }
+                                }
+                            }
+                            else if (roadToolMode == 1) { // Draw road
+                                if (!leftMouseDown) draftDragIdx = -1; // mouse released, stop moving
+                                // Straight-line axis lock (0/45/90 deg): Shift-hold or roadStraightMode, from the previous point
+                                auto makePos = [&](const glm::vec3& in) -> glm::vec3 {
+                                    glm::vec3 p = in;
+                                    if ((roadShiftHeld || roadStraightMode) && !roadDraftPoints.empty()) {
+                                        const glm::vec3& last = roadDraftPoints.back();
+                                        float dx = p.x - last.x, dz = p.z - last.z;
+                                        const float adx = std::fabs(dx), adz = std::fabs(dz);
+                                        if (adx >= adz) {
+                                            dz = (adz > adx * 0.4142f) ? (dz < 0 ? -adx : adx) : 0.0f;  // diagonal or horizontal
+                                        } else {
+                                            dx = (adx > adz * 0.4142f) ? (dx < 0 ? -adz : adz) : 0.0f;  // diagonal or vertical
+                                        }
+                                        p.x = last.x + dx; p.z = last.z + dz;
+                                    }
+                                    return p;
+                                };
+                                // Snap onto the nearest existing road ENDPOINT (first/last control point)
+                                auto snapPt = [&](const glm::vec3& in) -> glm::vec3 {
+                                    if (!roadSnapToRoads) return in;
+                                    glm::vec3 out = in;
+                                    float bestD = roadSnapTolerance;
+                                    for (const auto& seg : rg->segments) {
+                                        const auto& cps = seg.controlPoints;
+                                        if (cps.empty()) continue;
+                                        auto probe = [&](const RoadPoint& cp) {
+                                            float dx = out.x - cp.pos.x, dz = out.z - cp.pos.y;
+                                            float d = std::sqrt(dx * dx + dz * dz);
+                                            if (d < bestD) { bestD = d; out = glm::vec3(cp.pos.x, in.y, cp.pos.y); }
+                                        };
+                                        probe(cps.front());
+                                        if (cps.size() > 1) probe(cps.back());
+                                    }
+                                    return out;
+                                };
+                                auto emitP = [&](const glm::vec3& p) {
+                                    if (!roadDraftPoints.empty()) {
+                                        float dx = p.x - roadDraftPoints.back().x, dz = p.z - roadDraftPoints.back().z;
+                                        if (dx * dx + dz * dz < 1.0f) return; // ignore degenerate duplicates
+                                    }
+                                    roadDraftPoints.push_back(p);
+                                    std::cout << "[Road] Draft point " << roadDraftPoints.size()
+                                              << " @ (" << std::fixed << std::setprecision(1)
+                                              << p.x << ", " << p.z << ")\n";
+                                };
+                                if (leftMouseClicked) {
+                                    // 1) Grab & move an existing draft control point (only when clicked right ON one)
+                                    int nearestP = -1; float nearestD = 3.0f;
+                                    for (int i = 0; i < (int)roadDraftPoints.size(); ++i) {
+                                        float dx = lastRayHitPos.x - roadDraftPoints[i].x;
+                                        float dz = lastRayHitPos.z - roadDraftPoints[i].z;
+                                        float d = std::sqrt(dx * dx + dz * dz);
+                                        if (d < nearestD) { nearestD = d; nearestP = i; }
+                                    }
+                                    if (nearestP >= 0) {
+                                        draftDragIdx = nearestP;
+                                        roadDraftPoints[draftDragIdx] = snapPt(lastRayHitPos);
+                                        std::cout << "[Road] Moving draft point " << nearestP << "\n";
+                                    }
+                                    // 2) Insert a new control point into the nearest draft edge
+                                    else if (roadDraftPoints.size() >= 2) {
+                                        float bestE = 400.0f; int bestI = -1;
+                                        for (int i = 0; i + 1 < (int)roadDraftPoints.size(); ++i) {
+                                            float d = distPointToPolylineSegment(lastRayHitPos.x, lastRayHitPos.z,
+                                                                                roadDraftPoints[i].x, roadDraftPoints[i].z,
+                                                                                roadDraftPoints[i + 1].x, roadDraftPoints[i + 1].z);
+                                            if (d < bestE && d < 12.0f) { bestE = d; bestI = i; }
+                                        }
+                                        if (bestI >= 0) {
+                                            roadDraftPoints.insert(roadDraftPoints.begin() + bestI + 1, snapPt(lastRayHitPos));
+                                            draftDragIdx = bestI + 1;
+                                            draftInsertNewly = true;
+                                            std::cout << "[Road] Inserted draft point " << (bestI + 1)
+                                                      << " (drag to position it)\n";
+                                        } else {
+                                            draftDragIdx = -1;
+                                            emitP(snapPt(makePos(lastRayHitPos)));
+                                        }
+                                    } else {
+                                        emitP(snapPt(makePos(lastRayHitPos)));
+                                    }
+                                } else if (leftMouseDown && draftDragIdx >= 0 &&
+                                           draftDragIdx < (int)roadDraftPoints.size()) {
+                                    // Drag the grabbed/inserted point along the terrain
+                                    roadDraftPoints[draftDragIdx] = snapPt(lastRayHitPos);
+                                    // First drag frame after an insert: publish it as a real point
+                                    if (draftInsertNewly) {
+                                        draftInsertNewly = false;
+                                        std::cout << "[Road] Placed inserted point " << draftDragIdx << "\n";
+                                    }
+                                } else if (leftMouseDown && !roadDraftPoints.empty()) {
+                                    // Drag to draw: append a point every 5m the cursor travels
+                                    const glm::vec3& last = roadDraftPoints.back();
+                                    glm::vec3 p = snapPt(lastRayHitPos);
+                                    const float dx = p.x - last.x, dz = p.z - last.z;
+                                    if (dx * dx + dz * dz >= 25.0f) {
+                                        emitP(p);
+                                    }
+                                }
+                            }
+                            else if (roadToolMode == 2) { // Edit points
+                                if (selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg->segments.size()) {
+                                    auto& cps = rg->segments[selectedRoadIdx].controlPoints;
+                                    if (leftMouseClicked) {
+                                        int bestP = -1; float bestPD = 12.0f;
+                                        for (size_t i = 0; i < cps.size(); ++i) {
+                                            float dx = lastRayHitPos.x - cps[i].pos.x;
+                                            float dz = lastRayHitPos.z - cps[i].pos.y;
+                                            float d = std::sqrt(dx*dx + dz*dz);
+                                            if (d < bestPD) { bestPD = d; bestP = (int)i; }
+                                        }
+                                        if (bestP >= 0) {
+                                            selectedRoadPointIdx = bestP;
+                                            std::cout << "[Road] Grabbed control point " << bestP << "\n";
+                                        } else if (cps.size() >= 2) {
+                                            // Insert a new control point on the nearest segment
+                                            float bestDD = 400.0f; int bestSI = -1;
+                                            for (size_t i = 0; i + 1 < cps.size(); ++i) {
+                                                float ax = cps[i].pos.x, az = cps[i].pos.y;
+                                                float bx = cps[i+1].pos.x, bz = cps[i+1].pos.y;
+                                                float dx = bx - ax, dz = bz - az;
+                                                float len2 = dx*dx + dz*dz;
+                                                float t = (len2 > 1e-8f) ? glm::clamp(((lastRayHitPos.x - ax) * dx + (lastRayHitPos.z - az) * dz) / len2, 0.0f, 1.0f) : 0.0f;
+                                                float px = ax + t * dx, pz = az + t * dz;
+                                                float d = (lastRayHitPos.x - px) * (lastRayHitPos.x - px) + (lastRayHitPos.z - pz) * (lastRayHitPos.z - pz);
+                                                if (d < bestDD) { bestDD = d; bestSI = (int)i; }
+                                            }
+                                            if (bestSI >= 0) {
+                                                RoadPoint np; np.pos.x = lastRayHitPos.x; np.pos.y = lastRayHitPos.z;
+                                                cps.insert(cps.begin() + bestSI + 1, np);
+                                                selectedRoadPointIdx = bestSI + 1;
+                                                roadGraphDirty = true;
+                                                std::cout << "[Road] Inserted control point " << (bestSI + 1) << "\n";
+                                            }
+                                        }
+                                    } else if (leftMouseDown && selectedRoadPointIdx >= 0 && selectedRoadPointIdx < (int)cps.size()) {
+                                        auto& cp = cps[selectedRoadPointIdx];
+                                        if (cp.pos.x != lastRayHitPos.x || cp.pos.y != lastRayHitPos.z) {
+                                            cp.pos.x = lastRayHitPos.x;
+                                            cp.pos.y = lastRayHitPos.z;
+                                            roadGraphDirty = true;
+                                        }
+                                    }
+                                }
+                            }
+                            else if (roadToolMode == 3) { // Move projected reference map
+                                static bool projDragging = false;
+                                static float projLastX = 0.0f, projLastZ = 0.0f;
+                                if (leftMouseDown && projRefVisible) {
+                                    if (projDragging) {
+                                        projRefCenter.x += lastRayHitPos.x - projLastX;
+                                        projRefCenter.y += lastRayHitPos.z - projLastZ;
+                                    }
+                                    projDragging = true;
+                                    projLastX = lastRayHitPos.x;
+                                    projLastZ = lastRayHitPos.z;
+                                } else {
+                                    projDragging = false;
+                                }
+                            }
+                        }
+                    }
+                    else if (editorBrushMode == 0) { // Select / Move
                         static bool lastLMB = false;
                         if (leftMouseDown && !lastLMB) {
                             int closestIdx = -1;
@@ -493,6 +977,20 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     terrain->lastRayHitPos = lastRayHitPos;
     terrain->editorBrushMode = editorBrushMode;
     terrain->brushRadius = brushRadius;
+
+    // Rebuild the road ribbon mesh after any road edit operation
+    if (roadGraphDirty) {
+        terrain->rebuildRoadMesh();
+        roadGraphDirty = false;
+        // Auto-persist drawn roads (throttled) so a restart always keeps them —
+        // mirrors how the projected reference map placement auto-saves above.
+        static double lastRoadAutosave = 0.0;
+        if (currentTime - lastRoadAutosave > 1.0) {
+            lastRoadAutosave = currentTime;
+            terrain->saveRoadsToJSON("assets/roads/roads_manual.json");
+            std::cout << "[Editor] Road graph auto-saved to roads_manual.json\n";
+        }
+    }
 
     static int frameCount = 0;
     frameCount++;
@@ -823,6 +1321,283 @@ void Game::render() {
 
     // 6. Render Terrain (opaque pass - terrain chunks, city walls, landmarks, and editor preview)
     terrain->renderOpaque(projection, view, cameraPosition, lightDir, lColor, selectedPlacedIdx, (activeEditorMode == 1), selectedAssetIdx, previewAngle, previewScale, false);
+
+    // ── PROJECTED REFERENCE MAP ON THE TERRAIN (road edit mode, reference only) ──
+    if (editMode && activeEditorMode == 5) {
+        if (!roadRefLoaded) {
+            roadRefLoaded = true;
+            int w = 0, h = 0, ch = 0;
+            const char* path = roadRefPaths[roadRefIdx];
+            unsigned char* d = stbi_load(path, &w, &h, &ch, 4);
+            if (d) {
+                if (roadRefTex) glDeleteTextures(1, &roadRefTex);
+                glGenTextures(1, &roadRefTex);
+                glBindTexture(GL_TEXTURE_2D, roadRefTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                stbi_image_free(d);
+                roadRefW = w; roadRefH = h;
+                std::cout << "[Road] Reference image loaded: " << path << " (" << w << "x" << h << ")\n";
+            } else {
+                std::cerr << "[Road] Failed to load reference image " << path << "\n";
+            }
+        }
+        RoadGraph* rgp = terrain->getRoadGraph();
+        if (!projRefInitialized) {
+            projRefInitialized = true;
+            int texIdxUsed = roadRefIdx; // index the current texture was loaded for
+            // Restore a previously SAVED placement if one exists (button in the Reference Map panel)
+            if (loadProjRefMap() && projRefMapW > 0.0f) {
+                std::cout << "[Road] Projection uses saved placement\n";
+                if (roadRefIdx != texIdxUsed) roadRefLoaded = false; // saved map image differs -> reload
+            } else {
+                // No saved placement: start over the Port quay (where the camera spawns): plan (585,200)+offset
+                projRefCenter = glm::vec2(4185.0f, -501.0f);
+                float aspect = (roadRefH > 0) ? (float)roadRefH / (float)roadRefW : 0.7f;
+                if (rgp && !rgp->segments.empty()) {
+                    float minX = 1e9f, maxX = -1e9f, minZ = 1e9f, maxZ = -1e9f;
+                    for (const auto& seg : rgp->segments)
+                        for (const auto& p : seg.controlPoints) {
+                            minX = std::min(minX, p.pos.x); maxX = std::max(maxX, p.pos.x);
+                            minZ = std::min(minZ, p.pos.y); maxZ = std::max(maxZ, p.pos.y);
+                        }
+                    float bw = maxX - minX, bh = maxZ - minZ;
+                    projRefMapW = std::max(bw, bh / std::max(aspect, 0.001f));
+                } else {
+                    projRefMapW = 3000.0f;
+                }
+            }
+            projSavedCenter = projRefCenter;
+            projSavedScale = projRefScale;
+            projSavedFlipX = projRefFlipX;
+            projSavedFlipZ = projRefFlipZ;
+            projSavedOpacity = projRefOpacity;
+            projSavedYOffset = projRefYOffset;
+            projSavedIdx = roadRefIdx;
+            projSavedMapW = projRefMapW;
+            projLastSave = glfwGetTime();
+            std::cout << "[Road] Projection placed at center (" << projRefCenter.x << ", "
+                      << projRefCenter.y << "), width " << projRefMapW << "m, scale " << projRefScale << "x\n";
+        }
+        if (roadRefTex && projRefVisible) {
+            glUseProgram(0); // leave the GLSL terrain/water program; restore fixed-function immediate mode
+            glBindVertexArray(0);
+            glDisableVertexAttribArray(0);
+            float mw = projRefMapW * projRefScale;
+            float mh = (roadRefH > 0) ? mw * ((float)roadRefH / (float)roadRefW) : mw * 0.7f;
+            const float halfW = mw * 0.5f, halfH = mh * 0.5f;
+            glDisable(GL_LIGHTING);
+            glDepthMask(GL_FALSE);
+            glDepthFunc(GL_LEQUAL);
+            glDisable(GL_CULL_FACE);
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+            glEnable(GL_TEXTURE_2D);
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, roadRefTex);
+            glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+            if (std::getenv("FALLAGA_PROJ_DEBUG")) {
+                static bool dbgDone = false;
+                if (!dbgDone) {
+                    dbgDone = true;
+                    std::cout << "[DBG] projRefVisible=" << projRefVisible << " tex=" << roadRefTex
+                              << " loaded=" << roadRefLoaded << " refW=" << roadRefW << " refH=" << roadRefH
+                              << " idx=" << roadRefIdx << " flipX=" << projRefFlipX << " flipZ=" << projRefFlipZ
+                              << " center=(" << projRefCenter.x << "," << projRefCenter.y << ") mw=" << mw << " mh=" << mh << "\n";
+                    Vec3 cp = camera->getPosition();
+                    std::cout << "[DBG] cam=(" << cp.x << "," << cp.y << "," << cp.z << ")\n";
+                    Vec3 cr = camera->getRight();
+                    Vec3 cf = camera->getForward();
+                    std::cout << "[DBG] camF=(" << cf.x << "," << cf.y << "," << cf.z << ") camR=(" << cr.x << ","
+                              << cr.y << "," << cr.z << ")\n";
+                }
+                glDisable(GL_DEPTH_TEST);
+                glDisable(GL_BLEND);
+                glDisable(GL_TEXTURE_2D);
+                glDepthMask(GL_FALSE);
+                glMatrixMode(GL_PROJECTION); glLoadIdentity();
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity();
+                glColor3f(0.0f, 0.0f, 1.0f);
+                glBegin(GL_QUADS);
+                glVertex3f(-1.0f, -1.0f, 0.0f); glVertex3f(1.0f, -1.0f, 0.0f);
+                glVertex3f(1.0f, 1.0f, 0.0f); glVertex3f(-1.0f, 1.0f, 0.0f);
+                glEnd();
+                glMatrixMode(GL_PROJECTION); glLoadIdentity(); glMultMatrixf(glm::value_ptr(projection));
+                glMatrixMode(GL_MODELVIEW); glLoadIdentity(); glMultMatrixf(glm::value_ptr(view));
+                glColor3f(1.0f, 0.0f, 0.0f);
+                glBegin(GL_QUADS);
+                const float dbgLift = 2.0f;
+                GLfloat quadC[4][3] = {
+                    { projRefCenter.x - halfW, terrain->getHeight(projRefCenter.x - halfW, projRefCenter.y - halfH) + dbgLift, projRefCenter.y - halfH },
+                    { projRefCenter.x + halfW, terrain->getHeight(projRefCenter.x + halfW, projRefCenter.y - halfH) + dbgLift, projRefCenter.y - halfH },
+                    { projRefCenter.x + halfW, terrain->getHeight(projRefCenter.x + halfW, projRefCenter.y + halfH) + dbgLift, projRefCenter.y + halfH },
+                    { projRefCenter.x - halfW, terrain->getHeight(projRefCenter.x - halfW, projRefCenter.y + halfH) + dbgLift, projRefCenter.y + halfH }
+                };
+                for (int i = 0; i < 4; ++i) { glVertex3fv(quadC[i]); }
+                glEnd();
+                glEnable(GL_DEPTH_TEST);
+                glEnable(GL_LIGHTING);
+            } else {
+                // While drawing roads, dim the map so the road mesh + terrain read through
+                float effOpacity = (roadToolMode == 1) ? 0.40f : projRefOpacity;
+                glColor4f(1.0f, 1.0f, 1.0f, effOpacity);
+            }
+            glBegin(GL_QUADS);
+            const float lift = 0.7f + projRefYOffset; // small vertical lift above the draped surface
+            const int G = 32;   // grid resolution: drapes the map onto the terrain surface
+            const int GN = G + 1;
+            std::vector<float> gH((size_t)GN * GN);
+            for (int gyy = 0; gyy < GN; ++gyy) {
+                const float wz = projRefCenter.y - halfH + (float)gyy * (mh / G);
+                for (int gxx = 0; gxx < GN; ++gxx) {
+                    const float wx = projRefCenter.x - halfW + (float)gxx * (mw / G);
+                    gH[(size_t)gyy * GN + gxx] = terrain->getHeight(wx, wz) + lift;
+                }
+            }
+            for (int gy = 0; gy < G; ++gy) {
+                for (int gx = 0; gx < G; ++gx) {
+                    const float tx0 = projRefFlipX ? 1.0f - (float)gx / G : (float)gx / G;
+                    const float tx1 = projRefFlipX ? 1.0f - (float)(gx + 1) / G : (float)(gx + 1) / G;
+                    const float ty0 = projRefFlipZ ? 1.0f - (float)gy / G : (float)gy / G;
+                    const float ty1 = projRefFlipZ ? 1.0f - (float)(gy + 1) / G : (float)(gy + 1) / G;
+                    const float h00 = gH[(size_t)gy * GN + gx], h10 = gH[(size_t)gy * GN + gx + 1];
+                    const float h11 = gH[(size_t)(gy + 1) * GN + gx + 1], h01 = gH[(size_t)(gy + 1) * GN + gx];
+                    glTexCoord2f(tx0, ty0); glVertex3f(projRefCenter.x - halfW + (float)gx * (mw / G), h00, projRefCenter.y - halfH + (float)gy * (mh / G));
+                    glTexCoord2f(tx1, ty0); glVertex3f(projRefCenter.x - halfW + (float)(gx + 1) * (mw / G), h10, projRefCenter.y - halfH + (float)gy * (mh / G));
+                    glTexCoord2f(tx1, ty1); glVertex3f(projRefCenter.x - halfW + (float)(gx + 1) * (mw / G), h11, projRefCenter.y - halfH + (float)(gy + 1) * (mh / G));
+                    glTexCoord2f(tx0, ty1); glVertex3f(projRefCenter.x - halfW + (float)gx * (mw / G), h01, projRefCenter.y - halfH + (float)(gy + 1) * (mh / G));
+                }
+            }
+            glEnd();
+            glDisable(GL_TEXTURE_2D);
+            glDisable(GL_BLEND);
+            glDepthMask(GL_TRUE);
+            glDepthFunc(GL_LESS);
+            glEnable(GL_LIGHTING);
+            if (roadToolMode == 3) {
+                glColor3f(0.4f, 1.0f, 0.5f);
+                glLineWidth(2.0f);
+                glBegin(GL_LINE_LOOP);
+                const float lift2 = 1.2f + projRefYOffset;
+                glVertex3f(projRefCenter.x - halfW, terrain->getHeight(projRefCenter.x - halfW, projRefCenter.y - halfH) + lift2, projRefCenter.y - halfH);
+                glVertex3f(projRefCenter.x + halfW, terrain->getHeight(projRefCenter.x + halfW, projRefCenter.y - halfH) + lift2, projRefCenter.y - halfH);
+                glVertex3f(projRefCenter.x + halfW, terrain->getHeight(projRefCenter.x + halfW, projRefCenter.y + halfH) + lift2, projRefCenter.y + halfH);
+                glVertex3f(projRefCenter.x - halfW, terrain->getHeight(projRefCenter.x - halfW, projRefCenter.y + halfH) + lift2, projRefCenter.y + halfH);
+                glEnd();
+                glLineWidth(1.0f);
+            }
+        }
+    }
+
+    // ── ROAD EDIT OVERLAY (in-world draft polyline + selection highlight) ──
+    if (editMode && activeEditorMode == 5 && terrain->getRoadGraph()) {
+        RoadGraph* rg = terrain->getRoadGraph();
+        glUseProgram(0);
+        glBindVertexArray(0);
+        glDisableVertexAttribArray(0);
+        glDisable(GL_LIGHTING);
+        glDepthFunc(GL_LEQUAL);
+        if (roadToolMode == 1 && rayHitTerrain) {
+            // ── LIVE DRAW PREVIEW: smooth curve + road footprint + draggable points ──
+            std::vector<glm::vec3> preview;
+            if (!roadDraftPoints.empty()) {
+                preview = roadDraftPoints;
+                preview.push_back(lastRayHitPos); // tentative next point under the cursor
+            }
+            // if nothing drafted yet, still show a marker under the cursor
+            if (!roadDraftPoints.empty() && preview.size() >= 2) {
+                RoadSegment tempSeg;
+                tempSeg.type = (RoadType)roadDrawType;
+                tempSeg.width = roadDrawWidth;
+                tempSeg.shoulderWidth = roadDrawShoulder;
+                for (const auto& p : preview) {
+                    RoadPoint rp; rp.pos.x = p.x; rp.pos.y = p.z;
+                    tempSeg.controlPoints.push_back(rp);
+                }
+                RoadSpline::evaluate(tempSeg, terrain->getRoadHeightSampler(), 0.5f);
+
+                // curve spine
+                glColor3f(1.0f, 0.85f, 0.0f);
+                glLineWidth(3.0f);
+                glBegin(GL_LINE_STRIP);
+                for (const auto& sp : tempSeg.splinePoints) glVertex3f(sp.x, sp.y + 0.15f, sp.z);
+                glEnd();
+
+                // road-width footprint (left & right edges) - shows the real scale
+                if (tempSeg.rightVecs.size() >= 2) {
+                    const float halfW = roadDrawWidth * 0.5f;
+                    glColor3f(0.3f, 0.9f, 1.0f);
+                    glLineWidth(2.0f);
+                    glBegin(GL_LINE_STRIP);
+                    for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
+                        const glm::vec3& sp = tempSeg.splinePoints[i];
+                        glVertex3f(sp.x + tempSeg.rightVecs[i].x * halfW, sp.y + 0.05f, sp.z + tempSeg.rightVecs[i].z * halfW);
+                    }
+                    glEnd();
+                    glBegin(GL_LINE_STRIP);
+                    for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
+                        const glm::vec3& sp = tempSeg.splinePoints[i];
+                        glVertex3f(sp.x - tempSeg.rightVecs[i].x * halfW, sp.y + 0.05f, sp.z - tempSeg.rightVecs[i].z * halfW);
+                    }
+                    glEnd();
+                    glLineWidth(1.0f);
+                }
+            }
+
+            // control-point handles (draggable) + hover feedback
+            glBegin(GL_QUADS);
+            for (int i = 0; i < (int)roadDraftPoints.size(); ++i) {
+                float dx = lastRayHitPos.x - roadDraftPoints[i].x;
+                float dz = lastRayHitPos.z - roadDraftPoints[i].z;
+                bool hover = (dx * dx + dz * dz) < 144.0f; // within 12m of cursor
+                float y = terrain->getHeight(roadDraftPoints[i].x, roadDraftPoints[i].z) + 0.35f;
+                if (i == draftDragIdx)      glColor3f(1.0f, 0.6f, 0.1f);
+                else if (hover)             glColor3f(0.3f, 1.0f, 0.4f);
+                else                        glColor3f(1.0f, 1.0f, 1.0f);
+                const float s = (i == draftDragIdx) ? 3.5f : 2.6f;
+                glVertex3f(roadDraftPoints[i].x - s, y, roadDraftPoints[i].z - s);
+                glVertex3f(roadDraftPoints[i].x + s, y, roadDraftPoints[i].z - s);
+                glVertex3f(roadDraftPoints[i].x + s, y, roadDraftPoints[i].z + s);
+                glVertex3f(roadDraftPoints[i].x - s, y, roadDraftPoints[i].z + s);
+            }
+            glEnd();
+
+            // cursor marker (where the next point / insertion will land)
+            if (roadDraftPoints.size() >= 2) {
+                float y = terrain->getHeight(lastRayHitPos.x, lastRayHitPos.z) + 0.25f;
+                glColor3f(0.3f, 1.0f, 0.4f);
+                glPointSize(8.0f);
+                glBegin(GL_POINTS);
+                glVertex3f(lastRayHitPos.x, y, lastRayHitPos.z);
+                glEnd();
+                glPointSize(1.0f);
+            }
+        }
+        if (selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg->segments.size()) {
+            auto& seg = rg->segments[selectedRoadIdx];
+            glColor3f(1.0f, 0.5f, 0.1f);
+            glLineWidth(4.0f);
+            glBegin(GL_LINE_STRIP);
+            for (const auto& cp : seg.controlPoints) {
+                glVertex3f(cp.pos.x, terrain->getHeight(cp.pos.x, cp.pos.y) + 0.6f, cp.pos.y);
+            }
+            glEnd();
+            glLineWidth(1.0f);
+            glPointSize(10.0f);
+            glBegin(GL_POINTS);
+            for (size_t i = 0; i < seg.controlPoints.size(); ++i) {
+                bool selPt = (selectedRoadPointIdx >= 0 && (int)i == selectedRoadPointIdx);
+                if (selPt) glColor3f(1.0f, 0.2f, 0.2f);
+                else       glColor3f(0.4f, 0.95f, 0.4f);
+                glVertex3f(seg.controlPoints[i].pos.x, terrain->getHeight(seg.controlPoints[i].pos.x, seg.controlPoints[i].pos.y) + 0.6f, seg.controlPoints[i].pos.y);
+            }
+            glEnd();
+            glPointSize(1.0f);
+        }
+        glEnable(GL_LIGHTING);
+        glDepthFunc(GL_LESS);
+    }
     
     // 7. Character & Horse Shaders
     GameplayUtils::setupEntityShader(player->getShader(), cameraPosition, lightDir, lColor);
@@ -928,18 +1703,23 @@ void Game::render() {
         // ─── 1. TOP MENU BAR (UNREAL STYLE) WITH MODE SWITCHER ───
         drawRect(0, 0, (float)windowWidth, 32, 0.08f, 0.08f, 0.08f, 1.0f); // Dark background
         drawRect(0, 31, (float)windowWidth, 1, 0.18f, 0.18f, 0.18f, 1.0f);  // Bottom line border
-        drawStr(15, 20, "File      Edit      Window      Tools      Help", 0.7f, 0.7f, 0.7f);
-        drawStr((float)windowWidth - 260, 20, "Unreal Editor (Sousse Engine 5.4)", 0.5f, 0.5f, 0.5f);
+        if (windowWidth >= 1320) {
+            drawStr(15, 20, "File      Edit      Window      Tools      Help", 0.7f, 0.7f, 0.7f);
+        }
+        if (windowWidth >= 1080) {
+            drawStr((float)windowWidth - 260, 20, "Unreal Editor (Sousse Engine 5.4)", 0.5f, 0.5f, 0.5f);
+        }
         drawRect((float)windowWidth - 45, 11, 10, 10, 0.1f, 0.8f, 0.1f, 1.0f); // Green status LED
 
-        // Horizontally centered workspace mode switch tabs
+        // Horizontally centered workspace mode switch tabs (fits any window width)
         float center = (float)windowWidth / 2.0f;
-        std::string modeNames[] = { "GAME", "OBJECTS", "SCULPT", "PAINT", "WATER" };
-        float tabOffsets[] = { -300, -180, -60, 60, 180 };
-        float tabWidth = 110;
+        std::string modeNames[] = { "GAME", "OBJECTS", "SCULPT", "PAINT", "WATER", "ROADS" };
+        const float tabWidth = 110;
+        const float tabGap = 8;
+        const float tabStart = std::max(10.0f, center - (6 * tabWidth + 5 * tabGap) * 0.5f);
 
-        for (int i = 0; i < 5; ++i) {
-            float tx = center + tabOffsets[i];
+        for (int i = 0; i < 6; ++i) {
+            float tx = tabStart + i * (tabWidth + tabGap);
             bool active = (activeEditorMode == i);
             if (active) {
                 drawRect(tx, 4, tabWidth, 24, 0.89f, 0.36f, 0.13f, 0.9f);
@@ -953,7 +1733,8 @@ void Game::render() {
         }
 
         // ─── 2. LEFT PANEL: TOOLS & DETAILS ───
-        float lpX = 10, lpY = 42, lpW = 320, lpH = (float)windowHeight - 52;
+        if (activeEditorMode != 5 || roadPanelsVisible) {
+            float lpX = 10, lpY = 42, lpW = 320, lpH = (float)windowHeight - 52;
         drawRect(lpX, lpY, lpW, lpH, 0.11f, 0.11f, 0.11f, 0.95f); // Panel background
         drawRectOutline(lpX, lpY, lpW, lpH, 0.22f, 0.22f, 0.22f); // Panel border
 
@@ -1132,6 +1913,295 @@ void Game::render() {
             // Push level to terrain shader every frame
             terrain->setWaterLevel(waterLevelAdjust);
         }
+        else if (activeEditorMode == 5) {
+            // ─── ROAD EDITOR PANEL ──────────────────────────────────────
+            drawStr(lpX + 15, lpY + 19, "ROAD EDITOR", 1.0f, 0.6f, 0.1f);
+            drawStr(lpX + 15, lpY + 37, "TOOL", 0.9f, 0.5f, 0.1f);
+            std::string toolNames[] = {
+                "1. Select Road (LMB)",
+                "2. Draw Road (LMB)",
+                "3. Edit Points (Drag)",
+                "4. Reference Map"
+            };
+            for (int i = 0; i < 4; ++i) {
+                float btnY = lpY + 45 + i * 26;
+                bool isCur = (roadToolMode == i);
+                if (isCur) {
+                    drawRect(lpX + 8, btnY - 2, lpW - 16, 22, 0.89f, 0.36f, 0.13f, 0.9f);
+                    drawStr(lpX + 18, btnY + 13, toolNames[i], 1.0f, 1.0f, 1.0f);
+                } else {
+                    drawRect(lpX + 8, btnY - 2, lpW - 16, 22, 0.16f, 0.16f, 0.16f, 0.6f);
+                    drawStr(lpX + 18, btnY + 13, toolNames[i], 0.7f, 0.7f, 0.7f);
+                }
+                drawRectOutline(lpX + 8, btnY - 2, lpW - 16, 22, 0.25f, 0.25f, 0.25f);
+            }
+            if (roadToolMode == 1) {
+                drawStr(lpX + 15, lpY + 131, "DRAW CONTROLS", 0.9f, 0.5f, 0.1f);
+                drawStr(lpX + 15, lpY + 144, "CLICK = add point / start road", 0.72f, 0.72f, 0.72f);
+                drawStr(lpX + 15, lpY + 158, "HOLD + DRAG = draw a continuous line", 0.72f, 0.72f, 0.72f);
+                drawStr(lpX + 15, lpY + 172, "Enter/OK = commit, Esc/X = cancel, DEL PT = undo", 0.72f, 0.72f, 0.72f);
+            } else if (roadToolMode != 3) {
+                drawStr(lpX + 15, lpY + 131, "TIP", 0.9f, 0.5f, 0.1f);
+                drawStr(lpX + 15, lpY + 145, "Press 4 to move/scale the projected map", 0.6f, 0.85f, 0.6f);
+                drawStr(lpX + 15, lpY + 159, "Tab hides panels   R cycles PiP", 0.6f, 0.6f, 0.6f);
+            }
+
+            RoadGraph* rg = terrain->getRoadGraph();
+            if (roadToolMode == 1) {
+                // ─── NEW ROAD PROPERTY EDITOR (applied when you commit with Enter) ───
+                drawStr(lpX + 15, lpY + 192, "NEW ROAD PROPERTIES", 0.9f, 0.5f, 0.1f);
+                std::string typeNames6[] = {
+                    "Colonial Avenue", "Urban Street", "Country Highway",
+                    "Country Dirt", "Port", "Medina"
+                };
+                for (int i = 0; i < 6; ++i) {
+                    float btnY = lpY + 215 + i * 22;
+                    bool isCur = (roadDrawType == i);
+                    if (isCur) {
+                        drawRect(lpX + 8, btnY, lpW - 16, 20, 0.89f, 0.36f, 0.13f, 0.9f);
+                        drawStr(lpX + 18, btnY + 14, typeNames6[i], 1.0f, 1.0f, 1.0f);
+                    } else {
+                        drawRect(lpX + 8, btnY, lpW - 16, 20, 0.13f, 0.13f, 0.13f, 0.6f);
+                        drawStr(lpX + 18, btnY + 14, typeNames6[i], 0.7f, 0.7f, 0.7f);
+                    }
+                    drawRectOutline(lpX + 8, btnY, lpW - 16, 20, 0.25f, 0.25f, 0.25f);
+                }
+                std::ostringstream woss;
+                woss << "Width (m): " << std::fixed << std::setprecision(1) << roadDrawWidth;
+                drawStr(lpX + 15, lpY + 352, woss.str(), 0.8f, 0.8f, 0.8f);
+                drawRect(lpX + 8, lpY + 358, 60, 24, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(lpX + 8, lpY + 358, 60, 24, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 27, lpY + 373, "- 0.5", 0.9f, 0.5f, 0.2f);
+                drawRect(lpX + 78, lpY + 358, 60, 24, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(lpX + 78, lpY + 358, 60, 24, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 97, lpY + 373, "+ 0.5", 0.4f, 0.9f, 0.5f);
+                std::ostringstream soss;
+                soss << "Shoulder (m): " << std::fixed << std::setprecision(2) << roadDrawShoulder;
+                drawStr(lpX + 15, lpY + 390, soss.str(), 0.8f, 0.8f, 0.8f);
+                drawRect(lpX + 8, lpY + 396, 60, 24, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(lpX + 8, lpY + 396, 60, 24, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 27, lpY + 411, "- 0.25", 0.9f, 0.5f, 0.2f);
+                drawRect(lpX + 78, lpY + 396, 60, 24, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(lpX + 78, lpY + 396, 60, 24, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 97, lpY + 411, "+ 0.25", 0.4f, 0.9f, 0.5f);
+                drawStr(lpX + 15, lpY + 430, "LMB click add   click-on-point move", 0.6f, 0.6f, 0.6f);
+                drawStr(lpX + 15, lpY + 445, "click-on-segment insert   drag freehand", 0.6f, 0.6f, 0.6f);
+                drawStr(lpX + 15, lpY + 460, "Enter commit   Esc cancel   Backspace undo", 0.6f, 0.6f, 0.6f);
+                drawStr(lpX + 15, lpY + 475, "Curve+width preview live   S/SHIFT straight", 0.55f, 0.55f, 0.55f);
+                // Draw-tool option toggles
+                {
+                    float tY = lpY + 480;
+                    if (roadStraightMode) {
+                        drawRect(lpX + 8, tY, lpW - 16, 22, 0.30f, 0.25f, 0.10f, 0.9f);
+                        drawStr(lpX + 140, tY + 15, "STRAIGHT LINE: ON   (click=off)", 0.8f, 1.0f, 0.6f);
+                    } else {
+                        drawRect(lpX + 8, tY, lpW - 16, 22, 0.15f, 0.15f, 0.15f, 0.9f);
+                        drawStr(lpX + 140, tY + 15, "STRAIGHT LINE: off   (click=on)", 0.8f, 0.8f, 0.8f);
+                    }
+                    drawRectOutline(lpX + 8, tY, lpW - 16, 22, 0.35f, 0.3f, 0.15f);
+                    drawStr(lpX + 18, tY + 15, "S:", 0.8f, 0.9f, 0.5f);
+                }
+                {
+                    float tY = lpY + 502;
+                    if (roadSnapToRoads) {
+                        drawRect(lpX + 8, tY, lpW - 16, 22, 0.12f, 0.26f, 0.20f, 0.9f);
+                        drawStr(lpX + 140, tY + 15, "SNAP TO ROADS: ON   (click=off)", 0.8f, 0.7f, 1.0f);
+                    } else {
+                        drawRect(lpX + 8, tY, lpW - 16, 22, 0.15f, 0.15f, 0.15f, 0.9f);
+                        drawStr(lpX + 140, tY + 15, "SNAP TO ROADS: off   (click=on)", 0.8f, 0.8f, 0.8f);
+                    }
+                    drawRectOutline(lpX + 8, tY, lpW - 16, 22, 0.2f, 0.45f, 0.3f);
+                    drawStr(lpX + 18, tY + 15, "J:", 0.8f, 0.6f, 1.0f);
+                }
+                // Drawing status + commit/cancel buttons
+                std::ostringstream dss;
+                if (!roadDraftPoints.empty()) {
+                    dss << "DRAWING " << roadDraftPoints.size() << " pt(s) active";
+                    drawStr(lpX + 15, lpY + 528, dss.str(), 0.85f, 0.95f, 0.45f);
+                } else {
+                    dss << "No drawing yet — click/press terrain to start";
+                    drawStr(lpX + 15, lpY + 528, dss.str(), 0.6f, 0.6f, 0.6f);
+                }
+                {
+                    float oY = lpY + 548, thirdW = (lpW - 16 - 12) / 3.0f;
+                    drawRect(lpX + 8, oY, thirdW, 24, 0.30f, 0.18f, 0.10f, 0.95f);
+                    drawRectOutline(lpX + 8, oY, thirdW, 24, 0.55f, 0.35f, 0.2f);
+                    drawStr(lpX + 8 + 22, oY + 17, "DEL PT", 0.9f, 1.0f, 0.8f);
+                    drawRect(lpX + 8 + thirdW + 6, oY, thirdW, 24, 0.10f, 0.34f, 0.17f, 0.95f);
+                    drawRectOutline(lpX + 8 + thirdW + 6, oY, thirdW, 24, 0.25f, 0.65f, 0.35f);
+                    drawStr(lpX + 8 + thirdW + 6 + 15, oY + 17, "OK COMMIT", 0.85f, 0.9f, 1.0f);
+                    drawRect(lpX + 8 + 2 * (thirdW + 6), oY, thirdW, 24, 0.32f, 0.13f, 0.11f, 0.95f);
+                    drawRectOutline(lpX + 8 + 2 * (thirdW + 6), oY, thirdW, 24, 0.6f, 0.3f, 0.25f);
+                    drawStr(lpX + 8 + 2 * (thirdW + 6) + 10, oY + 17, "CANCEL", 0.85f, 1.0f, 0.95f);
+                }
+            } else if (roadToolMode == 3) {
+                std::string refName = std::string(roadRefPaths[roadRefIdx]);
+                size_t slash = refName.find_last_of("/\\");
+                if (slash != std::string::npos) refName = refName.substr(slash + 1);
+                // ─── PROJECTED REFERENCE MAP PANEL (on the terrain, reference only) ───
+                drawStr(lpX + 15, lpY + 190, "PROJECTED REFERENCE MAP", 0.9f, 0.5f, 0.1f);
+                drawStr(lpX + 15, lpY + 204, refName, 0.6f, 0.75f, 0.55f);
+                std::string visTxt = projRefVisible ? "PROJECTION: ON  (click to hide)" : "PROJECTION: OFF  (click to show)";
+                if (projRefVisible) {
+                    drawRect(lpX + 8, lpY + 210, lpW - 16, 22, 0.10f, 0.30f, 0.14f, 0.9f);
+                } else {
+                    drawRect(lpX + 8, lpY + 210, lpW - 16, 22, 0.16f, 0.16f, 0.16f, 0.9f);
+                }
+                drawRectOutline(lpX + 8, lpY + 210, lpW - 16, 22, 0.3f, 0.6f, 0.3f);
+                drawStr(lpX + (lpW - (int)visTxt.size() * 7) / 2, lpY + 225, visTxt, 0.85f, 0.85f, 0.85f);
+
+                const float cW = 140.0f, cGap = 12.0f;
+                const float x1 = lpX + 8, x2 = lpX + 8 + cW + cGap;
+
+                std::ostringstream mv;
+                mv << "MOVE (X/Z 20m, Y 5m)  Y: " << std::fixed << std::setprecision(0) << projRefYOffset << "m";
+                drawStr(lpX + 15, lpY + 236, mv.str(), 0.65f, 0.65f, 0.65f);
+                drawRect(x1, lpY + 244, cW, 22, 0.16f, 0.16f, 0.14f, 0.9f);
+                drawRectOutline(x1, lpY + 244, cW, 22, 0.35f, 0.35f, 0.3f);
+                drawStr(lpX + 55, lpY + 259, "MOVE -X", 0.85f, 0.85f, 0.85f);
+                drawRect(x2, lpY + 244, cW, 22, 0.14f, 0.16f, 0.16f, 0.9f);
+                drawRectOutline(x2, lpY + 244, cW, 22, 0.3f, 0.35f, 0.35f);
+                drawStr(lpX + 55 + cW + cGap, lpY + 259, "MOVE +X", 0.85f, 0.85f, 0.85f);
+
+                drawRect(x1, lpY + 278, cW, 22, 0.16f, 0.16f, 0.14f, 0.9f);
+                drawRectOutline(x1, lpY + 278, cW, 22, 0.35f, 0.35f, 0.3f);
+                drawStr(lpX + 55, lpY + 293, "MOVE -Y", 0.85f, 0.85f, 0.85f);
+                drawRect(x2, lpY + 278, cW, 22, 0.14f, 0.16f, 0.16f, 0.9f);
+                drawRectOutline(x2, lpY + 278, cW, 22, 0.3f, 0.35f, 0.35f);
+                drawStr(lpX + 55 + cW + cGap, lpY + 293, "MOVE +Y", 0.85f, 0.85f, 0.85f);
+
+                drawRect(x1, lpY + 312, cW, 22, 0.16f, 0.16f, 0.14f, 0.9f);
+                drawRectOutline(x1, lpY + 312, cW, 22, 0.35f, 0.35f, 0.3f);
+                drawStr(lpX + 55, lpY + 327, "MOVE -Z", 0.85f, 0.85f, 0.85f);
+                drawRect(x2, lpY + 312, cW, 22, 0.14f, 0.16f, 0.16f, 0.9f);
+                drawRectOutline(x2, lpY + 312, cW, 22, 0.3f, 0.35f, 0.35f);
+                drawStr(lpX + 55 + cW + cGap, lpY + 327, "MOVE +Z", 0.85f, 0.85f, 0.85f);
+
+                std::ostringstream pss;
+                pss << "SCALE  (" << std::fixed << std::setprecision(1) << projRefScale << "x)";
+                drawStr(lpX + 15, lpY + 346, pss.str(), 0.65f, 0.65f, 0.65f);
+                drawRect(x1, lpY + 354, cW, 22, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(x1, lpY + 354, cW, 22, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 62, lpY + 369, "- 0.1x", 0.9f, 0.5f, 0.2f);
+                drawRect(x2, lpY + 354, cW, 22, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(x2, lpY + 354, cW, 22, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 62 + cW + cGap, lpY + 369, "+ 0.1x", 0.4f, 0.9f, 0.5f);
+
+                drawStr(lpX + 15, lpY + 380, "FLIP", 0.65f, 0.65f, 0.65f);
+                drawRect(x1, lpY + 388, cW, 22, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(x1, lpY + 388, cW, 22, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 55, lpY + 403, projRefFlipX ? "FLIP X (on)" : "FLIP X (off)", 0.9f, 0.6f, 0.4f);
+                drawRect(x2, lpY + 388, cW, 22, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(x2, lpY + 388, cW, 22, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 55 + cW + cGap, lpY + 403, projRefFlipZ ? "FLIP Z (on)" : "FLIP Z (off)", 0.4f, 0.9f, 0.5f);
+
+                std::ostringstream oss;
+                oss << "OPACITY  (" << std::fixed << std::setprecision(1) << projRefOpacity << ")";
+                drawStr(lpX + 15, lpY + 414, oss.str(), 0.65f, 0.65f, 0.65f);
+                drawRect(x1, lpY + 422, cW, 22, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(x1, lpY + 422, cW, 22, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 62, lpY + 437, "- 0.1", 0.9f, 0.5f, 0.2f);
+                drawRect(x2, lpY + 422, cW, 22, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(x2, lpY + 422, cW, 22, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 62 + cW + cGap, lpY + 437, "+ 0.1", 0.4f, 0.9f, 0.5f);
+
+                drawRect(lpX + 8, lpY + 456, lpW - 16, 22, 0.13f, 0.13f, 0.13f, 0.9f);
+                drawRectOutline(lpX + 8, lpY + 456, lpW - 16, 22, 0.4f, 0.4f, 0.4f);
+                drawStr(lpX + (lpW - 46) / 2, lpY + 471, "RESET", 0.9f, 0.9f, 0.9f);
+if (projSaveFlash > 0.0f) {
+                    drawRect(lpX + 8, lpY + 494, lpW - 16, 22, 0.15f, 0.85f, 0.35f, 0.95f);
+                    drawRectOutline(lpX + 8, lpY + 494, lpW - 16, 22, 0.4f, 1.0f, 0.6f);
+                    drawStr(lpX + (lpW - 70) / 2, lpY + 509, "SAVE MAP PLACEMENT", 0.8f, 0.05f, 0.2f);
+                    drawStr(lpX + 15, lpY + 530, "SAVED! -> projref_map.txt (next boot restores it)", 0.4f, 1.0f, 0.6f);
+                } else {
+                    drawRect(lpX + 8, lpY + 494, lpW - 16, 22, 0.10f, 0.26f, 0.16f, 0.9f);
+                    drawRectOutline(lpX + 8, lpY + 494, lpW - 16, 22, 0.25f, 0.55f, 0.35f);
+                    drawStr(lpX + (lpW - 70) / 2, lpY + 509, "SAVE MAP PLACEMENT", 0.8f, 0.9f, 0.15f);
+                    drawStr(lpX + 15, lpY + 530, "saves center/scale/flip/opacity to projref_map.txt", 0.6f, 0.6f, 0.6f);
+                }
+                drawStr(lpX + 15, lpY + 545, "On launch this placement will be restored", 0.55f, 0.55f, 0.55f);
+                {
+                    const float mapBtnW = (lpW - 16 - 6) * 0.5f;
+                    float mY = lpY + 556;
+                    drawRect(lpX + 8, mY, mapBtnW, 22, 0.16f, 0.16f, 0.16f, 0.9f);
+                    drawRectOutline(lpX + 8, mY, mapBtnW, 22, 0.35f, 0.35f, 0.35f);
+                    drawStr(lpX + 8 + (mapBtnW - 77) / 2, mY + 15, "<  PREV MAP", 0.85f, 0.85f, 0.85f);
+                    drawRect(lpX + 8 + mapBtnW + 6, mY, mapBtnW, 22, 0.16f, 0.16f, 0.16f, 0.9f);
+                    drawRectOutline(lpX + 8 + mapBtnW + 6, mY, mapBtnW, 22, 0.35f, 0.35f, 0.35f);
+                    drawStr(lpX + 8 + mapBtnW + 6 + (mapBtnW - 70) / 2, mY + 15, "NEXT MAP >", 0.85f, 0.85f, 0.85f);
+                }
+                {
+                    float ppY = lpY + 586;
+                    std::string pipTxt = roadRefVisible ? "PICTURE-IN-PICTURE: ON   (click=off)"
+                                                        : "PICTURE-IN-PICTURE: off   (click=on)";
+                    if (roadRefVisible) {
+                        drawRect(lpX + 8, ppY, lpW - 16, 22, 0.10f, 0.26f, 0.30f, 0.9f);
+                        drawRectOutline(lpX + 8, ppY, lpW - 16, 22, 0.2f, 0.5f, 0.6f);
+                    } else {
+                        drawRect(lpX + 8, ppY, lpW - 16, 22, 0.16f, 0.16f, 0.16f, 0.9f);
+                        drawRectOutline(lpX + 8, ppY, lpW - 16, 22, 0.35f, 0.35f, 0.35f);
+                    }
+                    drawStr(lpX + (lpW - (int)pipTxt.size() * 7) / 2, ppY + 15, pipTxt, 0.85f, 0.85f, 0.85f);
+                }
+            } else if (rg) {
+                drawStr(lpX + 15, lpY + 192, "SELECTED ROAD", 0.9f, 0.5f, 0.1f);
+                if (selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg->segments.size()) {
+                    auto& seg = rg->segments[selectedRoadIdx];
+                    std::string info = "id " + std::to_string(seg.id) + "  (" +
+                                       std::to_string(seg.controlPoints.size()) + " pts, " +
+                                       std::to_string((int)seg.width) + "m)";
+                    drawStr(lpX + 15, lpY + 210, info, 0.85f, 0.85f, 0.85f);
+                    drawStr(lpX + 15, lpY + 226, roadTypeLabel((int)seg.type), 0.85f, 0.6f, 0.3f);
+                    drawStr(lpX + 15, lpY + 244, "TEXTURE (click to change)", 0.9f, 0.5f, 0.1f);
+                    std::string typeNames6[] = {
+                        "Colonial Avenue", "Urban Street", "Country Highway",
+                        "Country Dirt", "Port", "Medina"
+                    };
+                    for (int i = 0; i < 6; ++i) {
+                        float btnY = lpY + 260 + i * 22;
+                        bool isCur = ((int)seg.type == i);
+                        if (isCur) {
+                            drawRect(lpX + 8, btnY, lpW - 16, 18, 0.89f, 0.36f, 0.13f, 0.9f);
+                            drawStr(lpX + 18, btnY + 13, typeNames6[i], 1.0f, 1.0f, 1.0f);
+                        } else {
+                            drawRect(lpX + 8, btnY, lpW - 16, 18, 0.13f, 0.13f, 0.13f, 0.6f);
+                            drawStr(lpX + 18, btnY + 13, typeNames6[i], 0.7f, 0.7f, 0.7f);
+                        }
+                        drawRectOutline(lpX + 8, btnY, lpW - 16, 18, 0.25f, 0.25f, 0.25f);
+                    }
+                    drawStr(lpX + 15, lpY + 405, "Selected point", 0.8f, 0.5f, 0.1f);
+                    if (selectedRoadPointIdx >= 0) {
+                        drawStr(lpX + 15, lpY + 422, "point " + std::to_string(selectedRoadPointIdx) +
+                                   " selected", 0.72f, 0.72f, 0.72f);
+                    } else {
+                        drawStr(lpX + 15, lpY + 422, "none - click a point to grab it", 0.72f, 0.72f, 0.72f);
+                    }
+                    {
+                        float wYb = lpY + 438;
+                        drawStr(lpX + 15, lpY + 453, "WIDTH", 0.8f, 0.5f, 0.1f);
+                        drawRect(lpX + 70, wYb, 60, 22, 0.18f, 0.12f, 0.10f, 0.9f);
+                        drawRectOutline(lpX + 70, wYb, 60, 22, 0.5f, 0.25f, 0.15f);
+                        drawStr(lpX + 82, wYb + 15, "- 10%", 0.9f, 0.5f, 0.2f);
+                        drawRect(lpX + 136, wYb, 60, 22, 0.10f, 0.18f, 0.12f, 0.9f);
+                        drawRectOutline(lpX + 136, wYb, 60, 22, 0.2f, 0.5f, 0.25f);
+                        drawStr(lpX + 147, wYb + 15, "+ 10%", 0.4f, 0.9f, 0.5f);
+                    }
+                    {
+                        float dYb = lpY + 468;
+                        bool hasPoint = (selectedRoadPointIdx >= 0);
+                        drawRect(lpX + 8, dYb, lpW - 16, 24, hasPoint ? 0.32f : 0.22f, 0.09f, 0.09f, 0.95f);
+                        drawRectOutline(lpX + 8, dYb, lpW - 16, 24, 0.6f, 0.22f, 0.22f);
+                        drawStr(lpX + (lpW - (hasPoint ? 130 : 118)) / 2, dYb + 17,
+                                hasPoint ? "DELETE SELECTED POINT" : "DELETE SELECTED ROAD",
+                                0.9f, 0.9f, 0.8f);
+                    }
+                } else {
+                    drawStr(lpX + 15, lpY + 210, "None - click near a road (tool 1)", 0.6f, 0.6f, 0.6f);
+                    drawStr(lpX + 15, lpY + 226, "Width +/- and delete buttons appear", 0.55f, 0.55f, 0.55f);
+                    drawStr(lpX + 15, lpY + 240, "once a road is selected in the viewport", 0.55f, 0.55f, 0.55f);
+                }
+            }
+        }
 
 
         float saveBtnY = lpH - 35 + lpY;
@@ -1160,6 +2230,7 @@ void Game::render() {
             drawRectOutline(lpX + 8, saveBtnY, lpW - 16, 26, 0.2f, 0.7f, 0.2f);
             drawStr(lpX + 100, saveBtnY + 17, "SAVE LEVEL LAYOUT", 1.0f, 1.0f, 1.0f);
         }
+        } // end: left panel (hidden in road mode when roadPanelsVisible==false)
 
 
         // ─── 3. RIGHT PANEL: DETAILS (SELECTED ACTOR) ───
@@ -1313,6 +2384,144 @@ void Game::render() {
             }
         }
 
+        // ─── ROADS GRAPH TRANSFORM PANEL (RIGHT SIDE, mode 5) ───
+        if (activeEditorMode == 5 && roadPanelsVisible) {
+            const float rpX = (float)windowWidth - 350, rpY = 42, rpW = 340, rpH = (float)windowHeight - 52;
+            const float colW = 150.0f, gap = 10.0f, smallColW = 96.0f;
+            drawRect(rpX, rpY, rpW, rpH, 0.11f, 0.11f, 0.11f, 0.95f);
+            drawRectOutline(rpX, rpY, rpW, rpH, 0.22f, 0.22f, 0.22f);
+            drawRect(rpX + 1, rpY + 1, rpW - 2, 28, 0.15f, 0.15f, 0.15f, 1.0f);
+            drawStr(rpX + 15, rpY + 19, "ROADS GRAPH TRANSFORM", 1.0f, 0.6f, 0.1f);
+
+            float dy = rpY + 45;
+
+            // Mirror
+            drawStr(rpX + 15, dy + 6, "MIRROR the whole map", 0.8f, 0.8f, 0.8f);
+            float mbY = dy + 22;
+            drawRect(rpX + 15, mbY, colW, 26, 0.20f, 0.16f, 0.12f, 0.9f);
+            drawRectOutline(rpX + 15, mbY, colW, 26, 0.5f, 0.3f, 0.2f);
+            drawStr(rpX + 40, mbY + 17, "MIRROR X", 0.9f, 0.9f, 0.9f);
+            drawRect(rpX + 15 + colW + gap, mbY, colW, 26, 0.20f, 0.16f, 0.12f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, mbY, colW, 26, 0.5f, 0.3f, 0.2f);
+            drawStr(rpX + 15 + colW + gap + 40, mbY + 17, "MIRROR Z", 0.9f, 0.9f, 0.9f);
+            dy = mbY + 40;
+
+            // Rotate
+            drawStr(rpX + 15, dy + 6, "ROTATE the whole map (90 deg steps)", 0.8f, 0.8f, 0.8f);
+            float rbY = dy + 22;
+            const char* rotLabels[3] = { "ROT 90 <", "ROT 180", "ROT 90 >" };
+            for (int i = 0; i < 3; ++i) {
+                float bx = rpX + 15 + i * (smallColW + gap);
+                drawRect(bx, rbY, smallColW, 26, 0.16f, 0.18f, 0.22f, 0.9f);
+                drawRectOutline(bx, rbY, smallColW, 26, 0.3f, 0.4f, 0.5f);
+                drawStr(bx + 12, rbY + 17, rotLabels[i], 0.85f, 0.85f, 0.85f);
+            }
+            dy = rbY + 40;
+
+            // Scale
+            std::ostringstream scoss;
+            scoss << "SCALE whole map   x" << std::fixed << std::setprecision(2) << roadTransformScale;
+            drawStr(rpX + 15, dy + 6, scoss.str(), 0.8f, 0.8f, 0.8f);
+            float scY = dy + 22;
+            drawRect(rpX + 15, scY, colW, 26, 0.16f, 0.12f, 0.10f, 0.9f);
+            drawRectOutline(rpX + 15, scY, colW, 26, 0.4f, 0.25f, 0.2f);
+            drawStr(rpX + 45, scY + 17, "SCALE -5%", 0.85f, 0.85f, 0.85f);
+            drawRect(rpX + 15 + colW + gap, scY, colW, 26, 0.10f, 0.16f, 0.12f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, scY, colW, 26, 0.25f, 0.45f, 0.3f);
+            drawStr(rpX + 15 + colW + gap + 45, scY + 17, "SCALE +5%", 0.85f, 0.85f, 0.85f);
+            float applyY = scY + 32;
+            drawRect(rpX + 15, applyY, rpW - 30, 26, 0.17f, 0.30f, 0.50f, 0.9f);
+            drawRectOutline(rpX + 15, applyY, rpW - 30, 26, 0.35f, 0.55f, 0.75f);
+            drawStr(rpX + 95, applyY + 17, "APPLY SCALE", 1.0f, 1.0f, 1.0f);
+            float resetY = applyY + 32;
+            drawRect(rpX + 15, resetY, rpW - 30, 26, 0.22f, 0.10f, 0.10f, 0.9f);
+            drawRectOutline(rpX + 15, resetY, rpW - 30, 26, 0.5f, 0.25f, 0.25f);
+            drawStr(rpX + 105, resetY + 17, "RESET SCALE 1.0", 0.9f, 0.9f, 0.9f);
+            dy = resetY + 40;
+
+            // Connect
+            std::ostringstream coss;
+            coss << "CONNECT ROADS   tolerance " << (int)roadConnectTolerance << "m";
+            drawStr(rpX + 15, dy + 6, coss.str(), 0.8f, 0.8f, 0.8f);
+            float cbY = dy + 22;
+            drawRect(rpX + 15, cbY, rpW - 30, 26, 0.30f, 0.45f, 0.18f, 0.9f);
+            drawRectOutline(rpX + 15, cbY, rpW - 30, 26, 0.55f, 0.7f, 0.35f);
+            drawStr(rpX + 80, cbY + 17, "CONNECT ROADS", 1.0f, 1.0f, 1.0f);
+            float tolY = cbY + 32;
+            drawRect(rpX + 15, tolY, colW, 26, 0.16f, 0.16f, 0.14f, 0.9f);
+            drawRectOutline(rpX + 15, tolY, colW, 26, 0.35f, 0.35f, 0.3f);
+            drawStr(rpX + 40, tolY + 17, "TOL -5m", 0.85f, 0.85f, 0.85f);
+            drawRect(rpX + 15 + colW + gap, tolY, colW, 26, 0.14f, 0.16f, 0.16f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, tolY, colW, 26, 0.3f, 0.35f, 0.35f);
+            drawStr(rpX + 15 + colW + gap + 40, tolY + 17, "TOL +5m", 0.85f, 0.85f, 0.85f);
+            dy = tolY + 40;
+
+            // Move
+            std::ostringstream moss;
+            moss << "MOVE the whole map   step " << (int)roadMoveStep << "m";
+            drawStr(rpX + 15, dy + 6, moss.str(), 0.8f, 0.8f, 0.8f);
+            float mY1 = dy + 22;
+            drawRect(rpX + 15, mY1, colW, 26, 0.16f, 0.16f, 0.14f, 0.9f);
+            drawRectOutline(rpX + 15, mY1, colW, 26, 0.35f, 0.35f, 0.3f);
+            drawStr(rpX + 45, mY1 + 17, "MOVE -X", 0.85f, 0.85f, 0.85f);
+            drawRect(rpX + 15 + colW + gap, mY1, colW, 26, 0.14f, 0.16f, 0.16f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, mY1, colW, 26, 0.3f, 0.35f, 0.35f);
+            drawStr(rpX + 15 + colW + gap + 45, mY1 + 17, "MOVE +X", 0.85f, 0.85f, 0.85f);
+            float mY2 = mY1 + 32;
+            drawRect(rpX + 15, mY2, colW, 26, 0.16f, 0.16f, 0.14f, 0.9f);
+            drawRectOutline(rpX + 15, mY2, colW, 26, 0.35f, 0.35f, 0.3f);
+            drawStr(rpX + 45, mY2 + 17, "MOVE -Z", 0.85f, 0.85f, 0.85f);
+            drawRect(rpX + 15 + colW + gap, mY2, colW, 26, 0.14f, 0.16f, 0.16f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, mY2, colW, 26, 0.3f, 0.35f, 0.35f);
+            drawStr(rpX + 15 + colW + gap + 45, mY2 + 17, "MOVE +Z", 0.85f, 0.85f, 0.85f);
+            float mY3 = mY2 + 32;
+            drawRect(rpX + 15, mY3, colW, 26, 0.16f, 0.12f, 0.12f, 0.9f);
+            drawRectOutline(rpX + 15, mY3, colW, 26, 0.4f, 0.25f, 0.25f);
+            drawStr(rpX + 40, mY3 + 17, "STEP -5m", 0.85f, 0.85f, 0.85f);
+            drawRect(rpX + 15 + colW + gap, mY3, colW, 26, 0.12f, 0.14f, 0.16f, 0.9f);
+            drawRectOutline(rpX + 15 + colW + gap, mY3, colW, 26, 0.25f, 0.3f, 0.35f);
+            drawStr(rpX + 15 + colW + gap + 40, mY3 + 17, "STEP +5m", 0.85f, 0.85f, 0.85f);
+            dy = mY3 + 34;
+
+            drawStr(rpX + 15, dy + 4, "F2 saves the transformed roads", 0.55f, 0.55f, 0.55f);
+        }
+
+        if (activeEditorMode == 5 && !roadPanelsVisible) {
+            std::string hint = "Panels hidden (TAB shows them).  Tools: 1 Select   2 Draw (drag draws, Enter commit)   3 Edit Pts    T type    Del delete    R reference";
+            drawStr(windowWidth / 2.0f - 400, (float)windowHeight - 42, hint.c_str(), 0.65f, 0.65f, 0.65f);
+        }
+
+        // ─── REFERENCE IMAGE OVERLAY (PiP) in road edit mode ───
+        if (activeEditorMode == 5) {
+            if (roadRefVisible && roadRefTex) {
+                std::string refNameSub = std::string(roadRefPaths[roadRefIdx]);
+                size_t rslash = refNameSub.find_last_of("/\\");
+                if (rslash != std::string::npos) refNameSub = refNameSub.substr(rslash + 1);
+                float rw = 300.0f;
+                float rh = (roadRefH > 0) ? rw * ((float)roadRefH / (float)roadRefW) : 200.0f;
+                float rx = (float)windowWidth - rw - 12.0f;
+                float ry = 40.0f;
+                drawRect(rx - 6, ry - 26, rw + 12, rh + 32, 0.04f, 0.04f, 0.04f, 0.9f);
+                drawRectOutline(rx - 6, ry - 26, rw + 12, rh + 32, 0.5f, 0.5f, 0.5f);
+                std::string title = std::string("REF MAP ") + std::to_string(roadRefIdx + 1) + "/" +
+                                     std::to_string(roadRefPathCount) + "  " + refNameSub +
+                                     "  (R toggle, [ ] cycle)";
+                drawStr(rx, ry - 16, title, 0.85f, 0.85f, 0.85f);
+                glEnable(GL_TEXTURE_2D);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, roadRefTex);
+                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+                glColor4f(1.0f, 1.0f, 1.0f, 0.85f);
+                glBegin(GL_QUADS);
+                glTexCoord2f(0.0f, 0.0f); glVertex2f(rx, ry);
+                glTexCoord2f(1.0f, 0.0f); glVertex2f(rx + rw, ry);
+                glTexCoord2f(1.0f, 1.0f); glVertex2f(rx + rw, ry + rh);
+                glTexCoord2f(0.0f, 1.0f); glVertex2f(rx, ry + rh);
+                glEnd();
+                glDisable(GL_TEXTURE_2D);
+            }
+        }
+
         // ─── 4. 2D PROJECTED BRUSH SIZE CIRCLE (BLENDER STYLE) ───
         if ((activeEditorMode == 2 || activeEditorMode == 3) && lastRayHitPos.y > -900.0f) {
             float aspectRatio = (float)windowWidth / (float)windowHeight;
@@ -1404,8 +2613,168 @@ void Game::performSave() {
     SousseMapData::saveLayout("assets/saves/city.txt");
     if (terrain) {
         terrain->saveTerrain();
+        terrain->saveRoadsToJSON("assets/roads/roads_manual.json");
     }
-    std::cout << "[Editor] Saved level layout and terrain modifications!\n";
+    std::cout << "[Editor] Saved level layout, terrain and road graph!\n";
+}
+
+// Persists the projected reference map placement & scale (center, size, flip, opacity, height, image index)
+void Game::saveProjRefMap() {
+    const std::string path = "assets/roads/projref_map.txt";
+    {
+        // Preserve the previous placement to projref_map.txt.bak_old before overwriting
+        const std::string bakPath = path + ".bak_old";
+        std::ifstream oldf(path);
+        if (oldf.good()) {
+            std::string old((std::istreambuf_iterator<char>(oldf)), std::istreambuf_iterator<char>());
+            oldf.close();
+            std::ofstream bak(bakPath, std::ios::trunc);
+            if (bak) { bak << old; bak.close(); }
+        }
+    }
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) {
+        std::cerr << "[Road] FAILED to open " << path << " for writing\n";
+        return;
+    }
+    f << "centerX " << projRefCenter.x << "\n"
+      << "centerZ " << projRefCenter.y << "\n"
+      << "mapW " << projRefMapW << "\n"
+      << "scale " << projRefScale << "\n"
+      << "flipX " << (projRefFlipX ? 1 : 0) << "\n"
+      << "flipZ " << (projRefFlipZ ? 1 : 0) << "\n"
+      << "opacity " << projRefOpacity << "\n"
+      << "yOffset " << projRefYOffset << "\n"
+      << "idx " << roadRefIdx << "\n";
+    f.close();
+    projSaveFlash = 1.6f; // visual feedback: highlight the button + show "SAVED" line
+    projSavedCenter = projRefCenter;
+    projSavedScale = projRefScale;
+    projSavedFlipX = projRefFlipX;
+    projSavedFlipZ = projRefFlipZ;
+    projSavedOpacity = projRefOpacity;
+    projSavedYOffset = projRefYOffset;
+    projSavedIdx = roadRefIdx;
+    projSavedMapW = projRefMapW;
+    projLastSave = glfwGetTime();
+    std::cout << "[Road] Projection placement saved to " << path
+              << " (center " << projRefCenter.x << ", " << projRefCenter.y
+              << ", scale " << projRefScale << "x)\n";
+}
+
+void Game::commitRoadDraft() {
+    RoadGraph* rg = terrain ? terrain->getRoadGraph() : nullptr;
+    if (rg && roadDraftPoints.size() >= 2) {
+        uint32_t nextId = 0;
+        for (const auto& s : rg->segments) nextId = std::max(nextId, s.id + 1);
+        RoadSegment ns;
+        ns.id = nextId;
+        ns.type = (RoadType)roadDrawType;
+        ns.width = roadDrawWidth;
+        ns.shoulderWidth = roadDrawShoulder;
+        // Ramer-Douglas-Peucker simplification (2D x/z) so freehand drags don't bake
+        // in every 5m sample — keeps drawn roads smooth with far fewer control points.
+        auto simplifyDraft = [&](const std::vector<glm::vec3>& pts, float tol) {
+            if (pts.size() <= 2) return pts;
+            std::vector<bool> keep(pts.size(), false);
+            keep.front() = keep.back() = true;
+            std::vector<std::pair<int, int>> stack;
+            stack.push_back({ 0, (int)pts.size() - 1 });
+            while (!stack.empty()) {
+                int a = stack.back().first, b = stack.back().second;
+                stack.pop_back();
+                if (b - a < 2) continue;
+                float maxD = 0.0f; int at = -1;
+                for (int i = a + 1; i < b; ++i) {
+                    float d = distPointToPolylineSegment(pts[i].x, pts[i].z,
+                                                         pts[a].x, pts[a].z, pts[b].x, pts[b].z);
+                    if (d > maxD) { maxD = d; at = i; }
+                }
+                if (maxD > tol && at >= 0) {
+                    keep[at] = true;
+                    stack.push_back({ a, at });
+                    stack.push_back({ at, b });
+                }
+            }
+            std::vector<glm::vec3> out;
+            for (size_t i = 0; i < pts.size(); ++i) if (keep[i]) out.push_back(pts[i]);
+            return out;
+        };
+        // tolerance scales with road width so narrow medina alleys keep their shape
+        float tol = glm::max(1.2f, ns.width * 0.15f);
+        std::vector<glm::vec3> simp = simplifyDraft(roadDraftPoints, tol);
+        const int skipped = (int)roadDraftPoints.size() - (int)simp.size();
+        for (const auto& p : simp) {
+            RoadPoint rp; rp.pos.x = p.x; rp.pos.y = p.z;
+            ns.controlPoints.push_back(rp);
+        }
+        rg->segments.push_back(ns);
+        selectedRoadIdx = (int)rg->segments.size() - 1;
+        selectedRoadPointIdx = -1;
+        roadGraphDirty = true;
+        roadDraftPoints.clear();
+        draftDragIdx = -1;
+        std::cout << "[Road] Committed road id=" << ns.id
+                  << " (" << ns.controlPoints.size() << " control points"
+                  << (skipped > 0 ? ", auto-simplified " + std::to_string(skipped) + " pts" : "") << ")\n";
+    } else {
+        std::cout << "[Road] Need at least 2 draft points to commit\n";
+    }
+}
+
+void Game::cancelRoadDraft() {
+    if (!roadDraftPoints.empty()) {
+        roadDraftPoints.clear();
+        draftDragIdx = -1;
+        std::cout << "[Road] Drawing cancelled (" << roadDraftPoints.size() << " draft points cleared)\n";
+    }
+}
+
+bool Game::loadProjRefMap() {
+    const std::string path = "assets/roads/projref_map.txt";
+    std::ifstream f(path);
+    if (!f.is_open()) return false;
+    float cx = projRefCenter.x, cz = projRefCenter.y, mw = 0.0f, sc = 1.0f, op = 0.85f, yo = 0.0f;
+    int flX = 0, flZ = 0, idx = 0;
+    bool haveMw = false;
+    std::string key;
+    while (f >> key) {
+        if (key == "centerX") f >> cx;
+        else if (key == "centerZ") f >> cz;
+        else if (key == "mapW") { f >> mw; haveMw = true; }
+        else if (key == "scale") f >> sc;
+        else if (key == "flipX") f >> flX;
+        else if (key == "flipZ") f >> flZ;
+        else if (key == "opacity") f >> op;
+        else if (key == "yOffset") f >> yo;
+        else if (key == "idx") f >> idx;
+    }
+    f.close();
+    projRefCenter.x = cx;
+    projRefCenter.y = cz;
+    projRefScale = sc;
+    projRefFlipX = (flX != 0);
+    projRefFlipZ = (flZ != 0);
+    projRefOpacity = glm::clamp(op, 0.1f, 1.0f);
+    projRefYOffset = yo;
+    roadRefIdx = (idx >= 0 && idx < roadRefPathCount) ? idx : 0;
+    if (haveMw) {
+        projRefMapW = mw;
+        projSavedCenter = projRefCenter;
+        projSavedScale = projRefScale;
+        projSavedFlipX = projRefFlipX;
+        projSavedFlipZ = projRefFlipZ;
+        projSavedOpacity = projRefOpacity;
+        projSavedYOffset = projRefYOffset;
+        projSavedIdx = roadRefIdx;
+        projSavedMapW = projRefMapW;
+        projLastSave = glfwGetTime();
+        std::cout << "[Road] Projection placement restored from " << path
+                  << " (center " << projRefCenter.x << ", " << projRefCenter.y
+                  << ", scale " << projRefScale << "x, opacity " << projRefOpacity << ")\n";
+        return true;
+    }
+    return false;
 }
 
 Camera& Game::getCamera() {
@@ -1455,6 +2824,110 @@ void Game::keyDown(int key) {
 
     if (editMode) {
         // Handle Editor specific inputs
+
+        // ── Road Edit mode keys ──
+        if (activeEditorMode == 5) {
+            if (key == GLFW_KEY_TAB) {
+                roadPanelsVisible = !roadPanelsVisible;
+                std::cout << "[Road] Side panels " << (roadPanelsVisible ? "shown (Tab hides to free the viewport for clicks)" : "hidden (Tab shows them again)") << "\n";
+                return;
+            }
+            if (key == GLFW_KEY_R) {
+                roadRefVisible = !roadRefVisible;
+                std::cout << "[Road] Reference image " << (roadRefVisible ? "shown" : "hidden") << " (R toggles)\n";
+                return;
+            }
+            if (key == GLFW_KEY_LEFT_BRACKET || key == GLFW_KEY_RIGHT_BRACKET) {
+                int dir = (key == GLFW_KEY_LEFT_BRACKET) ? -1 : 1;
+                int next = (roadRefIdx + dir + roadRefPathCount) % roadRefPathCount;
+                if (next != roadRefIdx) {
+                    roadRefIdx = next;
+                    roadRefLoaded = false;   // force reload next frame
+                    std::cout << "[Road] Reference map -> " << roadRefPaths[roadRefIdx] << "\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_1) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 0; std::cout << "[Road] Tool: Select Road\n"; return; }
+            if (key == GLFW_KEY_2) { if (roadToolMode != 1) draftDragIdx = -1; roadToolMode = 1; std::cout << "[Road] Tool: Draw Road (LMB click=add/grab point, drag on edge=insert, drag=draw, Enter commit, Esc cancel)\n"; return; }
+            if (key == GLFW_KEY_3) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 2; std::cout << "[Road] Tool: Edit Points (click grab/insert, drag move, Del remove)\n"; return; }
+            if (key == GLFW_KEY_4) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 3; std::cout << "[Road] Tool: Reference Map (drag to move, panel for scale/flip)\n"; return; }
+            // (in Draw tool) Del / Backspace pops the last draft point (undo)
+            if ((key == GLFW_KEY_DELETE || key == GLFW_KEY_BACKSPACE) && roadToolMode == 1 && !roadDraftPoints.empty()) {
+                roadDraftPoints.pop_back();
+                draftDragIdx = -1;
+                std::cout << "[Road] Removed last draft point (" << roadDraftPoints.size() << " left)\n";
+                return;
+            }
+            // (in Select tool) '=' / '-' +/- 10% scales the selected road's width ("scale roads")
+            if ((key == GLFW_KEY_EQUAL || key == GLFW_KEY_MINUS) && roadToolMode == 0) {
+                RoadGraph* rgw = terrain->getRoadGraph();
+                if (rgw && selectedRoadIdx >= 0 && selectedRoadIdx < (int)rgw->segments.size()) {
+                    float f = (key == GLFW_KEY_EQUAL) ? 1.1f : 1.0f / 1.1f;
+                    auto& seg = rgw->segments[selectedRoadIdx];
+                    seg.width = glm::clamp(seg.width * f, 2.0f, 40.0f);
+                    roadGraphDirty = true;
+                    std::cout << "[Road] Selected width -> " << seg.width << "m (id=" << seg.id << ")\n";
+                } else {
+                    std::cout << "[Road] Select a road first (tool 1), then '='/' -' scales its width\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_T) {
+                if (roadToolMode == 1) {
+                    roadDrawType = (roadDrawType + 1) % 6;
+                    roadDrawWidth = roadDefaultWidthFor((RoadType)roadDrawType);
+                    roadDrawShoulder = roadDefaultShoulderFor((RoadType)roadDrawType);
+                    std::cout << "[Road] Next road type -> " << roadTypeLabel(roadDrawType)
+                              << " (w " << roadDrawWidth << "m, s " << roadDrawShoulder << "m)\n";
+                    return;
+                }
+                RoadGraph* rg = terrain->getRoadGraph();
+                if (rg && selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg->segments.size()) {
+                    auto& seg = rg->segments[selectedRoadIdx];
+                    seg.type = (RoadType)((((int)seg.type) + 1) % 6);
+                    seg.width = roadDefaultWidthFor(seg.type);
+                    seg.shoulderWidth = roadDefaultShoulderFor(seg.type);
+                    roadGraphDirty = true;
+                    std::cout << "[Road] Type -> " << roadTypeLabel((int)seg.type) << "\n";
+                } else {
+                    std::cout << "[Road] Select a road first (tool 1)\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_ENTER) {
+                commitRoadDraft();
+                return;
+            }
+            if (key == GLFW_KEY_ESCAPE) {
+                cancelRoadDraft();
+                selectedRoadPointIdx = -1;
+                return;
+            }
+            if (key == GLFW_KEY_DELETE || key == GLFW_KEY_BACKSPACE) {
+                RoadGraph* rg = terrain->getRoadGraph();
+                if (rg && selectedRoadIdx >= 0 && selectedRoadIdx < (int)rg->segments.size()) {
+                    if (selectedRoadPointIdx >= 0 &&
+                        (int)rg->segments[selectedRoadIdx].controlPoints.size() > 2) {
+                        rg->segments[selectedRoadIdx].controlPoints.erase(
+                            rg->segments[selectedRoadIdx].controlPoints.begin() + selectedRoadPointIdx);
+                        selectedRoadPointIdx = -1;
+                        std::cout << "[Road] Removed control point\n";
+                    } else {
+                        rg->segments.erase(rg->segments.begin() + selectedRoadIdx);
+                        selectedRoadIdx = -1;
+                        selectedRoadPointIdx = -1;
+                        std::cout << "[Road] Deleted selected road\n";
+                    }
+                    roadGraphDirty = true;
+                }
+                return;
+            }
+            // Straight-line (roadStraightMode) and Snap (roadSnapToRoads) are BUTTON-ONLY
+            // (draw panel). The S/J key handlers were removed because S conflicts with the
+            // player movement key (fall-through to the player switch below) and J is now
+            // redundant. Shift+LMB still gives one-shot straight when held.
+        }
+
         if (key == GLFW_KEY_B) {
             editorBrushMode = (editorBrushMode + 1) % 8;
             std::string modeNames[] = {

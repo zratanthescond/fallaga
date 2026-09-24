@@ -19,21 +19,26 @@
 
 // ──────────────────────── COORDINATE SYSTEM ─────────────────────────────────
 
+#ifndef TERRAIN_BOUNDS_DEFINED
+#define TERRAIN_BOUNDS_DEFINED
 struct TerrainBounds {
     float minX, maxX;          // World-space X extent
     float minZ, maxZ;          // World-space Z extent
     float minHeight, maxHeight; // Elevation range
 };
+#endif
 
 struct TerrainCoordinateMapper {
     TerrainBounds bounds;
     int heightmapW = 0, heightmapH = 0;
+    bool flipHeightmapZ = false;
 
-    // Pixel (col, row) → World (X, Z).  This matches TerrainManager,
-    // where row 0 is the south edge (minZ) of the rendered terrain mesh.
+    // Pixel (col, row) → World (X, Z).
     glm::vec2 pixelToWorld(float px, float py) const {
         float u = px / float(heightmapW - 1);
         float v = py / float(heightmapH - 1);
+        if (flipHeightmapZ)
+            v = 1.0f - v;
         return glm::vec2(
             glm::mix(bounds.minX, bounds.maxX, u),
             glm::mix(bounds.minZ, bounds.maxZ, v)
@@ -42,19 +47,19 @@ struct TerrainCoordinateMapper {
 
     // World (X, Z) → Normalized UV [0,1]
     glm::vec2 worldToUV(float x, float z) const {
-        return glm::vec2(
-            (x - bounds.minX) / (bounds.maxX - bounds.minX),
-            (z - bounds.minZ) / (bounds.maxZ - bounds.minZ)
-        );
+        float u = (x - bounds.minX) / (bounds.maxX - bounds.minX);
+        float v = (z - bounds.minZ) / (bounds.maxZ - bounds.minZ);
+        if (flipHeightmapZ)
+            v = 1.0f - v;
+        return glm::vec2(u, v);
     }
 
     // World (X, Z) → Heightmap pixel (col, row)
     glm::vec2 worldToPixel(float x, float z) const {
-        float u = (x - bounds.minX) / (bounds.maxX - bounds.minX);
-        float v = (z - bounds.minZ) / (bounds.maxZ - bounds.minZ);
+        glm::vec2 uv = worldToUV(x, z);
         return glm::vec2(
-            u * float(heightmapW - 1),
-            v * float(heightmapH - 1)
+            uv.x * float(heightmapW - 1),
+            uv.y * float(heightmapH - 1)
         );
     }
 };
@@ -102,6 +107,10 @@ struct RoadSegment {
     // Raw control points from JSON
     std::vector<RoadPoint> controlPoints;
 
+    // True when the road forms a closed loop (round road / roundabout): rendered as
+    // a continuous ring with no end caps and unbiased curvature at the seam.
+    bool closed = false;
+
     // Evaluated spline (filled by RoadSpline::evaluate)
     std::vector<glm::vec3> splinePoints;   // x, y(elevation), z
     std::vector<glm::vec3> tangents;
@@ -133,10 +142,13 @@ public:
 namespace RoadSpline {
     // Catmull-Rom spline evaluation from 2D control points.
     // Samples heightmap for Y, then smooths elevation.
+    // Straight stretches resample every (1/samplesPerMeter) meters; curved
+    // sections (filleted corners, closed rings) tessellate by turn angle
+    // (~5 degrees per sample) so tight corners never starve for geometry.
     void evaluate(
         RoadSegment& seg,
         const HeightSampler& sampler,
-        float samplesPerMeter = 0.5f   // 1 sample every 2m
+        float samplesPerMeter = 0.5f   // 1 sample every 2m on straights
     );
 
     // Smooth elevation profile to respect max road grade
@@ -193,8 +205,10 @@ public:
     RoadMeshBuilder() = default;
     ~RoadMeshBuilder();
 
-    // Generate ribbon mesh from evaluated road segments
-    void build(const std::vector<RoadSegment>& segments,
+    // Generate ribbon mesh from evaluated road segments.
+    // Segments are taken by value so branch endpoints can be retracted to the
+    // host road's near edge before the ribbon is emitted.
+    void build(std::vector<RoadSegment> segments,
                const HeightSampler& sampler,
                const RoadDeformer* deformer = nullptr);
 
