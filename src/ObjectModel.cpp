@@ -296,6 +296,7 @@ void ObjModel::processNode(aiNode* node) {
         newMesh.assimpMesh = mesh;
         newMesh.materialIndex = mesh->mMaterialIndex;
         newMesh.name = mesh->mName.C_Str();
+        newMesh.nodeName = node->mName.C_Str();
 
         // Calculate AABB for this mesh
         newMesh.minBound = glm::vec3(std::numeric_limits<float>::max());
@@ -874,15 +875,36 @@ bool ObjModel::getNodeTransform(const std::string& name, glm::mat4& outTransform
 }
 
 bool ObjModel::checkSphereCollision(const glm::vec3& centerLocal, float radiusLocal, glm::vec3& outNormalLocal, float& outDepthLocal) const {
-    // Simple AABB-sphere collision per mesh
+    // Sphere vs mesh AABB. If the sphere center is inside the box, choose the
+    // nearest face instead of returning an arbitrary upward normal; that lets
+    // callers depenetrate sideways from walls and buildings.
     for (const auto& mesh : meshes) {
         glm::vec3 closest = glm::clamp(centerLocal, mesh.minBound, mesh.maxBound);
         glm::vec3 diff = centerLocal - closest;
         float distSq = glm::dot(diff, diff);
         if (distSq < radiusLocal * radiusLocal) {
             float dist = sqrtf(distSq);
-            outNormalLocal = (dist > 0.001f) ? diff / dist : glm::vec3(0, 1, 0);
-            outDepthLocal = radiusLocal - dist;
+            if (dist > 0.001f) {
+                outNormalLocal = diff / dist;
+                outDepthLocal = radiusLocal - dist;
+            } else {
+                const float faceDistance[6] = {
+                    centerLocal.x - mesh.minBound.x,
+                    mesh.maxBound.x - centerLocal.x,
+                    centerLocal.y - mesh.minBound.y,
+                    mesh.maxBound.y - centerLocal.y,
+                    centerLocal.z - mesh.minBound.z,
+                    mesh.maxBound.z - centerLocal.z};
+                int face = 0;
+                for (int i = 1; i < 6; ++i)
+                    if (faceDistance[i] < faceDistance[face]) face = i;
+                static const glm::vec3 faceNormals[6] = {
+                    glm::vec3(-1, 0, 0), glm::vec3(1, 0, 0),
+                    glm::vec3(0, -1, 0), glm::vec3(0, 1, 0),
+                    glm::vec3(0, 0, -1), glm::vec3(0, 0, 1)};
+                outNormalLocal = faceNormals[face];
+                outDepthLocal = radiusLocal + faceDistance[face];
+            }
             return true;
         }
     }

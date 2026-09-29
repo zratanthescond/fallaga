@@ -4,38 +4,7 @@ in vec3 viewDir;
 
 uniform vec3 lightDir; // Sun/Moon direction
 uniform float time;
-
-// Simple hash for noise
-float hash(vec2 p) {
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
-}
-
-// 2D Noise
-float noise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    float a = hash(i);
-    float b = hash(i + vec2(1.0, 0.0));
-    float c = hash(i + vec2(0.0, 1.0));
-    float d = hash(i + vec2(1.0, 1.0));
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
-}
-
-// Fractal Brownian Motion for clouds
-float fbm(vec2 p) {
-    float v = 0.0;
-    float a = 0.5;
-    vec2 shift = vec2(100.0);
-    for (int i = 0; i < 5; ++i) {
-        v += a * noise(p);
-        p = p * 2.0 + shift;
-        a *= 0.5;
-    }
-    return v;
-}
+uniform sampler2D cloudNoise;
 
 void main() {
     vec3 dir = normalize(viewDir);
@@ -71,12 +40,14 @@ void main() {
     vec3 skyColor = mix(skyBottom, skyTop, pow(vertical, 0.8));
 
     // 2. PROCEDURAL CLOUDS
-    vec2 cloudUV = dir.xz / (dir.y + 0.01);
-    float cloudSpeed = time * 0.01;
-    float cloudDensity = fbm(cloudUV * 0.5 + cloudSpeed);
-    
     // Only show clouds above horizon
     float cloudMask = smoothstep(0.0, 0.2, dir.y);
+    float cloudDensity = 0.0;
+    if (dir.y > 0.0) {
+        vec2 cloudUV = dir.xz / (dir.y + 0.01);
+        float cloudSpeed = time * 0.01;
+        cloudDensity = texture(cloudNoise, cloudUV * 0.5 + cloudSpeed).r;
+    }
     vec3 cloudColor = vec3(1.0, 1.0, 1.0);
     if (sunTilt < 0.0) cloudColor *= 0.3; // Darker at night
     else if (sunTilt < 0.2) cloudColor = mix(vec3(1.0, 0.6, 0.3), cloudColor, smoothstep(0.0, 0.2, sunTilt));

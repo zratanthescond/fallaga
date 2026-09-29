@@ -27,7 +27,7 @@ public:
         position.y += velocity.y * deltaTime;
 
         // 3. Collision with Terrain
-        float terrainHeight = terrain->getHeight(position.x, position.z);
+        float terrainHeight = terrain->getGroundSurfaceHeight(position.x, position.z);
         if (position.y < terrainHeight + groundOffset) {
             position.y = terrainHeight + groundOffset;
             velocity.y = 0.0f; // Stop falling
@@ -44,7 +44,7 @@ public:
      */
     static void snapToGround(Vec3& position, const Terrain* terrain, float groundOffset = 0.0f) {
         if (!terrain) return;
-        position.y = terrain->getHeight(position.x, position.z) + groundOffset;
+        position.y = terrain->getGroundSurfaceHeight(position.x, position.z) + groundOffset;
     }
 };
 

@@ -5,7 +5,9 @@
 #include "Camera.h"
 #include "Character.h"
 #include "Terrain.h"
+#include "Car.h"
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <glm/gtc/matrix_transform.hpp> // Ensure this is included here as well
 Camera::Camera(Character* target) 
@@ -43,6 +45,11 @@ glm::mat4 Camera::getViewMatrix()
 void Camera::update(float mouseDeltaX, float mouseDeltaY, float mouseScroll, float deltaTime, bool isEditMode) {
     if (!target) return;
 
+    // While driving, the camera must follow the CAR. The character's own
+    // velocity is not driven by the car, so it is stale (leftover walking
+    // velocity, usually zero) and useless for camera alignment.
+    Car* car = target->isDrivingOrTransitioning() ? target->getMountedCar() : nullptr;
+
     // 1. Update angles and distance based on mouse input
     angleAroundTarget += mouseDeltaX * CAMERA_SENSITIVITY;
     pitch -= mouseDeltaY * CAMERA_SENSITIVITY;
@@ -50,6 +57,13 @@ void Camera::update(float mouseDeltaX, float mouseDeltaY, float mouseScroll, flo
     // Clamp pitch to prevent flipping
     if (pitch > CAMERA_PITCH_MAX) pitch = CAMERA_PITCH_MAX;
     if (pitch < CAMERA_PITCH_MIN) pitch = CAMERA_PITCH_MIN;
+
+    // Contain the pitch while driving. An on-foot camera left near-overhead or
+    // almost level makes the car undrivable, and reset() never changes pitch.
+    if (car) {
+        if (pitch > 42.0f) pitch = 42.0f;
+        if (pitch < 3.0f) pitch = 3.0f;
+    }
 
     // Handle camera zoom limits dynamically (closer when aiming)
     float minZoom = CAMERA_MIN_DISTANCE;
@@ -74,6 +88,19 @@ void Camera::update(float mouseDeltaX, float mouseDeltaY, float mouseScroll, flo
     if (distance > maxZoom) distance = maxZoom;
     if (distance < minZoom) distance = minZoom;
 
+    // Driving pull-back. FOV is fixed at 45 degrees, so distance is the only
+    // way to see far enough ahead at speed. A manual scroll suppresses it for a
+    // couple of seconds so it does not fight the player.
+    if (car) {
+        if (mouseScroll != 0.0f) zoomHold = 2.0f;
+        else if (zoomHold > 0.0f) zoomHold -= deltaTime;
+
+        float wanted = glm::clamp(7.0f + car->getSpeed() * 0.30f, 7.0f, 20.0f);
+        if (zoomHold <= 0.0f) {
+            distance += (wanted - distance) * (1.0f - std::exp(-2.5f * deltaTime));
+        }
+    }
+
     // 2. Auto-Alignment (RDR2 Camera feel) - Disabled in Editor Mode
     if (mouseDeltaX != 0.0f || mouseDeltaY != 0.0f) {
         timeSinceLastMouseMovement = 0.0f;
@@ -83,19 +110,52 @@ void Camera::update(float mouseDeltaX, float mouseDeltaY, float mouseScroll, flo
 
     Vec3 vel = target->getVelocity();
     float horizontalSpeed = sqrt(vel.x * vel.x + vel.z * vel.z);
-    
-    // Only align if moving, mouse has been quiet for 1.2 seconds, and NOT in edit mode
-    if (!isEditMode && horizontalSpeed > 0.5f && timeSinceLastMouseMovement > 1.2f) {
-        // Find movement angle in degrees
-        float targetAngle = std::atan2(vel.x, vel.z) * 180.0f / 3.14159265f;
-        
-        float angleDiff = targetAngle - angleAroundTarget;
+    float alignAngle = std::atan2(vel.x, vel.z) * 180.0f / 3.14159265f;
+    bool haveAlignSource = horizontalSpeed > 0.5f;
+
+    if (car) {
+        // Align to the car's heading, not its velocity, so the camera stays
+        // behind the car while reversing instead of swinging to the front.
+        glm::vec3 cf = car->getForwardVector();
+        // The orbit angle is measured from the car's forward vector: with the
+        // camera position formula below, this places the camera behind it.
+        alignAngle = std::atan2(cf.x, cf.z) * 180.0f / 3.14159265f;
+        horizontalSpeed = car->getSpeed();
+        haveAlignSource = true;
+    }
+
+    // Driving uses a short manual-look hold and an exponential return so the
+    // chase camera stays behind the car through corners, including at rest.
+    float idleNeeded = car ? 0.10f : 1.2f;
+
+    // Only align if moving, mouse has been quiet, and NOT in edit mode
+    const bool shouldAlign = car || horizontalSpeed > 0.5f;
+    if (!isEditMode && haveAlignSource && shouldAlign &&
+        timeSinceLastMouseMovement > idleNeeded) {
+        float angleDiff = alignAngle - angleAroundTarget;
         while (angleDiff > 180.0f) angleDiff -= 360.0f;
         while (angleDiff < -180.0f) angleDiff += 360.0f;
         
         // Slowly align camera behind player
-        float alignRate = (target->isRiding() || target->isDrivingOrTransitioning()) ? 0.8f : 1.2f;
-        angleAroundTarget += angleDiff * alignRate * deltaTime;
+        float alignRate = car ? 8.0f : ((target->isRiding() || target->isDrivingOrTransitioning()) ? 0.8f : 1.2f);
+        angleAroundTarget += angleDiff * (1.0f - std::exp(-alignRate * deltaTime));
+    }
+
+    if (std::getenv("FALLAGA_TEST_MODE") && car) {
+        static int camDbg = 0;
+        if (++camDbg % 20 == 0) {
+            float d = alignAngle - angleAroundTarget;
+            while (d > 180.0f) d -= 360.0f;
+            while (d < -180.0f) d += 360.0f;
+            std::cout << "[CAMDGB] spd=" << horizontalSpeed
+                      << " alignAngle=" << alignAngle
+                      << " camAngle=" << angleAroundTarget
+                      << " diff=" << d
+                      << " dist=" << distance
+                      << " pitch=" << pitch
+                      << " idle=" << timeSinceLastMouseMovement
+                      << " haveAlign=" << haveAlignSource << "\n";
+        }
     }
 
     // 3. Calculate the new camera's goal position
@@ -106,8 +166,14 @@ void Camera::update(float mouseDeltaX, float mouseDeltaY, float mouseScroll, flo
 }
 
 void Camera::calculateCameraPosition() {
-    // The target is the character's position
+    // The seated character anchor can lag the car by one update. Use the car's
+    // actual chassis position for both camera placement and look-at framing.
+    Car* car = target->isDrivingOrTransitioning() ? target->getMountedCar() : nullptr;
     Vec3 targetPos = target->getPosition();
+    if (car) {
+        const Vec3 carPos = car->getPosition();
+        targetPos = Vec3(carPos.x, carPos.y, carPos.z);
+    }
 
     // Convert angles to radians for trigonometric functions
     float radAngleAroundTarget = angleAroundTarget * 3.14159265f / 180.0f;
@@ -150,7 +216,10 @@ void Camera::calculateCameraPosition() {
     
     float terrainY = 0.0f;
     if (terrainModel) {
-        terrainY = terrainModel->getHeight(position.x, position.z);
+        // Ground surface, not raw terrain: on a roadbed the rendered surface sits
+        // above the raw heightfield, and a raw-height clamp sinks the camera
+        // through the road.
+        terrainY = terrainModel->getGroundSurfaceHeight(position.x, position.z);
     }
     
     // Define a minimum height offset above the terrain
@@ -165,7 +234,10 @@ void Camera::calculateCameraPosition() {
 void Camera::updateSmoothing(float deltaTime) {
     // The core of the RDR2-like feel.
     // We smoothly interpolate the camera's position towards its goal.
-    float smoothingFactor = 1.0f - exp(-CAMERA_SMOOTHING * deltaTime);
+    Car* car = target && target->isDrivingOrTransitioning()
+        ? target->getMountedCar() : nullptr;
+    const float smoothingRate = car ? 10.0f : CAMERA_SMOOTHING;
+    float smoothingFactor = 1.0f - exp(-smoothingRate * deltaTime);
 
     // Smoothly move the camera from its current position to the new goal position
     smoothedPosition.x += (position.x - smoothedPosition.x) * smoothingFactor;
@@ -174,6 +246,10 @@ void Camera::updateSmoothing(float deltaTime) {
     
     // Calculate the goal target look-at position
     Vec3 targetPos = target->getPosition();
+    if (car) {
+        const Vec3 carPos = car->getPosition();
+        targetPos = Vec3(carPos.x, carPos.y, carPos.z);
+    }
     targetPos.y += 1.3f; // head/shoulder level
     
     float radAngleAroundTarget = angleAroundTarget * 3.14159265f / 180.0f;
@@ -233,7 +309,12 @@ void Camera::reset() {
     smoothedPosition = position;
     
     // Calculate target goal immediately
+    Car* car = target->isDrivingOrTransitioning() ? target->getMountedCar() : nullptr;
     Vec3 targetPos = target->getPosition();
+    if (car) {
+        const Vec3 carPos = car->getPosition();
+        targetPos = Vec3(carPos.x, carPos.y, carPos.z);
+    }
     targetPos.y += 1.3f; // head/shoulder level
     
     float radAngleAroundTarget = angleAroundTarget * 3.14159265f / 180.0f;

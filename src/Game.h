@@ -26,12 +26,14 @@ public:
     int activeTextureLayer = 0; // 0 = Layer 1, 1 = Layer 2
     float previewScale = 1.0f;
     float previewAngle = 0.0f;
-    int editorBrushMode = 0; // 0=Select/Move, 1=Sculpt Raise, 2=Sculpt Lower, 3=Sculpt Smooth, 4=Sculpt Erode, 5=Paint Road, 6=Paint River, 7=Paint Erase
+    int editorBrushMode = 0; // 0=Select; 1-5 sculpt; 6=Paint Road; 7=Paint River; 8=Paint Erase
     float brushRadius = 30.0f;
     float brushStrength = 5.0f;
+    float sculptAngleDegrees = 20.0f;
+    float sculptGradeDegrees = 20.0f;
     glm::vec3 lastRayHitPos = glm::vec3(0.0f, -1000.0f, 0.0f);
     bool rayHitTerrain = false;
-    float waterLevelAdjust = -48.5f; // Real-time water level, default = WATER_BASE
+    float waterLevelAdjust = -55.0f; // Real-time sea level
     // ── Road Edit mode state ──
     int roadToolMode = 0;              // 0=Select Road, 1=Draw Road, 2=Edit Points
     int selectedRoadIdx = -1;
@@ -54,6 +56,8 @@ public:
     int roadDrawType = 1;              // default UrbanStreet
     float roadDrawWidth = 8.0f;        // m
     float roadDrawShoulder = 1.5f;     // m
+    float roadDrawCornerRadius = 0.0f;  // m; 0 uses the road-width-based automatic curve
+    bool roadDrawClosedLoop = false;   // close the next drawn road into a continuous ring
     // Reference image overlay (loaded in road edit mode)
     bool roadRefVisible = true;
     bool roadRefLoaded = false;

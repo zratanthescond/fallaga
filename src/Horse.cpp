@@ -90,10 +90,10 @@ void Horse::update(float deltaTime, Terrain* terrain) {
         glm::vec3 fwd = getHorizontalForward();
         glm::vec3 right(fwd.z, 0.0f, -fwd.x); // perpendicular in XZ plane
 
-        float hFront = terrain->getHeight(position.x + fwd.x * BODY_HALF_LEN, position.z + fwd.z * BODY_HALF_LEN);
-        float hRear  = terrain->getHeight(position.x - fwd.x * BODY_HALF_LEN, position.z - fwd.z * BODY_HALF_LEN);
-        float hLeft  = terrain->getHeight(position.x - right.x * BODY_HALF_WID, position.z - right.z * BODY_HALF_WID);
-        float hRight = terrain->getHeight(position.x + right.x * BODY_HALF_WID, position.z + right.z * BODY_HALF_WID);
+        float hFront = terrain->getGroundSurfaceHeight(position.x + fwd.x * BODY_HALF_LEN, position.z + fwd.z * BODY_HALF_LEN);
+        float hRear  = terrain->getGroundSurfaceHeight(position.x - fwd.x * BODY_HALF_LEN, position.z - fwd.z * BODY_HALF_LEN);
+        float hLeft  = terrain->getGroundSurfaceHeight(position.x - right.x * BODY_HALF_WID, position.z - right.z * BODY_HALF_WID);
+        float hRight = terrain->getGroundSurfaceHeight(position.x + right.x * BODY_HALF_WID, position.z + right.z * BODY_HALF_WID);
 
         float pitchAngle = std::atan2(hFront - hRear, BODY_HALF_LEN * 2.0f);
         float rollAngle  = std::atan2(hRight - hLeft, BODY_HALF_WID * 2.0f);
@@ -187,10 +187,10 @@ void Horse::updateMovement(Camera* camera, float deltaTime, Terrain* terrain) {
         const float BODY_HALF_WID = 0.6f;
         glm::vec3 right(horizForward.z, 0.0f, -horizForward.x);
 
-        float hFront = terrain->getHeight(position.x + horizForward.x * BODY_HALF_LEN, position.z + horizForward.z * BODY_HALF_LEN);
-        float hRear  = terrain->getHeight(position.x - horizForward.x * BODY_HALF_LEN, position.z - horizForward.z * BODY_HALF_LEN);
-        float hLeft  = terrain->getHeight(position.x - right.x * BODY_HALF_WID, position.z - right.z * BODY_HALF_WID);
-        float hRight = terrain->getHeight(position.x + right.x * BODY_HALF_WID, position.z + right.z * BODY_HALF_WID);
+        float hFront = terrain->getGroundSurfaceHeight(position.x + horizForward.x * BODY_HALF_LEN, position.z + horizForward.z * BODY_HALF_LEN);
+        float hRear  = terrain->getGroundSurfaceHeight(position.x - horizForward.x * BODY_HALF_LEN, position.z - horizForward.z * BODY_HALF_LEN);
+        float hLeft  = terrain->getGroundSurfaceHeight(position.x - right.x * BODY_HALF_WID, position.z - right.z * BODY_HALF_WID);
+        float hRight = terrain->getGroundSurfaceHeight(position.x + right.x * BODY_HALF_WID, position.z + right.z * BODY_HALF_WID);
 
         float pitchAngle = std::atan2(hFront - hRear, BODY_HALF_LEN * 2.0f);
         float rollAngle  = std::atan2(hRight - hLeft, BODY_HALF_WID * 2.0f);

@@ -47,6 +47,62 @@ void main()
     vec3 N = normalize(Normal);
     vec3 V = normalize(viewPos - WorldPos);
     float dist = length(viewPos - WorldPos);
+    float alt = WorldPos.y;
+
+    // Distant terrain is heavily minified on screen, so skip the close-range
+    // material stack, repeated procedural noise, and normal-map work there.
+    // Preserve roads, harbor materials, broad biome variation, lighting, and fog.
+    if (dist > 180.0) {
+        vec3 distantColor = texture(terrainTex, vec3(WorldPos.xz * 0.14, 1.0)).rgb;
+        float broadTone = noise(WorldPos.xz * 0.0025);
+        distantColor *= mix(vec3(0.94, 0.97, 0.91),
+                            vec3(1.04, 1.02, 0.96), broadTone);
+
+        vec4 distantPort = texture(portMask, UV);
+        float quay = distantPort.r;
+        float breakwater = distantPort.g + distantPort.b;
+        if (quay > 0.05) {
+            vec3 stone = texture(terrainTex, vec3(WorldPos.xz * 0.16, 12.0)).rgb;
+            distantColor = mix(distantColor, stone, clamp(quay, 0.0, 1.0));
+        }
+        if (breakwater > 0.05) {
+            vec3 rock = texture(terrainTex, vec3(WorldPos.xz * 0.18, 14.0)).rgb;
+            distantColor = mix(distantColor, rock, clamp(breakwater, 0.0, 1.0));
+        }
+
+        if (hasRoadMask) {
+            vec4 road = texture(roadMask, UV);
+            float roadWeight = smoothstep(0.08, 0.45, road.r);
+            if (roadWeight > 0.01 && (alt > waterLevel + 0.3 || quay + breakwater > 0.05)) {
+                float roadLayer = road.g > 0.55 ? 10.0 : 8.0;
+                vec3 roadColor = texture(terrainTex, vec3(WorldPos.xz * 0.18, roadLayer)).rgb;
+                distantColor = mix(distantColor, roadColor, roadWeight);
+            }
+            float riverWeight = smoothstep(0.08, 0.55, road.b) *
+                                (1.0 - smoothstep(waterLevel + 0.2, waterLevel + 1.8, alt));
+            if (riverWeight > 0.01) {
+                vec3 riverbed = texture(terrainTex, vec3(WorldPos.xz * 0.20, 5.0)).rgb;
+                distantColor = mix(distantColor, riverbed, riverWeight * 0.7);
+            }
+        }
+
+        vec3 L = normalize(lightDir);
+        float dayFactor = clamp(smoothstep(-0.15, 0.25, lightDir.y), 0.35, 1.0);
+        float diffuseFactor = clamp((dot(N, L) + 0.25) / 1.25, 0.0, 1.0);
+        vec3 groundLight = mix(vec3(0.25, 0.20, 0.15), vec3(0.35, 0.55, 0.85),
+                               N.y * 0.5 + 0.5) * dayFactor;
+        vec3 result = distantColor * (groundLight + lightColor * diffuseFactor * dayFactor);
+        result = (result * (2.51 * result + 0.03)) /
+                 (result * (2.43 * result + 0.59) + 0.14);
+        result = pow(max(result, vec3(0.0)), vec3(1.0 / 2.2));
+
+        vec3 horizonColor = mix(vec3(0.05, 0.1, 0.2), vec3(0.5, 0.8, 1.0),
+                                smoothstep(-0.1, 0.5, lightDir.y));
+        float fogAmount = smoothstep(2500.0, 6500.0, dist) *
+                          pow(clamp(1.0 - abs(V.y), 0.0, 1.0), 1.5);
+        FragColor = vec4(mix(result, horizonColor, pow(fogAmount, 1.4)), 1.0);
+        return;
+    }
 
     vec4 portVals = texture(portMask, UV);
     float quayMask = portVals.r;       // Quays, Wharfs, Esplanade
@@ -56,7 +112,6 @@ void main()
 
     // Exact slope in degrees: 0° = completely flat horizontal, 90° = vertical wall
     float angleDeg = acos(clamp(N.y, -1.0, 1.0)) * 57.2958;
-    float alt = WorldPos.y;
     float specMask = 0.03; // Natural matte earth/grass default
 
     // Distance LOD fades to eliminate moire aliasing while keeping razor-sharp close-up detail

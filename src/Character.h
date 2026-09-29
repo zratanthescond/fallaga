@@ -64,6 +64,7 @@ private:
     bool m_isExitingCar = false;
     bool m_isDrivingNpcCar = false;
     glm::vec3 m_CarEntryAnchor = glm::vec3(0.0f);
+    bool m_CarEntryAnchorGrounded = false;
 
 
     // Terrain normal for character alignment
@@ -131,6 +132,7 @@ public:
     bool isEnteringCar() const { return m_isEnteringCar; }
     bool isExitingCar() const { return m_isExitingCar; }
     bool isDrivingOrTransitioning() const { return m_isDriving || m_isEnteringCar || m_isExitingCar; }
+    Car* getMountedCar() const { return m_MountedCar; }
 
 
     // Weapon methods

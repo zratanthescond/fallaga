@@ -42,6 +42,7 @@ struct Mesh {
     std::vector<unsigned int> indices; 
     const aiMesh* assimpMesh; 
     std::string name;       // Mesh name from FBX (e.g. "body", "FL_wheel")
+    std::string nodeName;   // Owning FBX node name (often carries part identity)
     glm::vec3 minBound; // AABB Min
     glm::vec3 maxBound; // AABB Max
     unsigned int VAO = 0;
@@ -65,6 +66,7 @@ public:
     void renderInstanced(Shader& shader, const std::vector<glm::mat4>& instanceMatrices, bool forceUpdate = false) const; 
     int getMeshCount() const { return (int)meshes.size(); }
     std::string getMeshName(int index) const { return (index >= 0 && index < (int)meshes.size()) ? meshes[index].name : ""; }
+    std::string getMeshNodeName(int index) const { return (index >= 0 && index < (int)meshes.size()) ? meshes[index].nodeName : ""; }
     glm::vec3 getMeshCenter(int index) const {
         if (index < 0 || index >= (int)meshes.size()) return glm::vec3(0.0f);
         return (meshes[index].minBound + meshes[index].maxBound) * 0.5f;

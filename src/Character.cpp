@@ -203,11 +203,16 @@ void Character::update(Camera* camera, float deltaTime, Terrain* terrain, float 
 
             if (m_isEnteringCar) {
                 // Keep entry anchor locked to outside the driver door
-                glm::vec3 outsidePos = m_MountedCar->getDriverOutsideWorldPosition();
-                if (terrain) {
-                    outsidePos.y = terrain->getHeight(outsidePos.x, outsidePos.z) + 0.01f;
+                if (!m_CarEntryAnchorGrounded) {
+                    m_CarEntryAnchor = m_MountedCar->getDriverOutsideWorldPosition();
+                    if (terrain) {
+                        m_CarEntryAnchor.y = terrain->getGroundSurfaceHeight(
+                            m_CarEntryAnchor.x, m_CarEntryAnchor.z) + 0.01f;
+                    }
+                    m_CarEntryAnchorGrounded = true;
                 }
-                this->position = Vec3(outsidePos.x, outsidePos.y, outsidePos.z);
+                this->position = Vec3(m_CarEntryAnchor.x, m_CarEntryAnchor.y,
+                                      m_CarEntryAnchor.z);
             } else {
                 glm::vec3 seatWorld = m_MountedCar->getDriverSeatWorldPosition();
                 this->position = Vec3(seatWorld.x, seatWorld.y, seatWorld.z);
@@ -238,7 +243,7 @@ void Character::update(Camera* camera, float deltaTime, Terrain* terrain, float 
                         // Character stepped out 2.04m to the left door onto the ground
                         glm::vec3 exitPos = m_MountedCar->getDriverExitWorldPosition();
                         if (terrain) {
-                            exitPos.y = terrain->getHeight(exitPos.x, exitPos.z) + 0.01f;
+                            exitPos.y = terrain->getGroundSurfaceHeight(exitPos.x, exitPos.z) + 0.01f;
                         }
                         this->position = Vec3(exitPos.x, exitPos.y, exitPos.z);
                         m_MountedCar->dismountCharacter(this);
@@ -350,7 +355,7 @@ void Character::update(Camera* camera, float deltaTime, Terrain* terrain, float 
     }
 
     // 7. Ground Check & Jump Logic
-    float terrainHeight = terrain ? terrain->getHeight(position.x, position.z) : 0.0f;
+    float terrainHeight = terrain ? terrain->getGroundSurfaceHeight(position.x, position.z) : 0.0f;
     bool isGrounded = !m_isNoclip && (position.y <= terrainHeight + 0.1f);
     
     // Landing detection
@@ -507,8 +512,8 @@ void Character::render(const glm::mat4 &projection, const glm::mat4 &view,
                 glm::vec4 rightFootWorld = modelMatrix * rightFootTransform * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
 
                 // Sample terrain height directly under each foot
-                float leftTerrainHeight = terrain->getHeight(leftFootWorld.x, leftFootWorld.z);
-                float rightTerrainHeight = terrain->getHeight(rightFootWorld.x, rightFootWorld.z);
+                float leftTerrainHeight = terrain->getGroundSurfaceHeight(leftFootWorld.x, leftFootWorld.z);
+                float rightTerrainHeight = terrain->getGroundSurfaceHeight(rightFootWorld.x, rightFootWorld.z);
 
                 // Anatomical constant: distance from ankle joint to the sole of the foot (approx. 0.10m)
                 const float ANKLE_TO_SOLE = 0.10f;
@@ -651,6 +656,7 @@ void Character::startEnteringCar(Car *car) {
     // As EntringCar plays, root motion moves the character +1.97m on X into getDriverSeatWorldPosition().
     glm::vec3 outsidePos = car->getDriverOutsideWorldPosition();
     m_CarEntryAnchor = outsidePos;
+    m_CarEntryAnchorGrounded = false;
     this->position = Vec3(outsidePos.x, outsidePos.y, outsidePos.z);
     m_RotationAngle = car->getYaw();
     m_ForwardDirection = glm::vec3(0.0f, 1.0f, 0.0f);

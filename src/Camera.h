@@ -41,6 +41,7 @@ private:
     Character* target;
     Terrain* terrainModel = nullptr; // Dependency pointer
     float timeSinceLastMouseMovement = 0.0f; // Track mouse activity for auto-alignment
+    float zoomHold = 0.0f; // Suppresses the driving pull-back briefly after a manual zoom
 
 
     //float distance; // Current distance from the target

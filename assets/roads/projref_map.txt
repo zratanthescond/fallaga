@@ -1,0 +1,9 @@
+centerX 3344.69
+centerZ -3.68597
+mapW 2749.87
+scale 1.6
+flipX 0
+flipZ 0
+opacity 0.85
+yOffset 20
+idx 0

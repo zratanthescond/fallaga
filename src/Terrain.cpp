@@ -1,5 +1,6 @@
-#include "Terrain.h"
+﻿#include "Terrain.h"
 #include "PhysicsSystem.h"
+#include "WaterSimulation.h"
 #include "ProceduralMapData.h"
 #include "SousseMapData.h"
 #include "TextureEngine.h"
@@ -19,19 +20,20 @@
 #include <sstream>
 #include <stb_image.h>
 #include <vector>
-// Heightmap analysis: ~32% of the map sits in one contiguous flat basin at the
-// absolute floor (-50), with a very gentle shelf rising from -49 up to -43 that
-// adds only ~3.6% more area. A sea level of -43 let that gentle shelf bleed
-// water across large stretches of otherwise-dry terrain (visible as scattered
-// shallow "lakes" far from any real coastline). Keeping the level close to the
-// true floor confines water to the actual basin instead of creeping onto land.
-static constexpr float WATER_BASE = -48.5f; // Sea level
+// Keep the water below the mapped coastal shelf; connected masking excludes inland pits.
+static constexpr float WATER_BASE = -55.0f;
 static float waterLevelOffset = 0.0f; // Positive raises terrain (lowers water)
 static float waterLevelRuntime = WATER_BASE;  // Real-time editor override
 
 namespace {
 constexpr float HISTORIC_PLAN_OFFSET_X = 3600.0f;
 constexpr float HISTORIC_PLAN_OFFSET_Z = -701.0f;
+constexpr float kCarCollisionCellSize = 64.0f;
+
+std::uint64_t carCollisionCellKey(int x, int z) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
+         static_cast<std::uint32_t>(z);
+}
 
 bool isInsideHistoricCity(const RoadSegment& segment) {
   for (const RoadPoint& point : segment.controlPoints) {
@@ -167,7 +169,7 @@ void replaceWithHistoricCityRoads(RoadGraph& graph) {
 }
 } // namespace
 // ----------------------------------------------------------------
-//  Hash-based value noise — NO sine/cosine grids!
+//  Hash-based value noise â€” NO sine/cosine grids!
 // ----------------------------------------------------------------
 static float hashf(int x, int y) {
   // Integer hash with good avalanche mixing
@@ -301,6 +303,34 @@ Terrain::Terrain() {
   terrainManager = new TerrainManager("assets/terrain/heightmap.png",
                                       "assets/terrain/textureMap.png", -13938.0f,
                                       13938.0f, -13938.0f, 13938.0f, -70.0f, 87.8f);
+
+  // Keep the gameplay surface mask small: the source is 8129x8129, while a
+  // 1024-ish nearest-neighbor copy is enough to identify broad wadi channels.
+  int wadiW = 0, wadiH = 0, wadiChannels = 0;
+  unsigned char* wadiPixels = stbi_load("assets/terrain/heightmap_wadis.png",
+                                       &wadiW, &wadiH, &wadiChannels, 1);
+  if (wadiPixels && wadiW > 0 && wadiH > 0) {
+    const int stride = std::max(1, (std::max(wadiW, wadiH) + 1023) / 1024);
+    wadiSurfaceMaskW = (wadiW + stride - 1) / stride;
+    wadiSurfaceMaskH = (wadiH + stride - 1) / stride;
+    wadiSurfaceMask.resize(static_cast<size_t>(wadiSurfaceMaskW) * wadiSurfaceMaskH);
+    for (int y = 0; y < wadiSurfaceMaskH; ++y) {
+      const int sourceY = std::min(y * stride, wadiH - 1);
+      for (int x = 0; x < wadiSurfaceMaskW; ++x) {
+        const int sourceX = std::min(x * stride, wadiW - 1);
+        wadiSurfaceMask[static_cast<size_t>(y) * wadiSurfaceMaskW + x] =
+            wadiPixels[static_cast<size_t>(sourceY) * wadiW + sourceX];
+      }
+    }
+    stbi_image_free(wadiPixels);
+    std::cout << "[Terrain] Loaded wadi surface mask: " << wadiSurfaceMaskW
+              << "x" << wadiSurfaceMaskH << std::endl;
+  } else {
+    if (wadiPixels) stbi_image_free(wadiPixels);
+    std::cerr << "[Terrain] Wadi surface mask unavailable; using geographic fallback."
+              << std::endl;
+  }
+
   oceanShader = new Shader("src/shaders/ocean.vert", "src/shaders/ocean.frag");
   streetShader =
       new Shader("src/shaders/street.vert", "src/shaders/street.frag");
@@ -309,7 +339,7 @@ Terrain::Terrain() {
   std::cout << "[Terrain] Initializing Water Mesh..." << std::endl;
   buildWaterMesh();
 
-  // ── GEOMETRY-BASED ROAD SYSTEM ──────────────────────────────────────────
+  // â”€â”€ GEOMETRY-BASED ROAD SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   std::cout << "[Terrain] Initializing Geometry Road System..." << std::endl;
   {
       // 1. Set up height sampler from TerrainManager
@@ -322,8 +352,9 @@ Terrain::Terrain() {
 
       roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
                              terrainManager->getGridW(), terrainManager->getGridH());
+      roadMapper = mapper;
 
-      // 2. Road graph: the old auto-traced road network is REMOVED — roads are
+      // 2. Road graph: the old auto-traced road network is REMOVED â€” roads are
       //    now drawn by hand in the Road Editor. Only manual roads saved to
       //    roads_manual.json are restored at startup (empty slate otherwise).
       roadGraph = new RoadGraph();
@@ -335,16 +366,141 @@ Terrain::Terrain() {
           std::cout << "[Terrain] Road system: restored " << roadGraph->segments.size()
                     << " manually drawn road segments\n";
       } else {
-          std::cout << "[Terrain] Road system: no manual roads yet (roads_manual.json) — blank slate, draw roads in Road Editor\n";
+          // loadFromJSON already explained why on stderr (missing file, or a
+          // syntax error with its line and column).
+          std::cout << "[Terrain] Road system: no roads loaded from roads_manual.json â€” blank slate, draw roads in Road Editor\n";
       }
 
-      // 4. Initial test: Build road ribbon mesh directly without deformation
+      // 4. Build the road mesh from the untouched source terrain profile.
       for (auto& seg : roadGraph->segments) {
           RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
       }
       roadMeshBuilder = new RoadMeshBuilder();
       roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
       roadMeshBuilder->upload();
+
+      // Cut/fill the terrain heightfield itself under the authored road ribbons.
+      roadDeformer = new RoadDeformer();
+      // Rasterize road cuts on the same grid as the rendered terrain mesh. A
+      // smaller mask left multi-metre ungraded strips at road edges after resampling.
+      const int deformW = terrainManager->getVisualGridW();
+      const int deformH = terrainManager->getVisualGridH();
+      roadDeformer->build(roadGraph->segments, roadHeightSampler, roadMapper, deformW, deformH);
+      terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
+      // Final support pass follows the built mesh itself so curved widths, end
+      // caps, and junction surfaces all have terrain directly beneath them.
+      terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
+          roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true);
+      // Seat the ribbon on the graded heightfield before anything samples it again.
+      snapRoadsToRenderedTerrain();
+
+      // FALLAGA_ROADGAP: measure how far the road surface actually sits above the
+      // terrain the GPU draws. The road is sampled from the native DEM grid while the
+      // rendered terrain comes from the visual grid, so this is the only way to tell a
+      // conform that worked (centimetres) from one that silently missed (metres).
+      if (std::getenv("FALLAGA_ROADGAP")) {
+        const int vw = terrainManager->getVisualGridW();
+        const int vh = terrainManager->getVisualGridH();
+        const float wMinX = terrainManager->getWorldMinX(), wMaxX = terrainManager->getWorldMaxX();
+        const float wMinZ = terrainManager->getWorldMinZ(), wMaxZ = terrainManager->getWorldMaxZ();
+        const std::vector<float>& H = terrainManager->getVisualHeightsData();
+        const float cellSize = vw > 1 ? (wMaxX - wMinX) / (vw - 1) : 0.0f;
+        auto sampleVisual = [&](float wx, float wz) -> float {
+          if (vw < 2 || vh < 2 || H.empty()) return 0.0f;
+          const float u = glm::clamp((wx - wMinX) / (wMaxX - wMinX) * (vw - 1), 0.0f, (float)(vw - 1));
+          const float v = glm::clamp((wz - wMinZ) / (wMaxZ - wMinZ) * (vh - 1), 0.0f, (float)(vh - 1));
+          const int x0 = (int)u, z0 = (int)v;
+          const int x1 = std::min(x0 + 1, vw - 1), z1 = std::min(z0 + 1, vh - 1);
+          const float tx = u - x0, tz = v - z0;
+          return H[(size_t)z0 * vw + x0] * (1 - tx) * (1 - tz) +
+                 H[(size_t)z0 * vw + x1] * tx * (1 - tz) +
+                 H[(size_t)z1 * vw + x0] * (1 - tx) * tz +
+                 H[(size_t)z1 * vw + x1] * tx * tz;
+        };
+        double sum = 0.0, sumAbs = 0.0, maxAbs = 0.0, maxAbove = 0.0;
+        int n = 0, above05 = 0, above2 = 0, terrainAbove1 = 0, terrainAbove3 = 0;
+        for (const auto& v : roadMeshBuilder->debugVertices()) {
+          const float d = v.position.y - sampleVisual(v.position.x, v.position.z);
+          sum += d; sumAbs += std::fabs(d); ++n;
+          if (std::fabs(d) > maxAbs) maxAbs = std::fabs(d);
+          if (d > 0.5f) ++above05;
+          if (d > 2.0f) ++above2;
+          // Ground still standing proud of the asphalt: high places the tool did not
+          // clean. This is the number to drive down, and it is independent of the
+          // road-above-terrain figures.
+          const float proud = -d;
+          if (proud > maxAbove) maxAbove = proud;
+          if (proud > 1.0f) ++terrainAbove1;
+          if (proud > 3.0f) ++terrainAbove3;
+        }
+        if (n > 0) {
+          // Terrain poking through the ribbon is the failure that matters, and it can
+          // only be judged against the real road surface at the probe point. Comparing
+          // offset terrain against the height of the nearest road *vertex* is wrong on
+          // any sloped or cross-sloped road and invents thousands of false pokes, so
+          // walk the triangles incident to each vertex and interpolate properly.
+          const auto& rv = roadMeshBuilder->debugVertices();
+          const auto& ri = roadMeshBuilder->debugIndices();
+          std::vector<std::vector<uint32_t>> incident(rv.size());
+          for (uint32_t t = 0; t * 3 + 2 < ri.size(); ++t) {
+            for (int k = 0; k < 3; ++k) {
+              const uint32_t vi = ri[t * 3 + k];
+              if (vi < incident.size()) incident[vi].push_back(t);
+            }
+          }
+          const float kStencil[2] = { 8.0f, 16.0f };
+          double worstPoke = 0.0;
+          int probes = 0, poke025 = 0, poke1m = 0;
+          for (size_t vi = 0; vi < rv.size(); ++vi) {
+            for (int s = 0; s < 2; ++s) {
+              const float o = kStencil[s];
+              const float ox[5] = { 0.0f, o, -o, 0.0f, 0.0f };
+              const float oz[5] = { 0.0f, 0.0f, 0.0f, o, -o };
+              for (int k = 0; k < 5; ++k) {
+                const float px = rv[vi].position.x + ox[k];
+                const float pz = rv[vi].position.z + oz[k];
+                float roadY = -std::numeric_limits<float>::infinity();
+                for (uint32_t t : incident[vi]) {
+                  const glm::vec3 A = rv[ri[t * 3 + 0]].position;
+                  const glm::vec3 B = rv[ri[t * 3 + 1]].position;
+                  const glm::vec3 C = rv[ri[t * 3 + 2]].position;
+                  const float area = (B.x - A.x) * (C.z - A.z) - (B.z - A.z) * (C.x - A.x);
+                  if (std::fabs(area) < 1e-8f) continue;
+                  const float wb = ((px - A.x) * (C.z - A.z) - (pz - A.z) * (C.x - A.x)) / area;
+                  const float wc = ((B.x - A.x) * (pz - A.z) - (B.z - A.z) * (px - A.x)) / area;
+                  const float wa = 1.0f - wb - wc;
+                  if (wa < 0.0f || wb < 0.0f || wc < 0.0f) continue;
+                  roadY = std::max(roadY, wa * A.y + wb * B.y + wc * C.y);
+                }
+                if (roadY == -std::numeric_limits<float>::infinity()) continue;
+                const float proud = sampleVisual(px, pz) - roadY;
+                ++probes;
+                if (proud > worstPoke) worstPoke = proud;
+                if (proud > 0.25f) ++poke025;
+                if (proud > 1.0f) ++poke1m;
+              }
+            }
+          }
+          std::cout << "[RoadGap] cell=" << cellSize << "m verts=" << n
+                    << " meanGap=" << (sum / n)
+                    << " meanAbs=" << (sumAbs / n)
+                    << " maxAbs=" << maxAbs
+                    << " above0.5m=" << above05
+                    << " above2m=" << above2
+                    << " | proud>1m=" << terrainAbove1
+                    << " maxProud=" << maxAbove
+                    << " || probes=" << probes
+                    << " poke>0.25m=" << poke025
+                    << " poke>1m=" << poke1m
+                    << " worstPoke=" << worstPoke << std::endl;
+        }
+      }
+
+
+      // 5. Derived 4-direction auto-tiling field (read-only consequence of the
+      //    evaluated splines: connectivity queries, shape classification).
+      roadTileField = new RoadTileField();
+      roadTileField->build(roadGraph->segments, roadMapper);
 
       std::cout << "[Terrain] Road System ready: "
                 << roadGraph->segments.size() << " segments, "
@@ -387,7 +543,9 @@ Terrain::Terrain() {
   // Initialize dynamic waterMapTex (256x256 single-channel floating-point texture)
   glGenTextures(1, &waterMapTex);
   glBindTexture(GL_TEXTURE_2D, waterMapTex);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, 256, 256, 0, GL_RED, GL_FLOAT, nullptr);
+  std::vector<float> initiallyDry(WaterSimulation::SIM_SIZE * WaterSimulation::SIM_SIZE, -1000.0f);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, WaterSimulation::SIM_SIZE, WaterSimulation::SIM_SIZE,
+               0, GL_RED, GL_FLOAT, initiallyDry.data());
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -449,15 +607,16 @@ Terrain::~Terrain() {
   delete roadGraph;
   delete roadDeformer;
   delete roadMeshBuilder;
+  delete roadTileField;
 }
 
 void Terrain::buildWaterFBOs(int width, int height) {
-  // Halve resolution for performance — reflections don't need full res
+  // Halve resolution for performance â€” reflections don't need full res
   int w = width  / 2;
   int h = height / 2;
   fboW = w; fboH = h;
 
-  // ── REFLECTION FBO ──────────────────────────────────────────────
+  // â”€â”€ REFLECTION FBO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   glGenFramebuffers(1, &reflFBO);
   glBindFramebuffer(GL_FRAMEBUFFER, reflFBO);
 
@@ -478,7 +637,7 @@ void Terrain::buildWaterFBOs(int width, int height) {
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
     std::cerr << "[Terrain] Reflection FBO incomplete!" << std::endl;
 
-  // ── REFRACTION FBO ──────────────────────────────────────────────
+  // â”€â”€ REFRACTION FBO â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   glGenFramebuffers(1, &refrFBO);
   glBindFramebuffer(GL_FRAMEBUFFER, refrFBO);
 
@@ -642,6 +801,15 @@ bool roadDebugView() {
     static const bool on = (std::getenv("FALLAGA_DEBUGVIEW") != nullptr);
     return on;
 }
+
+// FALLAGA_EDGEONLY: draw nothing but the road's own edge lines. The surface, the
+// shoulder and the paint are all discarded in the fragment shader, leaving the ribbon
+// outline on its own so ribbon deformation (pinch, twist, self-overlap, torn caps) can
+// be seen directly instead of being hidden by tarmac shading.
+bool roadEdgeOnlyView() {
+    static const bool on = (std::getenv("FALLAGA_EDGEONLY") != nullptr);
+    return on;
+}
 }  // namespace
 
 void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
@@ -665,6 +833,7 @@ void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
 
   const bool dbg = roadDebugView();
   if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
+  if (roadEdgeOnlyView()) streetShader->setInt("u_debugEdges", 1);
 
   glBindVertexArray(streetVAO);
   glDrawElements(GL_TRIANGLES, streetIndexCount, GL_UNSIGNED_INT, 0);
@@ -746,7 +915,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
       };
 
       // ============================================================
-      // PHASE 1: GRASS — Clustered carpet placement with tight budget
+      // PHASE 1: GRASS â€” Clustered carpet placement with tight budget
       // ============================================================
       int grassClusterSeeds = 1800; // Balanced coverage without GPU choke
       for (int s = 0; s < grassClusterSeeds; ++s) {
@@ -858,6 +1027,24 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
   }
 
   double t_tm_start = glfwGetTime();
+  // TEMP DIAGNOSTIC: same-frame A/B scanline readback, see FALLAGA_PROBE.
+  static int probeFrame = 0;
+  const bool probeNow = !isReflectionPass && std::getenv("FALLAGA_PROBE") && (++probeFrame == 100);
+  auto scanline = [&](const char* tag) {
+    GLint vpArr[4] = { 0, 0, 0, 0 };
+    glGetIntegerv(GL_VIEWPORT, vpArr);
+    const int y0 = vpArr[3] * 2 / 3;
+    std::printf("[SCAN %s] vp=%dx%d row y=%d  x=600..1320 step 12\n", tag, vpArr[2], vpArr[3], y0);
+    for (int i = 0; i <= 60; ++i) {
+      const int px = 600 + i * 12, py = y0;
+      unsigned char rgb[3] = { 0, 0, 0 };
+      glReadPixels(px, py, 1, 1, GL_RGB, GL_UNSIGNED_BYTE, rgb);
+      const int lum = (rgb[0] * 299 + rgb[1] * 587 + rgb[2] * 114) / 1000;
+      std::printf("[SCAN %s] x=%4d lum=%3d rgb=(%3d,%3d,%3d)%s\n",
+                  tag, px, lum, rgb[0], rgb[1], rgb[2], lum > 120 ? "  <== BRIGHT" : "");
+    }
+    std::fflush(stdout);
+  };
   if (terrainManager) {
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -880,7 +1067,12 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         streetShader->setVec3("viewPos", cam);
         const bool dbg = roadDebugView();
         if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
-        roadMeshBuilder->render(*streetShader);
+        if (roadEdgeOnlyView()) streetShader->setInt("u_debugEdges", 1);
+        if (!std::getenv("FALLAGA_PROBE_NOMESH")) {
+          if (probeNow) scanline("terrain-only");
+          roadMeshBuilder->render(*streetShader);
+          if (probeNow) scanline("terrain+mesh");
+        }
         if (dbg) glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
       } else {
         renderStreets(proj, view, light, cam);
@@ -894,6 +1086,9 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
   static bool firstRebuildDone = false;
   if (SousseMapData::layoutDirty || batchesDirty ||
       (!firstRebuildDone && cachedBatches.empty())) {
+    // Grid entries hold pointers into these cache containers.
+    carCollisionGrid.clear();
+    carCollisionGridDirty = true;
     cachedBatches.clear();
     cachedCustomRenderTasks.clear();
 
@@ -1086,6 +1281,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
       std::cout << "[Librarian] : Rendering cache rebuilt for " << placedCount
                 << " objects.\n";
     }
+    rebuildCarCollisionGrid();
   }
 
   // --- PHASE 2: MODERN INSTANCED RENDERING ---
@@ -1517,7 +1713,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     }
 
     modelShader->use();
-    // Rigid placement — no per-vertex deformation (keeps wall shape intact)
+    // Rigid placement â€” no per-vertex deformation (keeps wall shape intact)
     modelShader->setBool("deformToTerrain", false);
 
     // Frustum culling check for the entire Medina wall structure
@@ -1618,6 +1814,63 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         glVertex3f(cx, cy, cz);
     }
     glEnd();
+
+    // Angle Slope preview: the colored 3D profile shows the selected grade,
+    // while the ground-plane arrow shows its 0-360 degree uphill direction.
+    if (editorBrushMode == 5) {
+        const float direction = editorSculptDirectionDegrees * 3.14159265f / 180.0f;
+        const glm::vec2 dir(std::cos(direction), std::sin(direction));
+        const glm::vec2 side(-dir.y, dir.x);
+        const float grade = std::tan(glm::clamp(editorSculptGradeDegrees, 0.0f, 60.0f) * 3.14159265f / 180.0f);
+        const glm::vec2 center(lastRayHitPos.x, lastRayHitPos.z);
+        const float centerY = getHeight(center.x, center.y);
+        const float arrowLength = brushRadius * 0.82f;
+        const glm::vec2 tip = center + dir * arrowLength;
+        const float tipY = getHeight(tip.x, tip.y) + 0.6f + arrowLength * grade;
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        // The inner ring marks the area where the full configured grade is applied;
+        // the space between this and the orange outer ring is the softened join.
+        glColor4f(0.15f, 0.9f, 1.0f, 0.55f);
+        glLineWidth(1.5f);
+        glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < 48; ++i) {
+            const float a = (float)i * (2.0f * 3.14159265f / 48.0f);
+            const float px = center.x + std::cos(a) * brushRadius * 0.80f;
+            const float pz = center.y + std::sin(a) * brushRadius * 0.80f;
+            glVertex3f(px, getHeight(px, pz) + 0.4f, pz);
+        }
+        glEnd();
+
+        // Bright cyan direction arrow laid on the ground.
+        glColor4f(0.15f, 0.9f, 1.0f, 0.95f);
+        glLineWidth(4.0f);
+        glBegin(GL_LINES);
+        glVertex3f(center.x, centerY + 0.55f, center.y);
+        glVertex3f(tip.x, getHeight(tip.x, tip.y) + 0.55f, tip.y);
+        glEnd();
+
+        // Raised profile line, lifted by the selected grade so the angle can
+        // be read in the world view before the terrain is modified.
+        glColor4f(1.0f, 0.68f, 0.12f, 0.98f);
+        glLineWidth(3.0f);
+        glBegin(GL_LINES);
+        glVertex3f(center.x, centerY + 0.6f, center.y);
+        glVertex3f(tip.x, tipY, tip.y);
+        const float headLen = brushRadius * 0.13f;
+        const float headHalfW = brushRadius * 0.075f;
+        const glm::vec2 headBase = tip - dir * headLen;
+        const float headY = tipY - headLen * grade;
+        for (float sign : {-1.0f, 1.0f}) {
+            const glm::vec2 wing = headBase + side * (sign * headHalfW);
+            glVertex3f(tip.x, tipY, tip.y);
+            glVertex3f(wing.x, headY, wing.y);
+        }
+        glEnd();
+        glDisable(GL_BLEND);
+    }
+
     glDepthFunc(GL_LESS);
     glEnable(GL_LIGHTING);
   }
@@ -1750,13 +2003,74 @@ void Terrain::renderWater(const glm::mat4 &proj, const glm::mat4 &view,
 float Terrain::getHeight(float x, float z) const {
   if (isFlatMode)
     return WATER_BASE;
-  float baseH = terrainManager ? terrainManager->getHeightAt(x, z) : 0.0f;
-  // Apply road deformation
-  if (roadDeformer && roadDeformer->isBuilt()) {
-      baseH += roadDeformer->getDeformation(x, z);
-  }
-  return baseH;
+  return terrainManager ? terrainManager->getHeightAt(x, z) : 0.0f;
 }
+
+float Terrain::getGroundSurfaceHeight(float x, float z) const {
+  const float terrainY = getHeight(x, z);
+  if (!roadGraph || roadGraph->segments.empty()) return terrainY;
+
+  // Match the road ribbon cross-section in RoadMeshBuilder: full width is applied
+  // along the mitered right vector, with the same restrained 2% terrain crossfall.
+  constexpr float kEdgeConform = 0.02f;
+  constexpr float kRoadSurfaceBias = 0.04f;
+  float surfaceY = terrainY;
+  for (const RoadSegment& road : roadGraph->segments) {
+    const size_t n = road.splinePoints.size();
+    if (n < 2 || road.width <= 0.0f || road.rightVecs.size() != n) continue;
+    if (road.surfaceBoundsValid) {
+      const float reach = road.width + 1.0f;
+      if (x < road.surfaceBounds.x - reach ||
+          x > road.surfaceBounds.z + reach ||
+          z < road.surfaceBounds.y - reach ||
+          z > road.surfaceBounds.w + reach) continue;
+    } else if (!road.controlPoints.empty()) {
+      float minX = road.controlPoints.front().pos.x, maxX = minX;
+      float minZ = road.controlPoints.front().pos.y, maxZ = minZ;
+      for (const RoadPoint& cp : road.controlPoints) {
+        minX = std::min(minX, cp.pos.x); maxX = std::max(maxX, cp.pos.x);
+        minZ = std::min(minZ, cp.pos.y); maxZ = std::max(maxZ, cp.pos.y);
+      }
+      const float reach = road.width + 1.0f;
+      if (x < minX - reach || x > maxX + reach ||
+          z < minZ - reach || z > maxZ + reach) continue;
+    }
+    const size_t edgeCount = road.closed ? n : n - 1;
+    for (size_t i = 0; i < edgeCount; ++i) {
+      const size_t j = (i + 1) % n;
+      const glm::vec2 a(road.splinePoints[i].x, road.splinePoints[i].z);
+      const glm::vec2 b(road.splinePoints[j].x, road.splinePoints[j].z);
+      const glm::vec2 d = b - a;
+      const float len2 = glm::dot(d, d);
+      if (len2 < 1e-8f) continue;
+      const glm::vec2 p(x, z);
+      const float rawT = glm::dot(p - a, d) / len2;
+      const float segmentLength = std::sqrt(len2);
+      const float t = glm::clamp(rawT, 0.0f, 1.0f);
+      const glm::vec2 center = a + d * t;
+      const glm::vec2 delta = p - center;
+      const glm::vec3 right3 = glm::mix(road.rightVecs[i], road.rightVecs[j], t);
+      const glm::vec2 right(right3.x, right3.z);
+      const float rightLen = glm::length(right);
+      if (rightLen < 1e-5f) continue;
+      const float halfWidth = road.width * 0.5f * rightLen;
+      const glm::vec2 rightDir = right / rightLen;
+      const float lateral = glm::dot(delta, rightDir);
+      // Allow a round end cap, but do not extend the segment along its tangent.
+      if (std::fabs(lateral) > halfWidth ||
+          rawT < -halfWidth / segmentLength || rawT > 1.0f + halfWidth / segmentLength) continue;
+
+      const float centerY = glm::mix(road.splinePoints[i].y, road.splinePoints[j].y, t);
+      const float edgeY = roadHeightSampler.isValid()
+          ? roadHeightSampler.sample(x, z)
+          : centerY;
+      const float roadY = centerY + (edgeY - centerY) * kEdgeConform + kRoadSurfaceBias;
+      surfaceY = std::max(surfaceY, roadY);
+    }
+  }
+  return surfaceY;
+}
+
 glm::vec3 Terrain::getNormalAt(float x, float z) const {
   const float sampleDistance = 1.0f;
   float hL = getHeight(x - sampleDistance, z);
@@ -1771,10 +2085,174 @@ float Terrain::getRoadAt(float x, float z) const {
   return 0.0f;
 }
 
-Terrain::Zone Terrain::getZoneAt(float x, float z) const { return Zone::PLAIN; }
+bool Terrain::resolveCarCollision(glm::vec3& position, glm::vec3& velocity,
+                                  float carRadius, float restitution) const {
+  if (carRadius <= 0.0f) return false;
+  if (carCollisionGridDirty) rebuildCarCollisionGrid();
+
+  bool collided = false;
+  const float broadPhaseRadius = carRadius + 30.0f;
+  const float broadPhaseRadiusSq = broadPhaseRadius * broadPhaseRadius;
+  const float collisionCenterHeight = 0.75f;
+
+  auto applyModelCollision = [&](const ObjModel* model, const glm::mat4& modelMatrix) {
+    if (!model) return;
+    glm::vec3 center(position.x, position.y + collisionCenterHeight, position.z);
+    glm::vec3 normal(0.0f);
+    float depth = 0.0f;
+    if (!model->checkSphereCollisionWorld(center, carRadius, modelMatrix,
+                                         normal, depth)) return;
+
+    normal.y = 0.0f;
+    const float normalLengthSq = glm::dot(normal, normal);
+    if (normalLengthSq < 1e-6f) return;
+    normal *= glm::inversesqrt(normalLengthSq);
+    position.x += normal.x * (depth + 0.01f);
+    position.z += normal.z * (depth + 0.01f);
+
+    const float normalSpeed = velocity.x * normal.x + velocity.z * normal.z;
+    if (normalSpeed < 0.0f) {
+      const float bounce = glm::clamp(restitution, 0.0f, 0.5f);
+      velocity.x -= (1.0f + bounce) * normalSpeed * normal.x;
+      velocity.z -= (1.0f + bounce) * normalSpeed * normal.z;
+      velocity.x *= 0.82f;
+      velocity.z *= 0.82f;
+    }
+    collided = true;
+  };
+
+  // Resolve twice so a car wedged into a corner can be moved clear of both
+  // nearby object bounds in one fixed physics step. Query only the cells that
+  // overlap the broad-phase radius instead of walking every rendered instance.
+  for (int pass = 0; pass < 2; ++pass) {
+    const int minCellX = static_cast<int>(std::floor(
+        (position.x - broadPhaseRadius) / kCarCollisionCellSize));
+    const int maxCellX = static_cast<int>(std::floor(
+        (position.x + broadPhaseRadius) / kCarCollisionCellSize));
+    const int minCellZ = static_cast<int>(std::floor(
+        (position.z - broadPhaseRadius) / kCarCollisionCellSize));
+    const int maxCellZ = static_cast<int>(std::floor(
+        (position.z + broadPhaseRadius) / kCarCollisionCellSize));
+
+    for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+      for (int cellZ = minCellZ; cellZ <= maxCellZ; ++cellZ) {
+        const auto cellIt = carCollisionGrid.find(
+            carCollisionCellKey(cellX, cellZ));
+        if (cellIt == carCollisionGrid.end()) continue;
+        for (const CarCollisionInstance& instance : cellIt->second) {
+          if (!instance.modelPath) continue;
+          const glm::mat4& modelMatrix = instance.modelMatrix;
+          const float dx = modelMatrix[3].x - position.x;
+          const float dz = modelMatrix[3].z - position.z;
+          if (dx * dx + dz * dz > broadPhaseRadiusSq) continue;
+
+          const auto modelIt = assetCache.find(*instance.modelPath);
+          if (modelIt == assetCache.end() || !modelIt->second) continue;
+          applyModelCollision(modelIt->second, modelMatrix);
+        }
+      }
+    }
+  }
+
+  return collided;
+}
+
+void Terrain::rebuildCarCollisionGrid() const {
+  carCollisionGrid.clear();
+  const auto insert = [this](const std::string& path,
+                             const glm::mat4& modelMatrix) {
+    if (path.find("grass") != std::string::npos ||
+        path.find("Grass") != std::string::npos) return;
+    const int cellX = static_cast<int>(std::floor(
+        modelMatrix[3].x / kCarCollisionCellSize));
+    const int cellZ = static_cast<int>(std::floor(
+        modelMatrix[3].z / kCarCollisionCellSize));
+    carCollisionGrid[carCollisionCellKey(cellX, cellZ)].push_back(
+        {&path, modelMatrix});
+  };
+
+  for (const auto& [path, matrices] : cachedBatches)
+    for (const glm::mat4& modelMatrix : matrices)
+      insert(path, modelMatrix);
+  for (const CustomRenderTask& task : cachedCustomRenderTasks)
+    insert(task.modelPath, task.modelMatrix);
+
+  carCollisionGridDirty = false;
+}
+
+Terrain::Zone Terrain::getZoneAt(float x, float z) const {
+  if (!terrainManager) return Zone::PLAIN;
+
+  const float groundHeight = getHeight(x, z);
+  if (groundHeight <= getWaterLevel() - 0.5f) return Zone::SEA;
+
+  // The historic Sousse plan is translated into terrain-world space by this
+  // offset when its roads are built. Classify the districts in that same local
+  // coordinate space so the map and physics agree.
+  constexpr float kPlanToWorldX = 3600.0f;
+  constexpr float kPlanToWorldZ = -701.0f;
+  const float planX = x - kPlanToWorldX;
+  const float planZ = z - kPlanToWorldZ;
+
+  static const std::vector<glm::vec2> medina = {
+      {-20.0f, 820.0f}, {150.0f, 900.0f}, {500.0f, 875.0f},
+      {680.0f, 760.0f}, {700.0f, 480.0f}, {630.0f, 180.0f},
+      {570.0f, -180.0f}, {390.0f, -520.0f}, {150.0f, -680.0f},
+      {-80.0f, -520.0f}, {-100.0f, -160.0f}, {-60.0f, 300.0f}};
+  static const std::vector<glm::vec2> kasbah = {
+      {-430.0f, -650.0f}, {160.0f, -650.0f}, {230.0f, -980.0f},
+      {120.0f, -1370.0f}, {-200.0f, -1510.0f}, {-470.0f, -1240.0f}};
+  static const std::vector<glm::vec2> port = {
+      {690.0f, 500.0f}, {1320.0f, 420.0f}, {1400.0f, -700.0f},
+      {1110.0f, -1050.0f}, {760.0f, -780.0f}, {620.0f, -250.0f}};
+  static const std::vector<glm::vec2> villeNouvelle = {
+      {-900.0f, 1250.0f}, {720.0f, 1250.0f}, {780.0f, 850.0f},
+      {680.0f, -580.0f}, {450.0f, -700.0f}, {260.0f, -580.0f},
+      {-470.0f, -580.0f}, {-880.0f, -350.0f}};
+
+  if (pointInPolygon(planX, planZ, medina)) return Zone::MEDINA;
+  if (pointInPolygon(planX, planZ, kasbah)) return Zone::KASBAH;
+  if (pointInPolygon(planX, planZ, port)) return Zone::PORT;
+  if (pointInPolygon(planX, planZ, villeNouvelle)) return Zone::VILLE_NOUVELLE;
+
+  // The coastal band is low and lies east of the historic plan; urban port
+  // ground was handled above so this only labels exposed shoreline as beach.
+  if (x > 4650.0f && groundHeight <= getWaterLevel() + 8.0f)
+    return Zone::BEACH;
+
+  if (!wadiSurfaceMask.empty() && wadiSurfaceMaskW > 0 && wadiSurfaceMaskH > 0) {
+    const float u = glm::clamp(
+        (x - terrainManager->getWorldMinX()) /
+            (terrainManager->getWorldMaxX() - terrainManager->getWorldMinX()),
+        0.0f, 1.0f);
+    const float v = glm::clamp(
+        (z - terrainManager->getWorldMinZ()) /
+            (terrainManager->getWorldMaxZ() - terrainManager->getWorldMinZ()),
+        0.0f, 1.0f);
+    const int px = std::clamp(static_cast<int>(u * (wadiSurfaceMaskW - 1)),
+                              0, wadiSurfaceMaskW - 1);
+    const int pz = std::clamp(static_cast<int>(v * (wadiSurfaceMaskH - 1)),
+                              0, wadiSurfaceMaskH - 1);
+    // Black pixels in heightmap_wadis.png mark the incised wadi channels.
+    if (wadiSurfaceMask[static_cast<size_t>(pz) * wadiSurfaceMaskW + px] < 128)
+      return Zone::WADI;
+  }
+
+  return Zone::PLAIN;
+}
 bool Terrain::pointInPolygon(float x, float z,
                              const std::vector<glm::vec2> &polygon) const {
-  return false;
+  if (polygon.size() < 3) return false;
+
+  bool inside = false;
+  for (size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+    const glm::vec2& a = polygon[i];
+    const glm::vec2& b = polygon[j];
+    const bool crosses = ((a.y > z) != (b.y > z)) &&
+        (x < (b.x - a.x) * (z - a.y) / (b.y - a.y) + a.x);
+    if (crosses) inside = !inside;
+  }
+  return inside;
 }
 
 void Terrain::update(const glm::vec3& camPos) {
@@ -1791,6 +2269,10 @@ void Terrain::saveTerrain() {
 
 void Terrain::rebuildRoadMesh() {
   if (!roadGraph || !roadMeshBuilder) return;
+  if (terrainManager) terrainManager->logHeightfieldSignature("rebuild/BEFORE");
+  // Restore the current terrain before sampling/evaluating the edited network;
+  // this prevents each rebuild from stacking another road cut into the DEM.
+  if (terrainManager) terrainManager->applyRoadBedHeightfield(nullptr, 0, 0);
   for (auto& seg : roadGraph->segments) {
     RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
   }
@@ -1798,9 +2280,50 @@ void Terrain::rebuildRoadMesh() {
   roadMeshBuilder->destroy();
   roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
   roadMeshBuilder->upload();
+  if (!roadDeformer) roadDeformer = new RoadDeformer();
+  const int deformW = terrainManager ? terrainManager->getVisualGridW() : 0;
+  const int deformH = terrainManager ? terrainManager->getVisualGridH() : 0;
+  roadDeformer->build(roadGraph->segments, roadHeightSampler, roadMapper, deformW, deformH);
+  if (terrainManager)
+    terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
+  if (terrainManager && roadMeshBuilder)
+    terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
+        roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true);
+  if (roadTileField) roadTileField->build(roadGraph->segments, roadMapper);
+  snapRoadsToRenderedTerrain();
+  if (terrainManager) terrainManager->logHeightfieldSignature("rebuild/AFTER");
   std::cout << "[Terrain] Road mesh rebuilt: " << roadGraph->segments.size()
             << " segments, " << roadMeshBuilder->getVertexCount() << " vertices, "
             << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
+}
+
+void Terrain::snapRoadsToRenderedTerrain() {
+  if (!terrainManager || !roadGraph || !roadMeshBuilder) return;
+  const int vw = terrainManager->getVisualGridW();
+  const int vh = terrainManager->getVisualGridH();
+  const std::vector<float>& visual = terrainManager->getVisualHeightsData();
+  if (vw < 2 || vh < 2 || visual.empty()) return;
+
+  // Sample the exact array the terrain chunks are meshed from, so the ribbon and
+  // the ground triangles are interpolated from the same bilinear surface. Anything
+  // less leaves a visible step wherever the road crosses a heightfield cell line.
+  TerrainCoordinateMapper visualMapper;
+  visualMapper.bounds = { terrainManager->getWorldMinX(), terrainManager->getWorldMaxX(),
+                          terrainManager->getWorldMinZ(), terrainManager->getWorldMaxZ(),
+                          terrainManager->getMinHeight(), terrainManager->getMaxHeight() };
+  visualMapper.heightmapW = vw;
+  visualMapper.heightmapH = vh;
+  HeightSampler visualSampler;
+  visualSampler.init(visualMapper, visual.data(), vw, vh);
+
+  for (auto& seg : roadGraph->segments) {
+    RoadSpline::evaluate(seg, visualSampler, 0.5f);
+  }
+  roadMeshBuilder->destroy();
+  roadMeshBuilder->build(roadGraph->segments, visualSampler, nullptr);
+  roadMeshBuilder->upload();
+  // Deliberately no conform pass here: the ribbon now sits on the surface, so
+  // re-conforming would drag the ground 5 cm lower on every rebuild and drift.
 }
 
 void Terrain::saveRoadsToJSON(const std::string& path) const {
@@ -1908,7 +2431,7 @@ void Terrain::connectRoads(float tolerance) {
   if (!roadGraph || roadGraph->segments.empty()) return;
   auto& segs = roadGraph->segments;
 
-  // ── Pass 1: snap each segment endpoint onto the nearest other road's
+  // â”€â”€ Pass 1: snap each segment endpoint onto the nearest other road's
   //    centerline (forms true T-junctions instead of gaps).
   auto distPt = [](const RoadPoint& a, const RoadPoint& b) {
     const float dx = a.pos.x - b.pos.x, dz = a.pos.y - b.pos.y;
@@ -1935,7 +2458,7 @@ void Terrain::connectRoads(float tolerance) {
           const float pz = os.controlPoints[k].pos.y + t * dz;
           const float d = std::sqrt((cp.pos.x - px) * (cp.pos.x - px) +
                                     (cp.pos.y - pz) * (cp.pos.y - pz));
-          // Only connect to a road's interior (true T) — ignore hits on the
+          // Only connect to a road's interior (true T) â€” ignore hits on the
           // other road's own near endpoints to avoid squashing parallel roads.
           const bool nearEnd = (t * len2 <= tolerance * tolerance && t < 0.2f) ||
                                (len2 * (1.0f - t) * (1.0f - t) <= tolerance * tolerance && t > 0.8f);
@@ -1952,7 +2475,7 @@ void Terrain::connectRoads(float tolerance) {
     }
   }
 
-  // ── Pass 2: merge segments whose endpoints coincide into one polyline.
+  // â”€â”€ Pass 2: merge segments whose endpoints coincide into one polyline.
   int merged = 0;
   bool anyChange = true;
   while (anyChange) {
@@ -1964,6 +2487,11 @@ void Terrain::connectRoads(float tolerance) {
         if (i == j || anyChange) continue;
         auto& B = segs[j];
         if (B.controlPoints.size() < 2) continue;
+
+        // Only merge segments that share the same road type and similar width.
+        // Merging roads of different hierarchy (e.g. ColonialAvenue into Medina)
+        // would destroy their independent rendering, so skip them.
+        if (A.type != B.type || std::fabs(A.width - B.width) >= 0.2f) continue;
 
         bool attached = false;
         // A.last -> B.first : extend A with B
@@ -2022,7 +2550,8 @@ float Terrain::getWaterLevel() const {
 void Terrain::updateWaterMapTexture(const float* data) const {
   if (waterMapTex != 0 && data != nullptr) {
     glBindTexture(GL_TEXTURE_2D, waterMapTex);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 256, GL_RED, GL_FLOAT, data);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WaterSimulation::SIM_SIZE, WaterSimulation::SIM_SIZE,
+                    GL_RED, GL_FLOAT, data);
     glBindTexture(GL_TEXTURE_2D, 0);
   }
 }

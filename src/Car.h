@@ -2,9 +2,12 @@
 
 #include "Shader.h"
 #include "Vec3.h"
+#include "vehicle/VehicleConfig.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
+#include <algorithm>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -12,6 +15,7 @@ class Character;
 class Camera;
 class Terrain;
 class ObjModel;
+class VehicleBody;
 
 class Car {
 public:
@@ -30,10 +34,26 @@ public:
 
     float minRPM = 800.0f;
     float maxRPM = 7500.0f;
-    float gearRatios[8] = {-3.1f, 0.0f, 3.6f, 2.2f, 1.5f, 1.1f, 0.9f, 0.7f}; // R, N, 1-5, 6
+    std::array<float, 8> gearRatios{{-3.1f, 0.0f, 3.6f, 2.2f,
+                                      1.5f, 1.1f, 0.9f, 0.7f}};
     float finalDrive = 4.1f;
+    std::vector<EngineTorquePoint> torquePoints;
 
-    float torqueCurve(float currentRPM) {
+    float torqueCurve(float currentRPM) const {
+      if (torquePoints.size() >= 2) {
+        if (currentRPM <= torquePoints.front().rpm)
+          return torquePoints.front().torqueNm;
+        for (size_t i = 1; i < torquePoints.size(); ++i) {
+          if (currentRPM <= torquePoints[i].rpm) {
+            const auto &a = torquePoints[i - 1];
+            const auto &b = torquePoints[i];
+            const float t = (currentRPM - a.rpm) /
+                            std::max(1.0f, b.rpm - a.rpm);
+            return a.torqueNm + (b.torqueNm - a.torqueNm) * t;
+          }
+        }
+        return torquePoints.back().torqueNm;
+      }
       float x = currentRPM / maxRPM;
       return 650.0f * (1.0f - 0.8f * (x - 0.6f) * (x - 0.6f)); // Punchy torque curve
     }
@@ -61,6 +81,16 @@ public:
     bool grounded = false;
   };
 
+  // One normalized input snapshot is shared by steering, tires, and stability
+  // control so each subsystem cannot interpret the same key differently.
+  struct DriverInput {
+    float steering = 0.0f; // -1 right, +1 left
+    bool accelerate = false;
+    bool brake = false;
+    bool handbrake = false;
+    bool horn = false;
+  };
+
   Car(State initialState = State::DRIVEN);
   ~Car();
 
@@ -84,6 +114,7 @@ public:
   bool hasDriver() const { return m_Driver != nullptr; }
   Character *getDriver() const { return m_Driver; }
   float getSpeed() const;
+  float getForwardSpeed() const;
   float getYaw() const { return yaw; }
   float getDriftAngle() const { return driftAngle; }
   float getPitchAngle() const { return pitchAngle; }
@@ -124,10 +155,20 @@ public:
 private:
   Wheel wheels[4]; // 0:FL, 1:FR, 2:RL, 3:RR
   Engine engine;
+  DriverInput driverInput;
+  VehicleConfig drivingConfig;
+  std::unique_ptr<VehicleBody> vehicleBody;
 
   // ── PHYSICS STATE ──────────────────────────────
   Vec3 position;
   Vec3 velocity;
+  glm::vec3 previousRenderPosition = glm::vec3(0.0f);
+  glm::quat previousRenderRotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+  float previousRenderSteerAngle = 0.0f;
+  float previousRenderDriftAngle = 0.0f;
+  float previousRenderWheelLength[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float previousRenderWheelSpin[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  bool hasPreviousRenderState = false;
   glm::vec3 angularVel = glm::vec3(0.0f);
   glm::quat rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
 
@@ -171,7 +212,6 @@ private:
 
   float physicsAccumulator = 0.0f;
 
-  static constexpr float MASS = 1400.0f; // GTA default mass (Stage 1)
   static constexpr float GRAVITY = -9.81f;
   static constexpr float MAX_STEER_ANGLE = 0.61f; // ~35 degrees (Stage 8)
   static constexpr float SCALE_FACTOR = 0.010f;
@@ -190,10 +230,11 @@ private:
 
   // ── PHYSICS SUBSYSTEMS ────────────────────────
   void updateActivePhysics(float dt, Terrain *terrain);
+  void updatePlayerArcadePhysics(float dt, Terrain *terrain);
   void updateIdlePhysics(float dt, Terrain *terrain);
   void updateRoamingAI(float dt, Terrain *terrain, float totalTime);
 
-  void processInput(float dt, bool &gas, bool &braking, bool &handbrake);
+  void processInput(float dt);
   void updateTransmission(float dt, bool gas, bool braking);
   void updateSuspension(float sdt, Terrain *terrain, glm::vec3 &totalForce,
                         glm::vec3 &totalTorque);

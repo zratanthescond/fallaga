@@ -47,6 +47,8 @@ void addGerstnerWave(vec3 basePos, vec2 d, float a, float s, float l, float q,
 
 void main() {
     vec3 pos = aPos;
+    // Keep the visible water plane at the editable sea level.
+    pos.y = waterLevel;
     vec3 tangent = vec3(1.0, 0.0, 0.0);
     vec3 binormal = vec3(0.0, 0.0, 1.0);
     

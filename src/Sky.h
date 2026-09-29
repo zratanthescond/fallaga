@@ -12,5 +12,7 @@ public:
 private:
     Shader* skyShader;
     unsigned int skyVAO, skyVBO;
+    unsigned int cloudNoiseTexture = 0;
     void setupQuad();
+    void setupCloudNoise();
 };

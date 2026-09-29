@@ -5,6 +5,7 @@
 #include <glm/glm.hpp>
 #include "TerrainChunk.h"
 #include "Shader.h"
+#include "RoadSystem.h"
 
 class TerrainManager {
 public:
@@ -19,23 +20,40 @@ public:
     float getRiverAt(float x, float z) const;
     GLuint getHeightmapTexture() const { return heightmapTexID; }
     GLuint getRoadMask() const { return roadMask; }
-    void setRoadDeformationTexture(GLuint texture) { roadDeformationTex = texture; }
-    void sculpt(float wx, float wz, float radius, float speed, int mode, float dt);
+    // Apply/remove the road bed directly in the visual and physics heightfields.
+    // Passing null offsets restores the terrain from the last road deformation.
+    void applyRoadBedHeightfield(const float* offsets, int offsetW, int offsetH);
+    void sculpt(float wx, float wz, float radius, float speed, int mode, float dt,
+                float directionDegrees = 0.0f, float gradeDegrees = 20.0f);
+    void conformTerrainToRoadMesh(float wx, float wz, float radius, float speed, float dt,
+                                  const std::vector<RoadVertex>& roadVertices,
+                                  const std::vector<uint32_t>& roadIndices,
+                                  bool wholeNetwork = false);
     void paint(float wx, float wz, float radius, float speed, int layerIdx, float dt);
     void saveTerrain();
     void erodeGlobal();
     void updateGPUHeightmapTexture();
+    // FALLAGA_ROADGAP: coarse signature of the rendered heightfield. Used to trace which
+    // stage of a tool stroke raises terrain back, since the brush, the roadbed deform and
+    // the conform all write the same array.
+    void logHeightfieldSignature(const char* stage) const;
 
     // Accessors for road system integration
     const float* getHeightsData() const { return heights.data(); }
     int getGridW() const { return gridW; }
     int getGridH() const { return gridH; }
+    int getVisualGridW() const { return visualW; }
+    int getVisualGridH() const { return visualH; }
     float getWorldMinX() const { return worldMinX; }
     float getWorldMaxX() const { return worldMaxX; }
     float getWorldMinZ() const { return worldMinZ; }
     float getWorldMaxZ() const { return worldMaxZ; }
     float getMinHeight() const { return minHeight; }
     float getMaxHeight() const { return maxHeight; }
+    // Rendered-terrain heightfield. Roads are sampled from getHeightsData(), so
+    // anything comparing the two (road/terrain conformance checks) must read this
+    // instead to see the surface the GPU actually draws.
+    const std::vector<float>& getVisualHeightsData() const { return visualHeights; }
 
 private:
     void loadHeightmap(const std::string& path);
@@ -43,13 +61,14 @@ private:
     void erode(int numDroplets, float brushX, float brushZ, float radius, bool isLocal);
     std::vector<float> heights;
     std::vector<float> visualHeights;
+    std::vector<float> appliedRoadOffsets;
     std::vector<unsigned char> roadMaskData;
     int gridW=0, gridH=0;
     int visualW=0, visualH=0;
     int roadW=0, roadH=0;
     float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
     std::vector<TerrainChunk*> chunks;
-    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0, roadDeformationTex=0;
+    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
     bool hasRoadMask = false;
     int activePaintLayerIdx = 2;
     Shader* terrainShader = nullptr;

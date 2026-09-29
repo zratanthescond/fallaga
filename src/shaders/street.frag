@@ -5,11 +5,20 @@ in vec3 FragPos;
 in vec3 Normal;
 in vec2 TexCoords;
 in float RoadType;
+in float MarkMask;   // 1 = paint markings, 0 = bare asphalt (junction pad / merged road)
 
 uniform vec3 lightDir;
 uniform vec3 viewPos;
 
 uniform int u_debugUV;   // FALLAGA_DEBUGVIEW: 1 = checker grid on the UVs
+uniform int u_debugEdges; // FALLAGA_EDGEONLY: 1 = road edges only, no surface
+uniform int u_joinStrokeCount;
+uniform vec4 u_joinCurvePoints[128]; // four xz control points per shader-painted stroke
+uniform vec4 u_joinStrokeInfo[32];  // half-width, 1 for pavement/curb, 0 for white edge
+uniform int u_joinContactCount;
+uniform vec4 u_joinContactCenterT[8]; // host center xz and tangent xz
+uniform vec4 u_joinContactInfo[8];    // host side, white mouth half-span, pavement half-span, radius
+uniform vec4 u_joinContactDims[8];    // host road width
 
 // ---------------------------------------------------------------------------
 //  Procedural GTA-style road surface.
@@ -45,6 +54,23 @@ float mark(float x, float center, float halfW, float aa) {
     return smoothstep(halfW, halfW - aa, abs(x - center));
 }
 
+float bezierStrokeDistance(vec2 q, vec2 p0, vec2 p1, vec2 p2, vec2 p3) {
+    float best = 1e20;
+    vec2 previous = p0;
+    for (int step = 1; step <= 16; ++step) {
+        float t = float(step) / 16.0;
+        float s = 1.0 - t;
+        vec2 current = p0 * (s*s*s) + p1 * (3.0*s*s*t) +
+                       p2 * (3.0*s*t*t) + p3 * (t*t*t);
+        vec2 d = current - previous;
+        float d2 = dot(d, d);
+        float along = (d2 > 1e-8) ? clamp(dot(q - previous, d) / d2, 0.0, 1.0) : 0.0;
+        best = min(best, length(q - (previous + d * along)));
+        previous = current;
+    }
+    return best;
+}
+
 void main() {
     float u = TexCoords.x;
     float v = TexCoords.y;
@@ -52,6 +78,33 @@ void main() {
     bool  paved = (type == 0 || type == 1 || type == 4);
     float dist  = length(viewPos - FragPos);
     vec2  wxz   = FragPos.xz;
+
+    // Junction / merge suppression. Interpolated, so paint fades out over the length of
+    // one cross-section instead of snapping on at a hard line.
+    float paint = clamp(MarkMask, 0.0, 1.0);
+
+    // ---- edge-only inspection (FALLAGA_EDGEONLY) ----------------------------
+    //  Keeps just the two ribbon boundaries and throws the entire surface away, so
+    //  deformation is read straight off the outline instead of through tarmac shading:
+    //  a pinched, twisted or self-overlapping ribbon shows up as the two edges crossing
+    //  or bunching. This has to run BEFORE the shoulder discard further down, which
+    //  drops exactly the u~0 / u~1 band being shown here, and it ignores markFade,
+    //  which would otherwise erase the painted lines past 140 m. Unlit, so the colour
+    //  is flat and the geometry is not disguised by lighting.
+    if (u_debugEdges != 0) {
+        // Cyan = the true geometric rim of the ribbon (u = 0 and u = 1).
+        float rim = clamp(mark(u, 0.0, 0.010, 0.004) + mark(u, 1.0, 0.010, 0.004),
+                          0.0, 1.0);
+        // Yellow = the painted edge lines, for reference against the real rim.
+        float line = clamp(mark(u, 0.085, 0.016, 0.006) + mark(u, 0.915, 0.016, 0.006),
+                           0.0, 1.0);
+        float a = clamp(rim + line * 0.5, 0.0, 1.0);
+        if (a < 0.05) discard;
+        vec3 c = mix(vec3(0.10, 0.90, 1.00), vec3(1.00, 0.92, 0.15),
+                     clamp(line * 0.5 / a, 0.0, 1.0));
+        FragColor = vec4(c, 1.0);
+        return;
+    }
 
     // ---- noise layers ---------------------------------------------------
     float nFine  = fbm(wxz * 7.0);      // tarmac aggregate
@@ -66,7 +119,8 @@ void main() {
                  pow(smoothstep(0.55, 1.0, nMacro), 3.0) * 0.1;
 
     // markings fade with distance to cut shimmering (GTA LOD behaviour)
-    float markFade = 1.0 - smoothstep(140.0, 420.0, dist);
+    float markFade = (1.0 - smoothstep(140.0, 420.0, dist)) * paint;
+
 
     vec3 albedo;
     float gloss = 0.0;
@@ -95,15 +149,40 @@ void main() {
         float lEdge = mark(u, 0.085, 0.018, edgeLineAA);
         float rEdge = mark(u, 0.915, 0.018, edgeLineAA);
 
-        // concrete curb band + gutter shadow at the road rim
-        float curb = mark(u, 0.028, 0.024, 0.008) +
-                     mark(u, 0.972, 0.024, 0.008);
+        // Concrete pavement strip from the ribbon edge to just outside the white
+        // edge stripe. Junction curves use the same width and material below.
+        float curb = mark(u, 0.0335, 0.0335, 0.006) +
+                     mark(u, 0.9665, 0.0335, 0.006);
+        curb *= paint;
+        float whiteSuppression = 0.0;
+        float pavementSuppression = 0.0;
+        for (int j = 0; j < 8; ++j) {
+            if (j >= u_joinContactCount) break;
+            vec4 centerT = u_joinContactCenterT[j];
+            vec4 info = u_joinContactInfo[j];
+            float hostWidth = u_joinContactDims[j].x;
+            vec2 hostCenter = centerT.xy;
+            vec2 hostTangent = normalize(centerT.zw);
+            vec2 hostRight = vec2(hostTangent.y, -hostTangent.x);
+            float along = dot(wxz - hostCenter, hostTangent);
+            float outward = dot(wxz - hostCenter, hostRight) * info.x;
+            float whiteCenter = hostWidth * (0.5 - 0.085);
+            float pavementCenter = hostWidth * (0.5 - 0.0335);
+            float whiteHalfWidth = hostWidth * 0.018;
+            float pavementHalfWidth = hostWidth * 0.0335;
+            if (abs(along) < info.y && abs(outward - whiteCenter) < whiteHalfWidth)
+                whiteSuppression = 1.0;
+            if (abs(along) < info.z && abs(outward - pavementCenter) < pavementHalfWidth)
+                pavementSuppression = 1.0;
+        }
+        curb *= 1.0 - pavementSuppression;
         vec3 cCurb = mix(vec3(0.60, 0.585, 0.545),
                          vec3(0.76, 0.735, 0.68), nMid * 0.3);
         albedo = mix(albedo, cCurb, curb * 0.9);
         albedo = mix(albedo, cTar * 0.6,
                      max(mark(u, 0.062, 0.012, 0.007),
-                         mark(u, 0.938, 0.012, 0.007)));
+                         mark(u, 0.938, 0.012, 0.007)) * paint *
+                         (1.0 - pavementSuppression));
         gloss = mix(gloss, 0.05, clamp(curb, 0.0, 1.0));
 
         // center markings
@@ -133,9 +212,43 @@ void main() {
         }
 
         // edge lines
-        float edgeLines = clamp(lEdge + rEdge, 0.0, 1.0) * markFade;
+        float edgeLines = clamp(lEdge + rEdge, 0.0, 1.0) * markFade * paint *
+                          (1.0 - whiteSuppression);
         albedo = mix(albedo, lineWhite, edgeLines);
         gloss  = mix(gloss, 0.45, edgeLines * 0.6);
+
+        // Paint rounded junction transitions with this road's own material. The
+        // curves are world-space UV guides; no separate line mesh can z-fight or
+        // introduce a second asphalt texture at the join.
+        float joinWhite = 0.0;
+        float joinCurb = 0.0;
+        for (int j = 0; j < 32; ++j) {
+            if (j >= u_joinStrokeCount) break;
+            int base = j * 4;
+            float d = bezierStrokeDistance(wxz,
+                u_joinCurvePoints[base + 0].xy,
+                u_joinCurvePoints[base + 1].xy,
+                u_joinCurvePoints[base + 2].xy,
+                u_joinCurvePoints[base + 3].xy);
+            float halfWidth = u_joinStrokeInfo[j].x;
+            float coverage = 1.0 - smoothstep(halfWidth - 0.025,
+                                               halfWidth + 0.025, d);
+            if (u_joinStrokeInfo[j].y > 0.5)
+                joinCurb = max(joinCurb, coverage);
+            else
+                joinWhite = max(joinWhite, coverage);
+        }
+        vec3 joinedCurb = mix(vec3(0.60, 0.585, 0.545),
+                              vec3(0.76, 0.735, 0.68), nMid * 0.3);
+        albedo = mix(albedo, joinedCurb, joinCurb);
+        // Join strokes already replace the branch and host lines inside the
+        // endpoint suppression zone. Do not reuse markFade here: MarkMask is
+        // intentionally zero at attached endpoints, and using it made every
+        // rounded white connector disappear just before it met the host stripe.
+        float joinLineFade = 1.0 - smoothstep(140.0, 420.0, dist);
+        albedo = mix(albedo, lineWhite, joinWhite * joinLineFade * wear);
+        gloss = mix(gloss, 0.05, joinCurb);
+        gloss = mix(gloss, 0.45, joinWhite * 0.6);
     } else {
         // ---------------- PACKED EARTH / DIRT TRACK ------------------------
         vec3 cPacked = vec3(0.50, 0.44, 0.33);
@@ -164,7 +277,10 @@ void main() {
     vec3 finalColor = albedo * (ambient + NdotL * 0.58);
     finalColor += vec3(0.26, 0.24, 0.21) * NdotL * spec * gloss;
 
-    if (edgeAlpha < 0.02) discard;
+    // Keep shoulder fragments opaque. Screen-space discard made each road's edge
+    // punch holes through the prioritized top surface, revealing the overlapping
+    // road beneath as black/white speckling at joins. `dust` above still shades the
+    // outer band so it fades visually into the terrain without fragment holes.
 
     // UV inspection: alternating cells + grid lines reveal arc-length spacing
     // (v) and cross-road mapping (u); uniform cell sizes mean no stretching.
@@ -179,5 +295,7 @@ void main() {
         return;
     }
 
-    FragColor = vec4(finalColor, edgeAlpha);
+    // Opaque: the road ribbon is drawn with blending off, so the shoulder has already
+    // been dithered away above and every surviving fragment owns its depth.
+    FragColor = vec4(finalColor, 1.0);
 }

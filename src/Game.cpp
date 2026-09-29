@@ -12,6 +12,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <cmath>
+#include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <fstream>
@@ -128,6 +129,32 @@ void Game::setup(int width, int height) {
 }
 
 void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
+    using PerfClock = std::chrono::steady_clock;
+    struct UpdatePerfStats {
+        double elapsed = 0.0;
+        int frames = 0;
+        double prepMs = 0.0;
+        double charactersMs = 0.0;
+        double carMs = 0.0;
+        double cameraMs = 0.0;
+        double terrainMs = 0.0;
+        double waterStepMs = 0.0;
+        double waterUploadMs = 0.0;
+        double otherMs = 0.0;
+    };
+    static const bool profileUpdate =
+        std::getenv("FALLAGA_UPDATE_PERF") != nullptr;
+    static UpdatePerfStats perf;
+    PerfClock::time_point phaseStart{};
+    if (profileUpdate) phaseStart = PerfClock::now();
+    auto recordPhase = [&](double& bucketMs) {
+        if (!profileUpdate) return;
+        const auto now = PerfClock::now();
+        bucketMs += std::chrono::duration<double, std::milli>(
+                        now - phaseStart).count();
+        phaseStart = now;
+    };
+
     double currentTime = glfwGetTime();
    
     deltaTime = currentTime - lastFrameTime;
@@ -145,27 +172,31 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     if (projChanged && (currentTime - projLastSave) > 0.5) {
         saveProjRefMap();
     }
+    recordPhase(perf.prepMs);
    // std::cout << "Delta Time: " << deltaTime << " seconds\n";
     player->update(camera, static_cast<float>(deltaTime), terrain);
-    camera->update(mouseDeltaX, mouseDeltaY, mouseScroll, static_cast<float>(deltaTime), editMode);
     horse->update(static_cast<float>(deltaTime), terrain);
+    recordPhase(perf.charactersMs);
     if (car) {
         car->update(static_cast<float>(deltaTime), terrain, static_cast<float>(totalTime), camera);
     }
+    recordPhase(perf.carMs);
+    // Update the camera after vehicle physics so the driving view follows the
+    // car's current frame position instead of trailing one physics update.
+    camera->update(mouseDeltaX, mouseDeltaY, mouseScroll, static_cast<float>(deltaTime), editMode);
+    recordPhase(perf.cameraMs);
     
     // Periodically update terrain (e.g. check for heightmap file changes)
     {
         auto camPos = camera->getPosition();
         terrain->update(glm::vec3(camPos.x, camPos.y, camPos.z));
     }
+    recordPhase(perf.terrainMs);
 
-    // Flow physics for the sea/wadis, bounded to the connected ocean/river
-    // mask so it can only redistribute water it already has - never spread
-    // onto new land (see WaterSimulation::update).
-    waterSim.update(static_cast<float>(deltaTime));
-    if (terrain) {
-        terrain->updateWaterMapTexture(waterSim.getTextureData());
-    }
+    // The rendered water map is static between terrain/water-level edits.
+    // WaterSimulation::update() only changes private flow state; its texture
+    // data is derived from the unchanged masks and heights. Recomputing it and
+    // uploading the full 512x512 texture every frame caused a GPU sync stall.
 
     // ----------------------------------------------------
     // EDITOR MOUSE & RAYCAST INTERACTION (UI CLICKS & 3D INTERACTION)
@@ -208,7 +239,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         if (mouseX >= tx && mouseX <= tx + tabW) {
                             activeEditorMode = i;
                             editMode = (i != 0);
-                            editorBrushMode = (i == 2) ? 1 : (i == 3) ? 4 : 0;
+                            editorBrushMode = (i == 2) ? 1 : (i == 3) ? 7 : 0;
                             std::cout << "[Editor Mode] Switched to Mode " << i << "...\n";
                             break;
                         }
@@ -248,19 +279,18 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                     } 
                     else if (activeEditorMode == 2) {
                         // Sculpt Mode: Tool selection
-                        for (int i = 0; i < 4; ++i) { // 4 tools: Raise, Lower, Smooth, Erode
-                            float btnY = lpY + 45 + i * 25;
+                        for (int i = 0; i < 6; ++i) { // includes road-bed conform
+                            float btnY = lpY + 45 + i * 22;
                             if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 20) {
-                                editorBrushMode = 1 + i; // 1 = Raise, 2 = Lower, 3 = Smooth, 4 = Erode
+                                editorBrushMode = 1 + i; // sculpt brush ids 1-6
                                 std::cout << "[Editor UI] Sculpt tool: " << editorBrushMode << "\n";
                             }
                         }
 
-                        // Brush Settings (Radius & Strength) - Aligned with Y coordinates lpY + 180 and lpY + 212
-                        GameEditorUtils::updateBrushSliders(mouseX, mouseY, lpX, lpY, lpW, brushRadius, brushStrength);
+                        GameEditorUtils::updateBrushSliders(mouseX, mouseY, lpX, lpY, lpW,
+                            brushRadius, brushStrength, true, &sculptAngleDegrees, &sculptGradeDegrees);
 
-                        // Run Global Erosion Button Click (Y range lpY + 265 to lpY + 285)
-                        if (leftMouseClicked && mouseY >= lpY + 265 && mouseY <= lpY + 285 && mouseX >= lpX + 15 && mouseX <= lpX + lpW - 15) {
+                        if (leftMouseClicked && mouseY >= lpY + 350 && mouseY <= lpY + 370 && mouseX >= lpX + 15 && mouseX <= lpX + lpW - 15) {
                             std::cout << "[Editor UI] Triggering Global Hydraulic Erosion Pass...\n";
                             terrain->terrainManager->erodeGlobal();
                             waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f, waterLevelAdjust);
@@ -272,7 +302,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         for (int i = 0; i < 3; ++i) {
                             float btnY = lpY + 45 + i * 25;
                             if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 20) {
-                                editorBrushMode = 5 + i; // 5 = Paint Road, 6 = Paint River, 7 = Erase
+                                editorBrushMode = 7 + i; // 7 = Paint Road, 8 = Paint River, 9 = Erase
                                 std::cout << "[Editor UI] Paint tool: " << editorBrushMode << "\n";
                             }
                         }
@@ -325,8 +355,12 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             }
                             float wY = lpY + 358;
                             if (leftMouseClicked && mouseY >= wY && mouseY <= wY + 24) {
-                                if (mouseX >= lpX + 8 && mouseX <= lpX + 68) roadDrawWidth = glm::max(2.0f, roadDrawWidth - 0.5f);
-                                else if (mouseX >= lpX + 78 && mouseX <= lpX + 138) roadDrawWidth = glm::min(30.0f, roadDrawWidth + 0.5f);
+                if (mouseX >= lpX + 8 && mouseX <= lpX + 68) roadDrawWidth = glm::max(2.0f, roadDrawWidth - 0.5f);
+                // 20 m ceiling. The road type presets top out at 11.5 m; past ~20 m the
+                // fixed cross-section bands (curb at 2.8% of u, edge line at 8.5%) spread
+                // out so far that the paint stops reading as a road at all.
+                else if (mouseX >= lpX + 78 && mouseX <= lpX + 138) roadDrawWidth = glm::min(20.0f, roadDrawWidth + 0.5f);
+
                                 std::cout << "[Road] New road width = " << roadDrawWidth << "m\n";
                             }
                             float sY = lpY + 396;
@@ -334,6 +368,15 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                 if (mouseX >= lpX + 8 && mouseX <= lpX + 68) roadDrawShoulder = glm::max(0.0f, roadDrawShoulder - 0.25f);
                                 else if (mouseX >= lpX + 78 && mouseX <= lpX + 138) roadDrawShoulder = glm::min(10.0f, roadDrawShoulder + 0.25f);
                                 std::cout << "[Road] New road shoulder = " << roadDrawShoulder << "m\n";
+                            }
+                            // New-road corner shaping. Zero keeps the automatic
+                            // width-based curve; explicit values soften tight bends.
+                            float cY = lpY + 430;
+                            if (leftMouseClicked && mouseY >= cY && mouseY <= cY + 22) {
+                                if (mouseX < lpX + lpW * 0.5f)
+                                    roadDrawCornerRadius = glm::max(0.0f, roadDrawCornerRadius - 2.0f);
+                                else
+                                    roadDrawCornerRadius = glm::min(60.0f, roadDrawCornerRadius + 2.0f);
                             }
                             // Draw-tool option toggles (STRAIGHT / SNAP)
                             float sLy = lpY + 480;
@@ -346,6 +389,10 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             if (leftMouseClicked && mouseY >= sNy && mouseY <= sNy + 22) {
                                 roadSnapToRoads = !roadSnapToRoads;
                                 std::cout << "[Road] Snap-to-road-endpoints " << (roadSnapToRoads ? "ON" : "OFF") << "\n";
+                            }
+                            float loopY = lpY + 524;
+                            if (leftMouseClicked && mouseY >= loopY && mouseY <= loopY + 20) {
+                                roadDrawClosedLoop = !roadDrawClosedLoop;
                             }
                             // DEL PT / OK COMMIT / X CANCEL buttons for the active drawing
                             float oY = lpY + 548, thirdW = (lpW - 16 - 12) / 3.0f;
@@ -460,8 +507,25 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                 roadGraphDirty = true;
                                 std::cout << "[Road] Selected width -> " << segW.width << "m (id=" << segW.id << ")\n";
                             }
+                            // Corner RADIUS slider for the selected road: drag to round
+                            // every interior corner of that road. Left end = auto (half the
+                            // road width, the historical behaviour).
+                            float cYb = lpY + 468;
+                            if (leftMouseDown && mouseY >= cYb && mouseY <= cYb + 22) {
+                                auto& segC = rg2->segments[selectedRoadIdx];
+                                const float trackX0 = lpX + 90.0f, trackW = 210.0f;
+                                const float mx = (float)mouseX;
+                                float norm = glm::clamp((mx - trackX0) / trackW, 0.0f, 1.0f);
+                                float want = std::floor(norm * 60.0f + 0.5f) * 0.5f;   // 0..30 m, 0.5 m steps
+                                if (want != segC.cornerRadius) {
+                                    segC.cornerRadius = want;
+                                    roadGraphDirty = true;
+                                    std::cout << "[Road] Corner radius -> " << want
+                                              << "m (id=" << segC.id << ")\n";
+                                }
+                            }
                             // Delete selected point/road (was Del key)
-                            float dYb = lpY + 468;
+                            float dYb = lpY + 498;
                             if (leftMouseClicked && mouseY >= dYb && mouseY <= dYb + 22) {
                                 if (selectedRoadPointIdx >= 0 &&
                                     (int)rg2->segments[selectedRoadIdx].controlPoints.size() > 2) {
@@ -734,14 +798,23 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         if (rg) {
                             if (roadToolMode == 0) { // Select road
                                 if (leftMouseClicked) {
-                                    int best = -1; float bestD = 10.0f;
+                                    // Pick against the EVALUATED centreline, not the raw
+                                    // control points: between control points the drawn
+                                    // road follows a Catmull-Rom curve, so a chord test
+                                    // misses the road across the middle of every long
+                                    // straight and rounds the wrong corner. The pick
+                                    // radius follows each road's own width.
+                                    int best = -1; float bestD = 1e9f; float bestR = 10.0f;
                                     for (size_t s = 0; s < rg->segments.size(); ++s) {
-                                        const auto& cps = rg->segments[s].controlPoints;
-                                        for (size_t i = 0; i + 1 < cps.size(); ++i) {
+                                        const auto& seg = rg->segments[s];
+                                        const auto& sp = seg.splinePoints;
+                                        const float r = glm::max(4.0f, seg.width * 0.75f);
+                                        if (sp.size() < 2) continue;
+                                        for (size_t i = 0; i + 1 < sp.size(); ++i) {
                                             float d = distPointToPolylineSegment(lastRayHitPos.x, lastRayHitPos.z,
-                                                                                cps[i].pos.x, cps[i].pos.y,
-                                                                                cps[i+1].pos.x, cps[i+1].pos.y);
-                                            if (d < bestD) { bestD = d; best = (int)s; }
+                                                                                sp[i].x, sp[i].z,
+                                                                                sp[i+1].x, sp[i+1].z);
+                                            if (d < r && d < bestD) { bestD = d; best = (int)s; bestR = r; }
                                         }
                                     }
                                     selectedRoadIdx = best;
@@ -749,9 +822,10 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                     if (best >= 0) {
                                         std::cout << "[Road] Selected id=" << rg->segments[best].id
                                                   << " type=" << roadTypeLabel((int)rg->segments[best].type)
-                                                  << " (" << rg->segments[best].controlPoints.size() << " pts)\n";
+                                                  << " (" << rg->segments[best].controlPoints.size()
+                                                  << " pts, pick radius " << bestR << "m)\n";
                                     } else {
-                                        std::cout << "[Road] No road within 10m of click (Select tool)\n";
+                                        std::cout << "[Road] No road under the cursor (Select tool)\n";
                                     }
                                 }
                             }
@@ -774,10 +848,12 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                     return p;
                                 };
                                 // Snap onto the nearest existing road ENDPOINT (first/last control point)
+                                // Also snap to the draft's own FIRST point so the user can close a loop.
                                 auto snapPt = [&](const glm::vec3& in) -> glm::vec3 {
                                     if (!roadSnapToRoads) return in;
                                     glm::vec3 out = in;
                                     float bestD = roadSnapTolerance;
+                                    // Snap to existing committed road endpoints
                                     for (const auto& seg : rg->segments) {
                                         const auto& cps = seg.controlPoints;
                                         if (cps.empty()) continue;
@@ -788,6 +864,35 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                         };
                                         probe(cps.front());
                                         if (cps.size() > 1) probe(cps.back());
+                                    }
+                                    // Snap onto an existing road's CENTRELINE. Endpoint-only
+                                    // snapping made a T-junction impossible to draw: you can
+                                    // never end a street on the middle of another one, so the
+                                    // branch always stopped short, missed the endpoint cluster
+                                    // and got a rounded cap floating over open ground. A
+                                    // branch that ends anywhere on a host centreline welds
+                                    // onto that host's near edge instead.
+                                    for (const auto& seg : rg->segments) {
+                                        const auto& sp = seg.splinePoints;
+                                        if (sp.size() < 2) continue;
+                                        for (size_t i = 0; i + 1 < sp.size(); ++i) {
+                                            const glm::vec2 a(sp[i].x, sp[i].z);
+                                            const glm::vec2 ab(sp[i+1].x - a.x, sp[i+1].z - a.y);
+                                            const float len2 = glm::dot(ab, ab);
+                                            if (len2 < 1e-8f) continue;
+                                            const float t = glm::clamp(
+                                                glm::dot(glm::vec2(out.x, out.z) - a, ab) / len2, 0.0f, 1.0f);
+                                            const glm::vec2 q = a + ab * t;
+                                            const float d = glm::length(glm::vec2(out.x, out.z) - q);
+                                            if (d < bestD) { bestD = d; out = glm::vec3(q.x, in.y, q.y); }
+                                        }
+                                    }
+                                    // Snap to the draft's own first point (closes a loop / round road)
+                                    if (roadDraftPoints.size() >= 3) {
+                                        const glm::vec3& front = roadDraftPoints.front();
+                                        float dx = out.x - front.x, dz = out.z - front.z;
+                                        float d = std::sqrt(dx * dx + dz * dz);
+                                        if (d < bestD) { bestD = d; out = glm::vec3(front.x, in.y, front.z); }
                                     }
                                     return out;
                                 };
@@ -893,9 +998,51 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                         }
                                     } else if (leftMouseDown && selectedRoadPointIdx >= 0 && selectedRoadPointIdx < (int)cps.size()) {
                                         auto& cp = cps[selectedRoadPointIdx];
-                                        if (cp.pos.x != lastRayHitPos.x || cp.pos.y != lastRayHitPos.z) {
-                                            cp.pos.x = lastRayHitPos.x;
-                                            cp.pos.y = lastRayHitPos.z;
+                                        glm::vec2 dragged(lastRayHitPos.x, lastRayHitPos.z);
+                                        const bool isEndpoint = selectedRoadPointIdx == 0 ||
+                                            selectedRoadPointIdx == (int)cps.size() - 1;
+                                        if (roadSnapToRoads && isEndpoint && cps.size() >= 2) {
+                                            const int adjacent = selectedRoadPointIdx == 0 ? 1 : (int)cps.size() - 2;
+                                            glm::vec2 branchInterior = cps[adjacent].pos - dragged;
+                                            const float interiorLen = glm::length(branchInterior);
+                                            if (interiorLen > 1e-4f) {
+                                                branchInterior /= interiorLen;
+                                                const float snapRange = std::max(roadSnapTolerance,
+                                                    rg->segments[selectedRoadIdx].width);
+                                                float bestSnap = snapRange;
+                                                glm::vec2 snapped = dragged;
+                                                for (int h = 0; h < (int)rg->segments.size(); ++h) {
+                                                    if (h == selectedRoadIdx) continue;
+                                                    const RoadSegment& host = rg->segments[h];
+                                                    const int pointCount = (int)host.splinePoints.size();
+                                                    if (pointCount < 2) continue;
+                                                    const int edgeCount = host.closed ? pointCount : pointCount - 1;
+                                                    for (int k = 0; k < edgeCount; ++k) {
+                                                        const int next = (k + 1) % pointCount;
+                                                        const glm::vec2 a(host.splinePoints[k].x, host.splinePoints[k].z);
+                                                        const glm::vec2 b(host.splinePoints[next].x, host.splinePoints[next].z);
+                                                        const glm::vec2 ab = b - a;
+                                                        const float ab2 = glm::dot(ab, ab);
+                                                        if (ab2 < 1e-8f) continue;
+                                                        const float t = glm::clamp(glm::dot(dragged - a, ab) / ab2, 0.0f, 1.0f);
+                                                        const glm::vec2 center = a + ab * t;
+                                                        const glm::vec2 tangent = glm::normalize(ab);
+                                                        if (std::fabs(glm::dot(branchInterior, tangent)) > kRoadJunctionApproachCos)
+                                                            continue;
+                                                        const glm::vec2 right(tangent.y, -tangent.x);
+                                                        const float side = glm::dot(branchInterior, right) >= 0.0f ? 1.0f : -1.0f;
+                                                        const glm::vec2 edge = center + right *
+                                                            (side * roadWhiteEdgeLineOffset(host.width));
+                                                        const float d = glm::length(dragged - edge);
+                                                        if (d < bestSnap) { bestSnap = d; snapped = edge; }
+                                                    }
+                                                }
+                                                dragged = snapped;
+                                            }
+                                        }
+                                        if (cp.pos.x != dragged.x || cp.pos.y != dragged.y) {
+                                            cp.pos.x = dragged.x;
+                                            cp.pos.y = dragged.y;
                                             roadGraphDirty = true;
                                         }
                                     }
@@ -954,16 +1101,39 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         }
                         lastLMB = leftMouseDown;
                     }
-                    else if (editorBrushMode >= 1 && editorBrushMode <= 4) { // Sculpt modes (1=Raise, 2=Lower, 3=Smooth, 4=Erode)
+                    else if (activeEditorMode == 2 && editorBrushMode >= 1 && editorBrushMode <= 5) { // Sculpt brushes
                         if (leftMouseDown && terrain->terrainManager) {
-                            terrain->terrainManager->sculpt(lastRayHitPos.x, lastRayHitPos.z, brushRadius, brushStrength, editorBrushMode, static_cast<float>(deltaTime));
+                            terrain->terrainManager->sculpt(lastRayHitPos.x, lastRayHitPos.z, brushRadius,
+                                brushStrength, editorBrushMode, static_cast<float>(deltaTime),
+                                sculptAngleDegrees, sculptGradeDegrees);
                             waterSim.updateTerrainArea(terrain->terrainManager, lastRayHitPos.x, lastRayHitPos.z, brushRadius);
                             terrain->updateWaterMapTexture(waterSim.getTextureData());
                         }
                     }
-                    else if (editorBrushMode >= 5 && editorBrushMode <= 7) { // Paint modes (5=Paint Road, 6=Paint River, 7=Erase)
+                    else if (activeEditorMode == 2 && editorBrushMode == 6) { // Fit terrain to the road bed
+                        RoadMeshBuilder* roadMesh = terrain->getRoadMeshBuilder();
+                        static bool shapingRoadBed = false;
+                        if (leftMouseDown && terrain->terrainManager && roadMesh) {
+                            shapingRoadBed = true;
+                            // Cuts where the ground is above the asphalt and fills where
+                            // it is below, so the graded rise shows on the terrain itself.
+                            terrain->terrainManager->conformTerrainToRoadMesh(
+                                lastRayHitPos.x, lastRayHitPos.z, brushRadius, brushStrength,
+                                static_cast<float>(deltaTime), roadMesh->debugVertices(),
+                                roadMesh->debugIndices());
+                        } else if (shapingRoadBed) {
+                            // Re-seat the ribbon on release, not every frame: doing it
+                            // per frame made the conform chase terrain it had just
+                            // lowered, sinking the road a little further on each pass.
+                            shapingRoadBed = false;
+                            if (terrain->terrainManager)
+                                terrain->terrainManager->logHeightfieldSignature("brush/RELEASE-before-snap");
+                            terrain->snapRoadsToRenderedTerrain();
+                        }
+                    }
+                    else if (activeEditorMode == 3 && editorBrushMode >= 7 && editorBrushMode <= 9) { // Paint modes
                         if (leftMouseDown && terrain->terrainManager) {
-                            int paintIdx = (editorBrushMode == 5) ? 1 : ((editorBrushMode == 6) ? 2 : 0);
+                            int paintIdx = (editorBrushMode == 7) ? 1 : ((editorBrushMode == 8) ? 2 : 0);
                             terrain->terrainManager->paint(lastRayHitPos.x, lastRayHitPos.z, brushRadius, brushStrength, paintIdx, static_cast<float>(deltaTime));
                         }
                     }
@@ -977,6 +1147,8 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     terrain->lastRayHitPos = lastRayHitPos;
     terrain->editorBrushMode = editorBrushMode;
     terrain->brushRadius = brushRadius;
+    terrain->editorSculptDirectionDegrees = sculptAngleDegrees;
+    terrain->editorSculptGradeDegrees = sculptGradeDegrees;
 
     // Rebuild the road ribbon mesh after any road edit operation
     if (roadGraphDirty) {
@@ -1179,6 +1351,24 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
         glm::vec3(camForward.x, camForward.y, camForward.z),
         glm::vec3(0.0f, 1.0f, 0.0f)
     );
+
+    if (profileUpdate) {
+        recordPhase(perf.otherMs);
+        perf.elapsed += deltaTime;
+        ++perf.frames;
+        if (perf.elapsed >= 0.5) {
+            const double scale = 1.0 / static_cast<double>(perf.frames);
+            std::cout << "[UPDATE PERF] avg ms: prep=" << perf.prepMs * scale
+                      << " characters=" << perf.charactersMs * scale
+                      << " car=" << perf.carMs * scale
+                      << " camera=" << perf.cameraMs * scale
+                      << " terrain=" << perf.terrainMs * scale
+                      << " waterStep=" << perf.waterStepMs * scale
+                      << " waterUpload=" << perf.waterUploadMs * scale
+                      << " other=" << perf.otherMs * scale << '\n';
+            perf = {};
+        }
+    }
 }
 
 // void Game::render() {
@@ -1247,6 +1437,53 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
      
 // }
 void Game::render() {
+    using RenderPerfClock = std::chrono::steady_clock;
+    static const bool profileRender = std::getenv("FALLAGA_RENDER_PERF") != nullptr;
+    static GLuint gpuTimerQueries[4] = {};
+    static bool gpuTimerPending[4] = {};
+    static int gpuTimerFrame = 0;
+    static int gpuTimerSamples = 0;
+    static double gpuTimerAccumulatedMs = 0.0;
+    int activeGpuTimerSlot = -1;
+    if (profileRender && GLEW_ARB_timer_query) {
+        if (gpuTimerQueries[0] == 0) glGenQueries(4, gpuTimerQueries);
+        const int slot = gpuTimerFrame++ % 4;
+        if (gpuTimerPending[slot]) {
+            GLuint available = GL_FALSE;
+            glGetQueryObjectuiv(gpuTimerQueries[slot], GL_QUERY_RESULT_AVAILABLE, &available);
+            if (available == GL_TRUE) {
+                GLuint64 elapsedNs = 0;
+                glGetQueryObjectui64v(gpuTimerQueries[slot], GL_QUERY_RESULT, &elapsedNs);
+                gpuTimerAccumulatedMs += static_cast<double>(elapsedNs) / 1000000.0;
+                gpuTimerPending[slot] = false;
+                if (++gpuTimerSamples >= 60) {
+                    std::cout << "[RENDER GPU PERF] avg ms: "
+                              << gpuTimerAccumulatedMs / gpuTimerSamples << '\n';
+                    gpuTimerSamples = 0;
+                    gpuTimerAccumulatedMs = 0.0;
+                }
+            }
+        }
+        if (!gpuTimerPending[slot]) {
+            activeGpuTimerSlot = slot;
+            glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[slot]);
+        }
+    }
+    RenderPerfClock::time_point renderPhaseStart{};
+    double skyRenderMs = 0.0;
+    double preTerrainRenderMs = 0.0;
+    double terrainRenderMs = 0.0;
+    double objectsRenderMs = 0.0;
+    double waterRenderMs = 0.0;
+    double renderPostMs = 0.0;
+    auto recordRenderPhase = [&](double& bucketMs) {
+        if (!profileRender) return;
+        const auto now = RenderPerfClock::now();
+        bucketMs += std::chrono::duration<double, std::milli>(now - renderPhaseStart).count();
+        renderPhaseStart = now;
+    };
+    if (profileRender) renderPhaseStart = RenderPerfClock::now();
+
     // 1. Reset Buffer and Global States
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
@@ -1276,6 +1513,7 @@ void Game::render() {
         lightDir = glm::normalize(glm::vec3(0.2f, 0.96f, 0.2f));
     }
     sky->render(projection, view, lightDir);
+    recordRenderPhase(skyRenderMs);
 
     // 4. Load Matrices into the Legacy Pipeline
     glMatrixMode(GL_PROJECTION);
@@ -1320,7 +1558,9 @@ void Game::render() {
     // Eliminates duplicate terrain render pass, saving ~8-12ms per frame.
 
     // 6. Render Terrain (opaque pass - terrain chunks, city walls, landmarks, and editor preview)
+    recordRenderPhase(preTerrainRenderMs);
     terrain->renderOpaque(projection, view, cameraPosition, lightDir, lColor, selectedPlacedIdx, (activeEditorMode == 1), selectedAssetIdx, previewAngle, previewScale, false);
+    recordRenderPhase(terrainRenderMs);
 
     // ── PROJECTED REFERENCE MAP ON THE TERRAIN (road edit mode, reference only) ──
     if (editMode && activeEditorMode == 5) {
@@ -1511,6 +1751,7 @@ void Game::render() {
                 tempSeg.type = (RoadType)roadDrawType;
                 tempSeg.width = roadDrawWidth;
                 tempSeg.shoulderWidth = roadDrawShoulder;
+                tempSeg.cornerRadius = roadDrawCornerRadius;
                 for (const auto& p : preview) {
                     RoadPoint rp; rp.pos.x = p.x; rp.pos.y = p.z;
                     tempSeg.controlPoints.push_back(rp);
@@ -1624,6 +1865,7 @@ void Game::render() {
     }
 
     player->render(projection, view, lightDir, lColor, camera);
+    recordRenderPhase(objectsRenderMs);
 
     // ── BLIT SCENE COLOR TO REFRACTION FBO (0.05ms hardware blit - replaces entire second world render pass!) ──
     if (terrain->fbosReady && terrain->refrFBO) {
@@ -1636,6 +1878,7 @@ void Game::render() {
 
     // 8. Render Water (transparent pass - after all opaque objects)
     terrain->renderWater(projection, view, cameraPosition, lightDir, lColor, 0, 0);
+    recordRenderPhase(waterRenderMs);
 
     // --- PHASE 8.5: EDITOR HUD & GLOBAL STATUS OVERLAYS ---
     if (editMode || isSavingState) {
@@ -1786,9 +2029,9 @@ void Game::render() {
             drawStr(lpX + 15, lpY + 19, "TERRAIN SCULPTING", 0.9f, 0.5f, 0.1f);
             
             drawStr(lpX + 15, lpY + 40, "ACTIVE SCULPT TOOL", 0.9f, 0.5f, 0.1f);
-            std::string toolNames[] = { "Raise Terrain (LMB)", "Lower Terrain (LMB)", "Smooth Terrain (LMB)", "Erode Terrain (LMB)" };
-            for (int i = 0; i < 4; ++i) {
-                float btnY = lpY + 45 + i * 25;
+            std::string toolNames[] = { "Raise Terrain (LMB)", "Lower Terrain (LMB)", "Smooth Terrain (LMB)", "Erode Terrain (LMB)", "Angle Slope (LMB)", "Fit To Curved Road Mesh (LMB)" };
+            for (int i = 0; i < 6; ++i) {
+                float btnY = lpY + 45 + i * 22;
                 bool isCurrent = (editorBrushMode == 1 + i);
                 if (isCurrent) {
                     drawRect(lpX + 8, btnY - 2, lpW - 16, 20, 0.89f, 0.36f, 0.13f, 0.9f);
@@ -1801,7 +2044,7 @@ void Game::render() {
             }
 
             // Brush Settings Sliders
-            float sliderStartY = lpY + 155;
+            float sliderStartY = lpY + 180;
             drawStr(lpX + 15, sliderStartY + 10, "BRUSH CONFIGURATION", 0.9f, 0.5f, 0.1f);
             
             float rNorm = glm::clamp((brushRadius - 5.0f) / 195.0f, 0.0f, 1.0f);
@@ -1816,8 +2059,20 @@ void Game::render() {
             drawRectOutline(lpX + 15, sliderStartY + 67, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
             drawRect(lpX + 15 + sNorm * (lpW - 40), sliderStartY + 64, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
 
+            float aNorm = glm::clamp(sculptAngleDegrees / 360.0f, 0.0f, 1.0f);
+            drawStr(lpX + 15, sliderStartY + 94, "Direction: " + std::to_string((int)sculptAngleDegrees) + " deg", 0.8f, 0.8f, 0.8f);
+            drawRect(lpX + 15, sliderStartY + 99, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
+            drawRectOutline(lpX + 15, sliderStartY + 99, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
+            drawRect(lpX + 15 + aNorm * (lpW - 40), sliderStartY + 96, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
+
+            float gNorm = glm::clamp(sculptGradeDegrees / 60.0f, 0.0f, 1.0f);
+            drawStr(lpX + 15, sliderStartY + 126, "Grade: " + std::to_string((int)sculptGradeDegrees) + " deg", 0.8f, 0.8f, 0.8f);
+            drawRect(lpX + 15, sliderStartY + 131, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
+            drawRectOutline(lpX + 15, sliderStartY + 131, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
+            drawRect(lpX + 15 + gNorm * (lpW - 40), sliderStartY + 128, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
+
             // Global Actions Section
-            float globalStartY = sliderStartY + 90;
+            float globalStartY = sliderStartY + 150;
             drawStr(lpX + 15, globalStartY + 10, "GLOBAL ACTIONS", 0.9f, 0.5f, 0.1f);
             
             // Button - highlight on hover could be cool, but standard UE orange button is great!
@@ -1832,7 +2087,7 @@ void Game::render() {
             std::string toolNames[] = { "Paint Road (Gravel)", "Paint River (Wet Mud)", "Erase Road/River" };
             for (int i = 0; i < 3; ++i) {
                 float btnY = lpY + 45 + i * 25;
-                bool isCurrent = (editorBrushMode == 5 + i);
+                bool isCurrent = (editorBrushMode == 7 + i);
                 if (isCurrent) {
                     drawRect(lpX + 8, btnY - 2, lpW - 16, 20, 0.89f, 0.36f, 0.13f, 0.9f);
                     drawStr(lpX + 18, btnY + 12, toolNames[i], 1.0f, 1.0f, 1.0f);
@@ -1908,7 +2163,7 @@ void Game::render() {
             float resetY = lpY + 185;
             drawRect(lpX + 15, resetY, lpW - 30, 22, 0.20f, 0.08f, 0.08f, 0.9f);
             drawRectOutline(lpX + 15, resetY, lpW - 30, 22, 0.5f, 0.2f, 0.2f);
-            drawStr(lpX + 80, resetY + 15, "Reset to -43.0m", 0.9f, 0.55f, 0.55f);
+            drawStr(lpX + 80, resetY + 15, "Reset to -55.0m", 0.9f, 0.55f, 0.55f);
 
             // Push level to terrain shader every frame
             terrain->setWaterLevel(waterLevelAdjust);
@@ -1984,7 +2239,16 @@ void Game::render() {
                 drawRect(lpX + 78, lpY + 396, 60, 24, 0.10f, 0.18f, 0.12f, 0.9f);
                 drawRectOutline(lpX + 78, lpY + 396, 60, 24, 0.2f, 0.5f, 0.25f);
                 drawStr(lpX + 97, lpY + 411, "+ 0.25", 0.4f, 0.9f, 0.5f);
-                drawStr(lpX + 15, lpY + 430, "LMB click add   click-on-point move", 0.6f, 0.6f, 0.6f);
+                drawStr(lpX + 15, lpY + 430, "CORNER ROUNDING", 0.8f, 0.65f, 0.35f);
+                drawRect(lpX + 150, lpY + 428, 60, 22, 0.18f, 0.12f, 0.10f, 0.9f);
+                drawRectOutline(lpX + 150, lpY + 428, 60, 22, 0.5f, 0.25f, 0.15f);
+                drawStr(lpX + 164, lpY + 443, "- 2m", 0.9f, 0.5f, 0.2f);
+                drawRect(lpX + 216, lpY + 428, 60, 22, 0.10f, 0.18f, 0.12f, 0.9f);
+                drawRectOutline(lpX + 216, lpY + 428, 60, 22, 0.2f, 0.5f, 0.25f);
+                drawStr(lpX + 230, lpY + 443, "+ 2m", 0.4f, 0.9f, 0.5f);
+                std::string drawCurveText = roadDrawCornerRadius > 0.0f
+                    ? std::to_string((int)roadDrawCornerRadius) + "m" : "auto";
+                drawStr(lpX + 280, lpY + 443, drawCurveText, 0.8f, 0.8f, 0.8f);
                 drawStr(lpX + 15, lpY + 445, "click-on-segment insert   drag freehand", 0.6f, 0.6f, 0.6f);
                 drawStr(lpX + 15, lpY + 460, "Enter commit   Esc cancel   Backspace undo", 0.6f, 0.6f, 0.6f);
                 drawStr(lpX + 15, lpY + 475, "Curve+width preview live   S/SHIFT straight", 0.55f, 0.55f, 0.55f);
@@ -2015,13 +2279,13 @@ void Game::render() {
                 }
                 // Drawing status + commit/cancel buttons
                 std::ostringstream dss;
-                if (!roadDraftPoints.empty()) {
-                    dss << "DRAWING " << roadDraftPoints.size() << " pt(s) active";
-                    drawStr(lpX + 15, lpY + 528, dss.str(), 0.85f, 0.95f, 0.45f);
-                } else {
-                    dss << "No drawing yet — click/press terrain to start";
-                    drawStr(lpX + 15, lpY + 528, dss.str(), 0.6f, 0.6f, 0.6f);
-                }
+                dss << (roadDrawClosedLoop ? "ROUND ROAD: ON — click to turn off" : "ROUND ROAD: off — click to close into a loop");
+                drawRect(lpX + 8, lpY + 524, lpW - 16, 20,
+                         roadDrawClosedLoop ? 0.12f : 0.16f,
+                         roadDrawClosedLoop ? 0.34f : 0.16f,
+                         roadDrawClosedLoop ? 0.24f : 0.16f, 0.9f);
+                drawRectOutline(lpX + 8, lpY + 524, lpW - 16, 20, 0.25f, 0.42f, 0.3f);
+                drawStr(lpX + 20, lpY + 538, dss.str(), 0.78f, 0.9f, 0.75f);
                 {
                     float oY = lpY + 548, thirdW = (lpW - 16 - 12) / 3.0f;
                     drawRect(lpX + 8, oY, thirdW, 24, 0.30f, 0.18f, 0.10f, 0.95f);
@@ -2187,7 +2451,25 @@ if (projSaveFlash > 0.0f) {
                         drawStr(lpX + 147, wYb + 15, "+ 10%", 0.4f, 0.9f, 0.5f);
                     }
                     {
-                        float dYb = lpY + 468;
+                        // CORNER RADIUS slider - tracks the CORNER RADIUS input band
+                        // (lpY + 468 .. +490) used by the editor input handler.
+                        float cYb = lpY + 468;
+                        const float trackX0 = lpX + 90.0f, trackW = 210.0f;
+                        drawStr(lpX + 15, lpY + 483, "CORNER", 0.8f, 0.5f, 0.1f);
+                        drawRect(trackX0, cYb + 6, trackW, 10, 0.06f, 0.06f, 0.06f, 1.0f);
+                        drawRectOutline(trackX0, cYb + 6, trackW, 10, 0.25f, 0.25f, 0.25f);
+                        float cNorm = glm::clamp(seg.cornerRadius / 30.0f, 0.0f, 1.0f);
+                        drawRect(trackX0 + cNorm * (trackW - 10.0f), cYb + 3, 10.0f, 16.0f,
+                                 0.89f, 0.36f, 0.13f, 1.0f);
+                        // "auto" at the far left marks 0 = the automatic half-width radius.
+                        drawStr(trackX0 + 2, cYb + 3, "auto", 0.55f, 0.55f, 0.55f);
+                        std::string cVal = seg.cornerRadius > 0.0f
+                            ? std::to_string((int)(seg.cornerRadius * 2.0f + 0.5f) / 2) + "m"
+                            : std::string("auto");
+                        drawStr(trackX0 + trackW - 34, cYb + 3, cVal, 0.9f, 0.5f, 0.2f);
+                    }
+                    {
+                        float dYb = lpY + 498;
                         bool hasPoint = (selectedRoadPointIdx >= 0);
                         drawRect(lpX + 8, dYb, lpW - 16, 24, hasPoint ? 0.32f : 0.22f, 0.09f, 0.09f, 0.95f);
                         drawRectOutline(lpX + 8, dYb, lpW - 16, 24, 0.6f, 0.22f, 0.22f);
@@ -2199,6 +2481,7 @@ if (projSaveFlash > 0.0f) {
                     drawStr(lpX + 15, lpY + 210, "None - click near a road (tool 1)", 0.6f, 0.6f, 0.6f);
                     drawStr(lpX + 15, lpY + 226, "Width +/- and delete buttons appear", 0.55f, 0.55f, 0.55f);
                     drawStr(lpX + 15, lpY + 240, "once a road is selected in the viewport", 0.55f, 0.55f, 0.55f);
+                    drawStr(lpX + 15, lpY + 254, "also a per-road corner radius slider", 0.55f, 0.55f, 0.55f);
                 }
             }
         }
@@ -2605,6 +2888,40 @@ if (projSaveFlash > 0.0f) {
     // 9. Cleanup
     glDisable(GL_LIGHTING);
     glUseProgram(0);
+
+    if (activeGpuTimerSlot >= 0) {
+        glEndQuery(GL_TIME_ELAPSED);
+        gpuTimerPending[activeGpuTimerSlot] = true;
+    }
+
+    recordRenderPhase(renderPostMs);
+    if (profileRender) {
+        static int profileFrames = 0;
+        static double accumulatedSkyMs = 0.0;
+        static double accumulatedPreTerrainMs = 0.0;
+        static double accumulatedTerrainMs = 0.0;
+        static double accumulatedObjectsMs = 0.0;
+        static double accumulatedWaterMs = 0.0;
+        static double accumulatedPostMs = 0.0;
+        accumulatedSkyMs += skyRenderMs;
+        accumulatedPreTerrainMs += preTerrainRenderMs;
+        accumulatedTerrainMs += terrainRenderMs;
+        accumulatedObjectsMs += objectsRenderMs;
+        accumulatedWaterMs += waterRenderMs;
+        accumulatedPostMs += renderPostMs;
+        if (++profileFrames >= 60) {
+            const double scale = 1.0 / profileFrames;
+            std::cout << "[RENDER PERF] avg ms: sky=" << accumulatedSkyMs * scale
+                      << " setup=" << accumulatedPreTerrainMs * scale
+                      << " terrain=" << accumulatedTerrainMs * scale
+                      << " objects=" << accumulatedObjectsMs * scale
+                      << " water=" << accumulatedWaterMs * scale
+                      << " post=" << accumulatedPostMs * scale << '\n';
+            profileFrames = 0;
+            accumulatedSkyMs = accumulatedPreTerrainMs = 0.0;
+            accumulatedTerrainMs = accumulatedObjectsMs = accumulatedWaterMs = accumulatedPostMs = 0.0;
+        }
+    }
 }
 void Game::performSave() {
     isSavingState = true;
@@ -2672,6 +2989,35 @@ void Game::commitRoadDraft() {
         ns.type = (RoadType)roadDrawType;
         ns.width = roadDrawWidth;
         ns.shoulderWidth = roadDrawShoulder;
+        ns.cornerRadius = roadDrawCornerRadius;
+
+        // -- Closed-loop detection -----------------------------------------
+        // When the last draft point coincides with the first (user snapped
+        // back to the start), mark this as a closed ring road so the mesh
+        // builder emits a seamless loop: no seam kink, no texture squash,
+        // no end caps.
+        //
+        // This must stay in step with the auto-detect in RoadSpline::evaluate.
+        // It used to accept any road whose two ends finished within 15 m of each
+        // other, which quietly promoted ordinary L-shaped streets to rings — and a
+        // closed segment is excluded from endpoint clustering, so the road then
+        // connected to nothing at all. Only treat it as a loop when the author
+        // actually landed back on the first point.
+        const float loopThresh = glm::max(1.0f, ns.width * 0.5f);
+        const glm::vec3& dFront = roadDraftPoints.front();
+        const glm::vec3& dBack  = roadDraftPoints.back();
+        float dLoop = std::sqrt((dBack.x - dFront.x) * (dBack.x - dFront.x) +
+                                (dBack.z - dFront.z) * (dBack.z - dFront.z));
+        bool isClosedLoop = ((roadDrawClosedLoop && roadDraftPoints.size() >= 3) ||
+                             (roadDraftPoints.size() >= 4 && dLoop < loopThresh));
+
+        if (isClosedLoop) {
+            // Snap the back point exactly onto the front so the mesh seam is pixel-perfect
+            roadDraftPoints.back() = glm::vec3(dFront.x, dBack.y, dFront.z);
+            ns.closed = true;
+            std::cout << "[Road] Detected closed loop (gap=" << dLoop << "m, thresh=" << loopThresh << "m)\n";
+        }
+
         // Ramer-Douglas-Peucker simplification (2D x/z) so freehand drags don't bake
         // in every 5m sample — keeps drawn roads smooth with far fewer control points.
         auto simplifyDraft = [&](const std::vector<glm::vec3>& pts, float tol) {
@@ -2703,6 +3049,13 @@ void Game::commitRoadDraft() {
         // tolerance scales with road width so narrow medina alleys keep their shape
         float tol = glm::max(1.2f, ns.width * 0.15f);
         std::vector<glm::vec3> simp = simplifyDraft(roadDraftPoints, tol);
+        if (isClosedLoop && simp.size() >= 3) {
+            const glm::vec3& first = simp.front();
+            const glm::vec3& last = simp.back();
+            const float seam = glm::length(glm::vec2(last.x - first.x, last.z - first.z));
+            if (seam > 0.01f) simp.push_back(first);
+            ns.closed = true;
+        }
         const int skipped = (int)roadDraftPoints.size() - (int)simp.size();
         for (const auto& p : simp) {
             RoadPoint rp; rp.pos.x = p.x; rp.pos.y = p.z;
@@ -2713,9 +3066,12 @@ void Game::commitRoadDraft() {
         selectedRoadPointIdx = -1;
         roadGraphDirty = true;
         roadDraftPoints.clear();
+        roadDrawClosedLoop = false;
         draftDragIdx = -1;
+        draftInsertNewly = false;
         std::cout << "[Road] Committed road id=" << ns.id
                   << " (" << ns.controlPoints.size() << " control points"
+                  << (ns.closed ? ", CLOSED LOOP" : "")
                   << (skipped > 0 ? ", auto-simplified " + std::to_string(skipped) + " pts" : "") << ")\n";
     } else {
         std::cout << "[Road] Need at least 2 draft points to commit\n";
@@ -2864,7 +3220,7 @@ void Game::keyDown(int key) {
                 if (rgw && selectedRoadIdx >= 0 && selectedRoadIdx < (int)rgw->segments.size()) {
                     float f = (key == GLFW_KEY_EQUAL) ? 1.1f : 1.0f / 1.1f;
                     auto& seg = rgw->segments[selectedRoadIdx];
-                    seg.width = glm::clamp(seg.width * f, 2.0f, 40.0f);
+                    seg.width = glm::clamp(seg.width * f, 2.0f, 20.0f);
                     roadGraphDirty = true;
                     std::cout << "[Road] Selected width -> " << seg.width << "m (id=" << seg.id << ")\n";
                 } else {
@@ -2929,10 +3285,10 @@ void Game::keyDown(int key) {
         }
 
         if (key == GLFW_KEY_B) {
-            editorBrushMode = (editorBrushMode + 1) % 8;
+            editorBrushMode = (editorBrushMode + 1) % 10;
             std::string modeNames[] = {
-                "Select / Move", "Sculpt Raise", "Sculpt Lower", "Sculpt Smooth", "Sculpt Erode (Hydraulic)",
-                "Paint Road (Gravel)", "Paint River (Wet Mud)", "Paint Erase"
+                "Select / Move", "Sculpt Raise", "Sculpt Lower", "Sculpt Smooth", "Sculpt Erode (Hydraulic)", "Sculpt Angle Slope",
+                "Fit Terrain Under Roads", "Paint Road (Gravel)", "Paint River (Wet Mud)", "Paint Erase"
             };
             std::cout << "[Brush] Mode changed to: " << modeNames[editorBrushMode] << "\n";
             return;

@@ -7,14 +7,17 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
+#include <cctype>
 
 #include "AudioSystem.h"
 #include "Camera.h"
 #include "Car.h"
+#include "CarHandling.h"
 #include "Character.h"
 #include "ObjectModel.h"
 #include "Shader.h"
 #include "Terrain.h"
+#include "vehicle/VehicleBody.h"
 
 // ================================================================
 // MESH RESOLVER
@@ -34,7 +37,8 @@ void Car::resolveWheelMeshes() {
   const int total = model->getMeshCount();
   std::cout << "[Car] " << total << " meshes:\n";
   for (int i = 0; i < total; i++)
-    std::cout << "  [" << i << "] \"" << model->getMeshName(i) << "\"\n";
+    std::cout << "  [" << i << "] node=\"" << model->getMeshNodeName(i)
+              << "\" mesh=\"" << model->getMeshName(i) << "\"\n";
 
   // Sort meshes by their AABB volume to identify body vs wheels
   struct MeshInfo {
@@ -55,17 +59,34 @@ void Car::resolveWheelMeshes() {
     return a.volume > b.volume;
   });
 
-  // The largest mesh is the body
+  // Prefer the explicit FBX part names. The generic mesh names (Mesh.001,
+  // Mesh.002, ...) do not identify the wheels or body in this asset.
+  const auto containsToken = [](std::string value, const char *token) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value.find(token) != std::string::npos;
+  };
+  std::vector<MeshInfo> namedWheels;
+  for (const auto &info : infos) {
+    const std::string nodeName = model->getMeshNodeName(info.index);
+    if (containsToken(nodeName, "body")) meshBody = info.index;
+    if (containsToken(nodeName, "weel") || containsToken(nodeName, "wheel"))
+      namedWheels.push_back(info);
+  }
+
+  // The largest mesh is the fallback body when an asset has no named body.
   if (!infos.empty()) {
-    meshBody = infos[0].index;
+    if (meshBody < 0) meshBody = infos[0].index;
     std::cout << "[Car] Resolved Body mesh index: " << meshBody << " (volume=" << infos[0].volume << ")\n";
   }
 
   // Filter out the body (and any door/other large parts) to find wheels.
   // The wheels are the 4 meshes with the smallest, similar volumes.
-  std::vector<MeshInfo> candidates;
-  for (size_t i = 1; i < infos.size(); i++) {
-    candidates.push_back(infos[i]);
+  std::vector<MeshInfo> candidates = namedWheels;
+  if (candidates.size() != 4) {
+    candidates.clear();
+    for (const auto &info : infos)
+      if (info.index != meshBody) candidates.push_back(info);
   }
 
   // Sort candidates by volume ascending
@@ -124,7 +145,9 @@ void Car::resolveWheelMeshes() {
       const auto &w = wheelInfos[i];
       const glm::vec3 &stdC = stdCenters[i];
       bool f = stdC.z < mz; // Front (model faces negative Z)
-      bool l = stdC.x < mx; // Left
+      // The body render transform includes a 180-degree Y rotation, so
+      // negative model-space X becomes the vehicle's world-space left side.
+      bool l = CarHandling::modelSpaceXIsVehicleLeft(stdC.x, mx);
       if (f && l) meshFL = w.index;
       else if (f && !l) meshFR = w.index;
       else if (!f && l) meshBL = w.index;
@@ -189,41 +212,7 @@ void Car::resolveWheelMeshes() {
 }
 
 // SECTION 4 — PACEJKA TIRE MODEL
-// ================================================================
-float Car::tireForce(float slip, float load) {
-  // Sim-Cade Tire Parameters (High grip, forgiving slide)
-  // B: Stiffness, C: Shape, E: Curvature
-  const float B = 10.0f, C = 1.3f, E = 1.0f;
-  return load * std::sin(C * std::atan(B * slip -
-                                       E * (B * slip - std::atan(B * slip))));
-}
-
-float Car::getSpeed() const {
-  return std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-}
-
-// SECTION 8 — Surface grip from terrain zone
-static float surfaceGrip(Terrain *t, float x, float z) {
-  switch (t->getZoneAt(x, z)) {
-  case Terrain::Zone::SEA:
-    return 0.10f;
-  case Terrain::Zone::BEACH:
-    return 0.55f;
-  case Terrain::Zone::PLAIN:
-    return 0.85f;
-  case Terrain::Zone::WADI:
-    return 0.70f;
-  case Terrain::Zone::PORT:
-  case Terrain::Zone::MEDINA:
-  case Terrain::Zone::VILLE_NOUVELLE:
-  case Terrain::Zone::KASBAH:
-    return 1.10f;
-  default:
-    return 0.90f;
-  }
-}
-
-// Wheel contact patch XZ (YAW ONLY — pitch/roll are outputs, not inputs)
+// ================================================================// SECTION 8 — Surface grip from terrain zone// Wheel contact patch XZ (YAW ONLY — pitch/roll are outputs, not inputs)
 glm::vec3 Car::getWheelWorld(const glm::vec3 &lo) const {
   glm::vec3 rel = (lo - carCenter) * SCALE_FACTOR;
   glm::vec3 rotatedRel = rotation * rel;
@@ -246,6 +235,8 @@ glm::vec3 Car::getWheelContactPatch(const glm::vec3 &lo) const {
 // CONSTRUCTOR / DESTRUCTOR
 // ================================================================
 Car::Car(State initialState) : isGrounded(true), state(initialState) {
+  if (!loadVehicleConfigJson("assets/cars/renault_40cv.json", drivingConfig))
+    std::cerr << "[Car] Failed to load Renault 40 CV tuning; using defaults.\n";
   position = Vec3(4110.0f, -46.5f, -60.0f);
   velocity = Vec3(0, 0, 0);
   angularVel = glm::vec3(0);
@@ -282,7 +273,25 @@ Car::Car(State initialState) : isGrounded(true), state(initialState) {
   carInstanceCount++;
 
   resolveWheelMeshes();
-  std::cout << "[Car] Instance " << carInstanceCount << " Ready.\n";
+  m_Wheelbase = drivingConfig.wheelbaseM;
+  m_TrackWidth = drivingConfig.trackWidthM;
+  SPRING_K = drivingConfig.springRateNPerM;
+  SPRING_DAMPING = drivingConfig.compressionDampingNsPerM;
+  engine.minRPM = drivingConfig.idleRpm;
+  engine.maxRPM = drivingConfig.maxRpm;
+  engine.finalDrive = drivingConfig.finalDrive;
+  engine.gearRatios = drivingConfig.gearRatios;
+  engine.torquePoints = drivingConfig.engineTorqueCurve;
+  engine.rpm = engine.minRPM;
+  const glm::vec3 chassisHalfExtents(
+      std::max(0.55f, m_TrackWidth * 0.48f), 0.48f,
+      std::max(0.9f, m_Wheelbase * 0.48f));
+  vehicleBody = std::make_unique<VehicleBody>(
+      drivingConfig.massKg, chassisHalfExtents,
+      drivingConfig.centerOfMassDropM, drivingConfig.yawInertiaKgM2);
+  std::cout << "[Car] Instance " << carInstanceCount << " Ready. Config="
+            << drivingConfig.id << " Mass=" << drivingConfig.massKg
+            << " kg.\n";
 }
 Car::~Car() {
   carInstanceCount--;
@@ -302,12 +311,13 @@ void Car::updateIdlePhysics(float dt, Terrain *terrain) {
   float h[4];
   for (int i = 0; i < 4; i++) {
     glm::vec3 cp = getWheelContactPatch(wheels[i].localPos);
-    h[i] = terrain->getHeight(cp.x, cp.z);
+    h[i] = terrain->getGroundSurfaceHeight(cp.x, cp.z);
   }
 
   // ── Vertical position: snap car center so wheels rest on ground ─────────
   float avgH = (h[0] + h[1] + h[2] + h[3]) * 0.25f;
-  float equilibriumCompression = (MASS * 9.81f * 0.25f) / SPRING_K;
+  float equilibriumCompression =
+      (drivingConfig.massKg * 9.81f * 0.25f) / SPRING_K;
   float rideHeight = wheels[0].suspensionRest - equilibriumCompression;
   float targetY = avgH + wheels[0].radius + rideHeight;
 
@@ -446,7 +456,7 @@ void Car::update(float dt, Terrain *terrain, float totalTime, Camera *camera) {
     float h[4];
     for (int i = 0; i < 4; i++) {
       glm::vec3 cp = getWheelContactPatch(wheels[i].localPos);
-      h[i] = terrain->getHeight(cp.x, cp.z);
+      h[i] = terrain->getGroundSurfaceHeight(cp.x, cp.z);
     }
     float avgH = (h[0] + h[1] + h[2] + h[3]) * 0.25f;
     
@@ -455,7 +465,8 @@ void Car::update(float dt, Terrain *terrain, float totalTime, Camera *camera) {
     rollAngle = std::atan2((h[1] + h[3]) * 0.5f - (h[0] + h[2]) * 0.5f, m_TrackWidth);
     
     // Calculate position.y to place wheels at equilibrium ride height
-    float equilibriumCompression = (MASS * (-GRAVITY) * 0.25f) / SPRING_K;
+    float equilibriumCompression =
+        (drivingConfig.massKg * (-GRAVITY) * 0.25f) / SPRING_K;
     float rideHeight = wheels[0].suspensionRest - equilibriumCompression;
     
     // Start from center ground height + radius + ride height
@@ -484,28 +495,60 @@ void Car::update(float dt, Terrain *terrain, float totalTime, Camera *camera) {
               << "\n  h={";
     for (int i = 0; i < 4; i++) std::cout << h[i] << (i<3?",":"");
     std::cout << "} pitch=" << pitchAngle << " roll=" << rollAngle
-              << " MASS=" << MASS << " SPRING_K=" << SPRING_K << "\n";
+              << " MASS=" << drivingConfig.massKg
+              << " SPRING_K=" << SPRING_K << "\n";
   }
 
   if (state == State::ROAMING) {
     updateRoamingAI(dt, terrain, totalTime);
   }
 
-  // Fixed 120Hz update loop
-  physicsAccumulator += dt;
-  const float physicsStep = 1.0f / 120.0f;
-  
-  if (physicsAccumulator > 0.25f) {
-    physicsAccumulator = 0.25f;
+  // Build/recenter the terrain collider incrementally once per rendered frame.
+  // The old path sampled 16,641 heights and rebuilt Bullet's full BVH in one
+  // physics substep, causing visible stalls on entry and again while driving.
+  const TerrainHeightQuery heightAt = [terrain](float x, float z) {
+    return terrain->getGroundSurfaceHeight(x, z);
+  };
+  vehicleBody->prepareTerrainCollision(
+      heightAt, glm::vec3(position.x, position.y, position.z));
+
+  // Mounting and dismounting are animation-only transitions. Keep the parked
+  // chassis still until the enter animation finishes, and while exiting.
+  if (state == State::DRIVEN && m_Driver && !m_Driver->isDriving()) {
+    physicsAccumulator = 0.0f;
+    return;
   }
 
-  while (physicsAccumulator >= physicsStep) {
+  // Fixed 120Hz update loop. Bound catch-up work so one hitch cannot force a
+  // long burst of physics steps and make the next frame miss its deadline too.
+  const float physicsStep = 1.0f / 120.0f;
+  constexpr int maxPhysicsStepsPerFrame = 8;
+  const float maxPhysicsBacklog = physicsStep * maxPhysicsStepsPerFrame;
+  physicsAccumulator = std::min(
+      physicsAccumulator + std::max(0.0f, dt), maxPhysicsBacklog);
+
+  int physicsSteps = 0;
+  while (physicsAccumulator >= physicsStep &&
+         physicsSteps < maxPhysicsStepsPerFrame) {
+    previousRenderPosition = glm::vec3(position.x, position.y, position.z);
+    previousRenderRotation = rotation;
+    previousRenderSteerAngle = steerAngle;
+    previousRenderDriftAngle = driftAngle;
+    for (int i = 0; i < 4; ++i) {
+      previousRenderWheelLength[i] = wheels[i].currentLength;
+      previousRenderWheelSpin[i] = wheels[i].spinAngle;
+    }
+    hasPreviousRenderState = true;
+
     if (state == State::PARKED) {
       updateIdlePhysics(physicsStep, terrain);
+    } else if (state == State::DRIVEN && m_Driver && m_Driver->isDriving()) {
+      updatePlayerArcadePhysics(physicsStep, terrain);
     } else {
       updateActivePhysics(physicsStep, terrain);
     }
     physicsAccumulator -= physicsStep;
+    ++physicsSteps;
   }
 }
 
@@ -518,470 +561,7 @@ glm::vec3 Car::getForwardVector() const {
 }
 glm::vec3 Car::getRightVector() const {
   return rotation * glm::vec3(1.0f, 0.0f, 0.0f);
-}
-
-void Car::processInput(float dt, bool &gas, bool &braking, bool &handbrake) {
-  if (!m_Driver || !m_Driver->isDriving()) return;
-
-
-  gas = m_Driver->keys['w'] || m_Driver->keys['W'] || m_Driver->keys['z'] ||
-        m_Driver->keys['Z'];
-  braking = m_Driver->keys['s'] || m_Driver->keys['S'];
-  bool left = m_Driver->keys['a'] || m_Driver->keys['A'] ||
-              m_Driver->keys['q'] || m_Driver->keys['Q'];
-  bool right = m_Driver->keys['d'] || m_Driver->keys['D'];
-  handbrake = glfwGetKey(glfwGetCurrentContext(), GLFW_KEY_SPACE) == GLFW_PRESS;
-
-  // 1. Speed-Sensitive Steering (GTA Style)
-  float speed = getSpeed();
-  float speedFactor = glm::clamp(1.0f - (speed * 0.022f), 0.35f, 1.0f);
-  float targetSteer = (left ? 1.0f : 0.0f) - (right ? 1.0f : 0.0f);
-  
-  float maxSteer = MAX_STEER_ANGLE * speedFactor;
-  float steerSpeed = 7.5f;
-  
-  steerAngle += (targetSteer * maxSteer - steerAngle) * (1.0f - std::exp(-steerSpeed * dt));
-
-  // 2. Horn Input (F Key)
-  if (glfwGetKey(glfwGetCurrentContext(), GLFW_KEY_F) == GLFW_PRESS) {
-    AudioSystem::getInstance().playHorn(glm::vec3(position.x, position.y, position.z));
-  } else {
-    AudioSystem::getInstance().stopHorn();
-  }
-}
-
-void Car::updateTransmission(float dt, bool gas, bool braking) {
-  float currentSpeedKmh = getSpeed() * 3.6f;
-
-  if (currentSpeedKmh < 2.0f) {
-    if (gas && engine.gear <= 1)
-      engine.gear = 2; // Shift to 1st
-    if (braking && engine.gear != 0)
-      engine.gear = 0; // Shift to Reverse
-  }
-
-  if (engine.gear >= 2) {
-    if (engine.rpm > 6000.0f && engine.gear < 7) {
-      engine.gear++;
-      engine.rpm -= 1500.0f;
-    } else if (engine.rpm < 2500.0f && engine.gear > 2 &&
-               currentSpeedKmh > 10.0f) {
-      engine.gear--;
-      engine.rpm += 1000.0f;
-    }
-  }
-
-  if (engine.gear == 0) { // Reverse
-    engine.throttle = braking ? 1.0f : 0.0f;
-  } else { // Forward
-    engine.throttle = gas ? 1.0f : 0.0f;
-  }
-
-  float avgWheelAV =
-      (wheels[2].angularVelocity + wheels[3].angularVelocity) * 0.5f;
-  float targetRPM = std::abs(avgWheelAV * engine.gearRatios[engine.gear]) *
-                    engine.finalDrive * 9.5493f;
-  engine.rpm += (std::max(engine.minRPM, targetRPM) - engine.rpm) *
-                (1.0f - std::exp(-5.0f * dt));
-  engine.rpm = glm::clamp(engine.rpm, engine.minRPM, engine.maxRPM);
-}
-
-void Car::updateSuspension(float sdt, Terrain *terrain, glm::vec3 &totalForce, glm::vec3 &totalTorque) {
-  glm::vec3 chassisUp = rotation * glm::vec3(0.0f, 1.0f, 0.0f);
-
-  for (int i = 0; i < 4; i++) {
-    glm::vec3 wp = getWheelWorld(wheels[i].localPos);
-    glm::vec3 cp = getWheelContactPatch(wheels[i].localPos);
-    float groundH = terrain->getHeight(cp.x, cp.z);
-
-    float distToGround = wp.y - groundH;
-    wheels[i].currentLength = glm::clamp(distToGround - wheels[i].radius, 0.0f,
-                                         wheels[i].suspensionRest);
-    wheels[i].compression = wheels[i].suspensionRest - wheels[i].currentLength;
-
-    float compVel = (wheels[i].prevLength - wheels[i].currentLength) / sdt;
-    wheels[i].prevLength = wheels[i].currentLength;
-
-    float damping = (compVel > 0.0f) ? SPRING_DAMPING : (SPRING_DAMPING * 1.5f);
-    float springF = wheels[i].compression * SPRING_K + compVel * damping;
-
-    // Cap the force to prevent physics explosions
-    float maxSpringF = MASS * 20.0f;
-    if (springF > maxSpringF)
-      springF = maxSpringF;
-    if (springF < 0.0f)
-      springF = 0.0f;
-
-    wheels[i].load = springF;
-    
-    if (wheels[i].compression > 0.02f) {
-      wheels[i].grounded = true;
-      isGrounded = true;
-    } else {
-      wheels[i].grounded = false;
-    }
-
-    glm::vec3 forceVec = chassisUp * springF;
-    totalForce += forceVec;
-
-    glm::vec3 rel = wp - glm::vec3(position.x, position.y, position.z);
-    totalTorque += glm::cross(rel, forceVec);
-  }
-}
-
-void Car::calculateTireForces(float sdt, Terrain *terrain,
-                              glm::vec3 &totalForce, glm::vec3 &totalTorque) {
-  bool handbrake = false;
-  bool braking = false;
-  bool gas = false;
-
-  if (state == State::DRIVEN && m_Driver && m_Driver->isDriving()) {
-    gas = m_Driver->keys['w'] || m_Driver->keys['W'] || m_Driver->keys['z'] ||
-          m_Driver->keys['Z'];
-    braking = m_Driver->keys['s'] || m_Driver->keys['S'];
-    handbrake = glfwGetKey(glfwGetCurrentContext(), GLFW_KEY_SPACE) == GLFW_PRESS;
-  } else if (state == State::ROAMING) {
-    gas = (engine.throttle > 0.1f);
-  }
-
-  float engineTorque = engine.torqueCurve(engine.rpm) * engine.throttle;
-  float driveTorque = engineTorque * engine.gearRatios[engine.gear] *
-                      engine.finalDrive * engine.clutch;
-
-  // Power split: RWD-biased AWD
-  float torqueSplit[4] = {
-    driveTorque * 0.15f, // FL
-    driveTorque * 0.15f, // FR
-    driveTorque * 0.35f, // RL
-    driveTorque * 0.35f  // RR
-  };
-
-  for (int i = 0; i < 4; i++) {
-    glm::vec3 wp = getWheelWorld(wheels[i].localPos);
-    glm::vec3 cp = getWheelContactPatch(wheels[i].localPos);
-    glm::vec3 rel = wp - glm::vec3(position.x, position.y, position.z);
-    
-    // World velocity of the contact patch
-    glm::vec3 wVel = glm::vec3(velocity.x, velocity.y, velocity.z) +
-                     glm::cross(angularVel, rel);
-
-    float wYaw = yaw + (wheels[i].isFront ? steerAngle : 0.0f);
-    glm::vec3 tireFwd(-std::sin(wYaw), 0.0f, std::cos(wYaw));
-    glm::vec3 tireRgt(std::cos(wYaw), 0.0f, std::sin(wYaw));
-
-    float vLong = glm::dot(wVel, tireFwd);
-    float vLat = glm::dot(wVel, tireRgt);
-
-    float roadFactor = terrain->getRoadAt(cp.x, cp.z);
-    float grip = surfaceGrip(terrain, cp.x, cp.z) * (1.0f + roadFactor * 0.4f);
-
-    // --- REALISTIC WHEEL SPIN PHYSICS ---
-    float omega = wheels[i].angularVelocity;
-    
-    // Calculate slip ratio
-    float slip = 0.0f;
-    float absVLong = std::abs(vLong);
-    if (absVLong > 0.1f) {
-        slip = (omega * wheels[i].radius - vLong) / absVLong;
-    } else {
-        // Low speed slip approximation to avoid division by zero
-        slip = (omega * wheels[i].radius - vLong) / 0.1f;
-    }
-    
-    // Pacejka longitudinal tire force
-    float fx_tire = tireForce(slip, wheels[i].load) * grip;
-
-    // Torques acting on the wheel
-    float T_drive = wheels[i].isDriven ? torqueSplit[i] : 0.0f;
-    
-    float T_brake = 0.0f;
-    if (handbrake && !wheels[i].isFront) {
-        T_brake = 8000.0f;
-    } else if (braking) {
-        T_brake = wheels[i].isFront ? 5000.0f : 3000.0f;
-    } else if (std::abs(engine.throttle) < 0.1f) {
-        T_brake = 400.0f; // Engine drag
-    }
-    T_brake += 50.0f; // Rolling resistance torque
-
-    // Net torque on the wheel
-    // The tire force creates a reaction torque opposing the wheel spin: -fx_tire * radius
-    // Braking torque always opposes the spin direction: -T_brake * sign(omega)
-    float signOmega = (omega > 0.05f) ? 1.0f : ((omega < -0.05f) ? -1.0f : 0.0f);
-    if (signOmega == 0.0f && T_brake > std::abs(T_drive)) {
-        // If wheel is stopped and braking torque dominates, keep it locked
-        omega = 0.0f;
-    } else {
-        float T_reaction = -fx_tire * wheels[i].radius;
-        float T_net = T_drive - T_brake * signOmega + T_reaction;
-        
-        // Wheel rotational inertia (I = 0.5 * m * r^2)
-        // A typical car wheel has I ~ 1.2 kg*m^2
-        float I_wheel = 1.2f;
-        float omega_dot = T_net / I_wheel;
-        
-        omega += omega_dot * sdt;
-        
-        // If we cross zero while braking, lock the wheel
-        if (signOmega != 0.0f && ((omega > 0.0f) != (signOmega > 0.0f)) && T_brake > std::abs(T_drive)) {
-            omega = 0.0f;
-        }
-    }
-    
-    wheels[i].angularVelocity = omega;
-    wheels[i].spinAngle += omega * sdt;
-
-    // Apply the real tire force to the chassis
-    float fx = fx_tire;
-
-    // 2. Calculate lateral force (-Vs * Grip)
-    float latGripMult = 1.0f;
-    if (handbrake && !wheels[i].isFront) {
-      latGripMult = 0.35f; // Slide the rear!
-    }
-    float fy = -vLat * 2.5f * latGripMult * wheels[i].load * grip;
-
-    // 3. Friction Circle limit
-    float maxF = wheels[i].load * grip * 2.0f;
-    float totalTireF = std::sqrt(fx * fx + fy * fy);
-    if (totalTireF > maxF && totalTireF > 0.001f) {
-      float ratio = maxF / totalTireF;
-      fx *= ratio;
-      fy *= ratio;
-    }
-
-    glm::vec3 wForce = tireFwd * fx + tireRgt * fy;
-    totalForce += wForce;
-
-    // Torque: lower the center of mass leverage arm to prevent roll-overs
-    glm::vec3 torqueRel = rel;
-    torqueRel.y *= 0.3f;
-    totalTorque += glm::cross(torqueRel, wForce);
-
-    // Store debug data
-    wheels[i].fx = fx;
-    wheels[i].fy = fy;
-    wheels[i].slipLong = slip;
-    wheels[i].slipLat = std::atan2(vLat, std::abs(vLong) + 0.3f);
-  }
-}
-
-void Car::applyStabilityControl(float sdt, Terrain *terrain,
-                                glm::vec3 &totalTorque) {
-  float speed = getSpeed();
-  
-  glm::vec3 localAngularVel = glm::inverse(rotation) * angularVel;
-  glm::vec3 localTorque(0.0f);
-
-  if (!isGrounded) {
-    // Aerial controls (GTA style)
-    bool gas = engine.throttle > 0.5f;
-    bool braking = m_Driver ? (m_Driver->keys['s'] || m_Driver->keys['S']) : false;
-    bool left = m_Driver ? (m_Driver->keys['a'] || m_Driver->keys['A'] ||
-                            m_Driver->keys['q'] || m_Driver->keys['Q']) : false;
-    bool right = m_Driver ? (m_Driver->keys['d'] || m_Driver->keys['D']) : false;
-
-    float pitchInput = (braking ? 1.0f : 0.0f) - (gas ? 1.0f : 0.0f);
-    float rollInput = (right ? 1.0f : 0.0f) - (left ? 1.0f : 0.0f);
-    float yawInput = (left ? 1.0f : 0.0f) - (right ? 1.0f : 0.0f);
-
-    localTorque.x += pitchInput * 25000.0f;
-    localTorque.z += rollInput * 25000.0f;
-    localTorque.y += yawInput * 15000.0f;
-
-    // Passive leveling in air
-    localTorque.x += -pitchAngle * 8000.0f;
-    localTorque.z += -rollAngle * 8000.0f;
-  } else {
-    // Grounded stability control (ESC and steering assist)
-    bool left = m_Driver ? (m_Driver->keys['a'] || m_Driver->keys['A'] ||
-                            m_Driver->keys['q'] || m_Driver->keys['Q']) : false;
-    bool right = m_Driver ? (m_Driver->keys['d'] || m_Driver->keys['D']) : false;
-    float steerInput = (left ? 1.0f : 0.0f) - (right ? 1.0f : 0.0f);
-
-    float roadFactor = terrain->getRoadAt(position.x, position.z);
-    
-    // Straight-line stabilization
-    if (speed > 5.0f && std::abs(steerInput) < 0.1f) {
-      glm::vec3 fwd = getForwardVector();
-      glm::vec3 velDir = glm::normalize(glm::vec3(velocity.x, 0.0f, velocity.z));
-      float dotVal = glm::clamp(glm::dot(fwd, velDir), -1.0f, 1.0f);
-      if (dotVal > 0.2f) {
-        float alignSign = fwd.x * velDir.z - fwd.z * velDir.x;
-        localTorque.y -= alignSign * 18000.0f * (1.0f + roadFactor * 2.0f);
-      }
-    }
-
-    // Kinematic yaw rate targeting (ESC)
-    float velocityLong = glm::dot(glm::vec3(velocity.x, velocity.y, velocity.z), getForwardVector());
-    float desiredLocalYawRate = -steerAngle * (velocityLong / m_Wheelbase);
-    
-    float escYawTorque = (desiredLocalYawRate - localAngularVel.y) * 22000.0f;
-    localTorque.y += escYawTorque;
-
-    // Steering assist
-    if (std::abs(steerInput) > 0.1f) {
-      localTorque.y -= steerInput * speed * 3000.0f;
-    }
-  }
-
-  // Transform local torques to world space
-  totalTorque += rotation * localTorque;
-}
-
-void Car::applyAerodynamics(float dt, glm::vec3 &totalForce) {
-  float speedSq = velocity.x * velocity.x + velocity.z * velocity.z;
-  if (speedSq > 0.1f) {
-    glm::vec3 dragDir = glm::normalize(glm::vec3(-velocity.x, 0.0f, -velocity.z));
-    float dragForce = 0.35f * speedSq;
-    float downForce = 1.5f * speedSq;
-    totalForce += dragDir * dragForce;
-    totalForce.y -= downForce;
-  }
-}
-
-void Car::updateActivePhysics(float dt, Terrain *terrain) {
-  if (!terrain)
-    return;
-
-  bool gas = false, braking = false, handbrake = false;
-  if (state == State::DRIVEN && m_Driver && m_Driver->isDriving()) {
-    processInput(dt, gas, braking, handbrake);
-    updateTransmission(dt, gas, braking);
-  } else {
-    updateTransmission(dt, engine.throttle > 0.1f, false);
-  }
-
-  glm::vec3 totalForce(0.0f, MASS * GRAVITY, 0.0f);
-  glm::vec3 totalTorque(0.0f);
-
-  isGrounded = false;
-  updateSuspension(dt, terrain, totalForce, totalTorque);
-  calculateTireForces(dt, terrain, totalForce, totalTorque);
-  applyStabilityControl(dt, terrain, totalTorque);
-  applyAerodynamics(dt, totalForce);
-
-  // Integrate linear motion
-  velocity.x += (totalForce.x / MASS) * dt;
-  velocity.y += (totalForce.y / MASS) * dt;
-  velocity.z += (totalForce.z / MASS) * dt;
-
-  // velocity.y damping removed to allow natural suspension physics
-
-  position.x += velocity.x * dt;
-  position.y += velocity.y * dt;
-  position.z += velocity.z * dt;
-
-  // Integrate angular motion
-  angularVel.x += (totalTorque.x / INERTIA_PITCH) * dt;
-  angularVel.y += (totalTorque.y / INERTIA_YAW) * dt;
-  angularVel.z += (totalTorque.z / INERTIA_ROLL) * dt;
-  angularVel *= BODY_DAMPING;
-
-  // Update orientation
-  if (!isGrounded) {
-    yaw += angularVel.y * dt;
-    pitchAngle += angularVel.x * dt;
-    rollAngle += angularVel.z * dt;
-    pitchAngle = glm::clamp(pitchAngle, -0.5f, 0.5f);
-    rollAngle = glm::clamp(rollAngle, -0.5f, 0.5f);
-
-    rotation = glm::angleAxis(-yaw + glm::pi<float>(), glm::vec3(0.0f, 1.0f, 0.0f)) *
-               glm::angleAxis(pitchAngle, glm::vec3(1.0f, 0.0f, 0.0f)) *
-               glm::angleAxis(rollAngle, glm::vec3(0.0f, 0.0f, 1.0f));
-  } else {
-    yaw += angularVel.y * dt;
-
-    float fwdAccel = 0.0f;
-    float latAccel = 0.0f;
-    if (dt > 1e-6f) {
-      fwdAccel = glm::dot(glm::vec3(velocity.x, 0.0f, velocity.z) -
-                              glm::vec3(prevVel.x, 0.0f, prevVel.z),
-                          getForwardVector()) / dt;
-      latAccel = glm::dot(glm::vec3(velocity.x, 0.0f, velocity.z) - prevVel,
-                          getRightVector()) / dt;
-    }
-    prevVel = glm::vec3(velocity.x, velocity.y, velocity.z);
-
-    float h[4];
-    for (int i = 0; i < 4; i++) {
-      glm::vec3 cp = getWheelContactPatch(wheels[i].localPos);
-      h[i] = terrain->getHeight(cp.x, cp.z);
-    }
-
-    float frontH = (h[0] + h[1]) * 0.5f;
-    float rearH = (h[2] + h[3]) * 0.5f;
-    float leftH = (h[0] + h[2]) * 0.5f;
-    float rightH = (h[1] + h[3]) * 0.5f;
-
-    float terrainPitch = std::atan2(frontH - rearH, m_Wheelbase);
-    float terrainRoll = std::atan2(rightH - leftH, m_TrackWidth);
-
-    float wtPitch = fwdAccel * 0.0035f;
-    float wtRoll = latAccel * 0.0045f;
-
-    float targetPitch = terrainPitch + wtPitch;
-    float targetRoll = terrainRoll + wtRoll;
-
-    pitchAngle += (targetPitch - pitchAngle) * (1.0f - std::exp(-15.0f * dt));
-    rollAngle += (targetRoll - rollAngle) * (1.0f - std::exp(-15.0f * dt));
-
-    pitchAngle = glm::clamp(pitchAngle, -0.35f, 0.35f);
-    rollAngle = glm::clamp(rollAngle, -0.40f, 0.40f);
-
-    rotation = glm::angleAxis(-yaw + glm::pi<float>(), glm::vec3(0.0f, 1.0f, 0.0f)) *
-               glm::angleAxis(pitchAngle, glm::vec3(1.0f, 0.0f, 0.0f)) *
-               glm::angleAxis(rollAngle, glm::vec3(0.0f, 0.0f, 1.0f));
-  }
-
-  // Hard floor snap to prevent chassis tunneling into ground
-  {
-    float groundH = terrain->getHeight(position.x, position.z);
-    float floorY = groundH + 0.16f;
-    if (position.y < floorY) {
-      position.y = floorY;
-      if (velocity.y < 0.0f)
-        velocity.y = 0.0f;
-    }
-  }
-
-  driftAngle += (-(glm::dot(glm::vec3(velocity.x, 0.0f, velocity.z), getRightVector())) * 0.25f - driftAngle) * (1.0f - std::exp(-6.0f * dt));
-
-  float currentSpeed = getSpeed();
-  bool allWheelsStopped = true;
-  for (int i = 0; i < 4; i++) {
-    if (std::abs(wheels[i].angularVelocity) > 0.1f)
-      allWheelsStopped = false;
-  }
-  if (allWheelsStopped && currentSpeed < 1.0f && std::abs(engine.throttle) < 0.1f) {
-    velocity = Vec3(0.0f, 0.0f, 0.0f);
-    angularVel = glm::vec3(0.0f);
-  } else if (std::abs(engine.throttle) < 0.1f && currentSpeed < 0.4f) {
-    velocity = velocity * 0.8f;
-    angularVel *= 0.8f;
-    if (currentSpeed < 0.05f) {
-      velocity = Vec3(0.0f, 0.0f, 0.0f);
-    }
-  }
-
-  if (state == State::DRIVEN) {
-    AudioSystem::getInstance().updateEngine(engine.rpm, engine.throttle, engine.maxRPM, glm::vec3(position.x, position.y, position.z));
-  }
-
-  bodyShake = 0.0f;
-  if (engine.rpm >= engine.maxRPM - 300.0f) {
-    bodyShake = ((rand() % 100) / 100.0f - 0.5f) * 0.018f;
-  }
-
-  if (m_Driver && m_Driver->isDriving()) {
-    glm::vec3 seat = getDriverSeatWorldPosition();
-    m_Driver->setPosition(Vec3(seat.x, seat.y, seat.z));
-    m_Driver->setRotation(yaw, glm::vec3(0, 1, 0));
-  }
-}
-
-
-// ================================================================
+}// ================================================================
 // MOUNT / DISMOUNT
 // ================================================================
 void Car::mountCharacter(Character *c) {
@@ -1021,11 +601,32 @@ void Car::render(const glm::mat4 &projection, const glm::mat4 &view,
   carShader->setBool("isInstanced", false);
   carShader->setBool("deformToTerrain", false);
 
+  constexpr float physicsStep = 1.0f / 120.0f;
+  const float alpha = hasPreviousRenderState
+      ? glm::clamp(physicsAccumulator / physicsStep, 0.0f, 1.0f)
+      : 1.0f;
+  const glm::vec3 currentPosition(position.x, position.y, position.z);
+  const glm::vec3 renderPosition = hasPreviousRenderState
+      ? glm::mix(previousRenderPosition, currentPosition, alpha)
+      : currentPosition;
+  const glm::quat renderRotation = hasPreviousRenderState
+      ? glm::slerp(previousRenderRotation, rotation, alpha)
+      : rotation;
+  const float renderSteerAngle = hasPreviousRenderState
+      ? glm::mix(previousRenderSteerAngle, steerAngle, alpha)
+      : steerAngle;
+  const float renderDriftAngle = hasPreviousRenderState
+      ? glm::mix(previousRenderDriftAngle, driftAngle, alpha)
+      : driftAngle;
+
   glm::mat4 base(1.0f);
-  base = glm::translate(base, glm::vec3(position.x, position.y + bodyShake, position.z));
+  base = glm::translate(base, glm::vec3(renderPosition.x,
+                                        renderPosition.y + bodyShake,
+                                        renderPosition.z));
 
   // Combine physics rotation with visual drift angle
-  glm::quat visualRotation = rotation * glm::angleAxis(driftAngle * 0.1f, glm::vec3(0.0f, 1.0f, 0.0f));
+  glm::quat visualRotation = renderRotation * glm::angleAxis(
+      renderDriftAngle * 0.1f, glm::vec3(0.0f, 1.0f, 0.0f));
   base = base * glm::mat4_cast(visualRotation);
 
   base = glm::scale(base, glm::vec3(SCALE_FACTOR));
@@ -1047,15 +648,26 @@ void Car::render(const glm::mat4 &projection, const glm::mat4 &view,
       return;
 
     // Suspension offset relative to equilibrium ride height (0 at rest)
-    float equilComp = (MASS * (-GRAVITY) * 0.25f) / SPRING_K;
+    float equilComp =
+        (drivingConfig.massKg * (-GRAVITY) * 0.25f) / SPRING_K;
     float rideLength = wheels[wi].suspensionRest - equilComp;
-    float suspY = -(wheels[wi].currentLength - rideLength) / SCALE_FACTOR;
+    const float renderLength = hasPreviousRenderState
+        ? glm::mix(previousRenderWheelLength[wi], wheels[wi].currentLength, alpha)
+        : wheels[wi].currentLength;
+    const float renderSpin = hasPreviousRenderState
+        ? glm::mix(previousRenderWheelSpin[wi], wheels[wi].spinAngle, alpha)
+        : wheels[wi].spinAngle;
+    float suspY = -(renderLength - rideLength) / SCALE_FACTOR;
 
     glm::mat4 wm = base;
     wm = glm::translate(wm, ctr + glm::vec3(0, suspY, 0));
     if (front)
-      wm = glm::rotate(wm, steerAngle, glm::vec3(0, 1, 0));
-    wm = glm::rotate(wm, -wheels[wi].spinAngle, glm::vec3(1, 0, 0));
+      // Positive steerAngle is left input; the model's local -Z forward axis
+      // is flipped by base, so use the opposite local angle for visible left.
+      wm = glm::rotate(wm, CarHandling::visibleWheelSteerAngle(renderSteerAngle),
+                       glm::vec3(0, 1, 0));
+    wm = glm::rotate(wm, CarHandling::visibleWheelSpinAngle(renderSpin),
+                     glm::vec3(1, 0, 0));
     
     if (isPaintedModel) {
       wm = wm * R;

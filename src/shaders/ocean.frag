@@ -62,12 +62,17 @@ void main() {
         float v = (FragPos.z - hmWorldMinZ) / (hmWorldMaxZ - hmWorldMinZ);
 
         if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
+            // The simulation marks below-sea depressions disconnected from the
+            // coast with a sentinel. Keep those inland basins dry.
+            float connectedWaterLevel = texture(waterMapTex, vec2(u, v)).r;
+            if (connectedWaterLevel < -100.0) discard;
+
             float normElev = texture(heightmapTex, vec2(u, v)).r;
             terrainH = hmMinElev + normElev * (hmMaxElev - hmMinElev);
 
             // Precise 8129x8129 heightmap cutoff: dry land is strictly discarded
             // with sub-meter smooth shoreline precision (eliminates all 109m square teeth)
-            float rawDepth = waterLevel - terrainH;
+            float rawDepth = min(waterLevel, connectedWaterLevel) - terrainH;
             if (rawDepth <= 0.005) discard;
 
             waterDepth = max(0.0, rawDepth);

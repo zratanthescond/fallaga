@@ -25,7 +25,7 @@ struct WaterLevelConfig {
     static constexpr float MAX = 0.0f;
     static constexpr float STEP_COARSE = 0.5f;
     static constexpr float STEP_FINE = 0.1f;
-    static constexpr float RESET_VALUE = -48.5f;
+    static constexpr float RESET_VALUE = -55.0f;
 };
 
 // ==== Brush Slider Handling ====
@@ -33,20 +33,32 @@ struct WaterLevelConfig {
 // Updates brush radius and strength sliders based on mouse input
 inline void updateBrushSliders(float mouseX, float mouseY,
                                 float lpX, float lpY, float lpW,
-                                float& outBrushRadius, float& outBrushStrength) {
+                                float& outBrushRadius, float& outBrushStrength,
+                                bool sculptLayout = false, float* outSculptDirection = nullptr,
+                                float* outSculptGrade = nullptr) {
     const float SLIDER_WIDTH = lpW - 30.0f;
     const float SLIDER_X_START = lpX + 15.0f;
 
-    // Radius slider (y range: lpY + 170 to lpY + 195)
-    if (mouseY >= lpY + 170 && mouseY <= lpY + 195) {
+    const float radiusY = sculptLayout ? 195.0f : 170.0f;
+    const float strengthY = sculptLayout ? 227.0f : 202.0f;
+    // Sculpt mode makes room for its fifth tool and angle control.
+    if (mouseY >= lpY + radiusY && mouseY <= lpY + radiusY + 25.0f) {
         float norm = glm::clamp((mouseX - SLIDER_X_START) / SLIDER_WIDTH, 0.0f, 1.0f);
         outBrushRadius = BrushConfig::RADIUS_MIN + norm * (BrushConfig::RADIUS_MAX - BrushConfig::RADIUS_MIN);
     }
 
     // Strength slider (y range: lpY + 202 to lpY + 227)
-    if (mouseY >= lpY + 202 && mouseY <= lpY + 227) {
+    if (mouseY >= lpY + strengthY && mouseY <= lpY + strengthY + 25.0f) {
         float norm = glm::clamp((mouseX - SLIDER_X_START) / SLIDER_WIDTH, 0.0f, 1.0f);
         outBrushStrength = BrushConfig::STRENGTH_MIN + norm * (BrushConfig::STRENGTH_MAX - BrushConfig::STRENGTH_MIN);
+    }
+    if (sculptLayout && outSculptDirection && mouseY >= lpY + 259.0f && mouseY <= lpY + 284.0f) {
+        const float norm = glm::clamp((mouseX - SLIDER_X_START) / SLIDER_WIDTH, 0.0f, 1.0f);
+        *outSculptDirection = norm * 360.0f;
+    }
+    if (sculptLayout && outSculptGrade && mouseY >= lpY + 291.0f && mouseY <= lpY + 316.0f) {
+        const float norm = glm::clamp((mouseX - SLIDER_X_START) / SLIDER_WIDTH, 0.0f, 1.0f);
+        *outSculptGrade = norm * 60.0f;
     }
 }
 

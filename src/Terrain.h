@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <map>
+#include <cstdint>
 #include <unordered_map>
 #include <glm/glm.hpp>
 #include "ObjectModel.h"
@@ -63,20 +64,34 @@ public:
 
     Shader& getShader()     const { return *oceanShader; }
     void    printDebugMap() const {}
-    void    markBatchesDirty() const { batchesDirty = true; }
+    void    markBatchesDirty() const {
+        batchesDirty = true;
+        carCollisionGridDirty = true;
+    }
     void    update(const glm::vec3& camPos);
     void    saveTerrain();
     void    buildWaterFBOs(int width, int height);
 
     float     getHeight  (float x, float z) const;
+    // Height of the walkable/drivable surface: road mesh where present, terrain elsewhere.
+    float     getGroundSurfaceHeight(float x, float z) const;
     glm::vec3 getNormalAt(float x, float z) const;
     float     getRoadAt  (float x, float z) const;
+    bool resolveCarCollision(glm::vec3& position, glm::vec3& velocity,
+                             float carRadius, float restitution = 0.12f) const;
 
     // Road Edit mode API (in-game road editor)
     RoadGraph*       getRoadGraph()       const { return roadGraph; }
     RoadMeshBuilder* getRoadMeshBuilder() const { return roadMeshBuilder; }
+    RoadTileField*   getRoadTileField()   const { return roadTileField; }
     HeightSampler&   getRoadHeightSampler()     { return roadHeightSampler; }
     void rebuildRoadMesh();
+    // Re-seats the road ribbon on the heightfield the GPU actually draws.
+    // The roads are sampled from the native DEM grid while the terrain mesh is built
+    // from the visual grid, and conforming terrain to the road only moves the coarse
+    // heightfield. Without this the asphalt keeps its pre-deform height and hovers
+    // above the rendered surface (measured up to 2.6 m on a 22 m cell grid).
+    void snapRoadsToRenderedTerrain();
     void saveRoadsToJSON(const std::string& path) const;
 
     // Whole-road-network graph transforms (world space, pivot = center of network)
@@ -103,6 +118,8 @@ public:
     mutable glm::vec3 lastRayHitPos = glm::vec3(0.0f);
     mutable int editorBrushMode = 0;
     mutable float brushRadius = 30.0f;
+    mutable float editorSculptDirectionDegrees = 0.0f;
+    mutable float editorSculptGradeDegrees = 20.0f;
 
     enum class Zone { SEA, PORT, MEDINA, WADI, VILLE_NOUVELLE, PLAIN, BEACH, KASBAH };
     Zone getZoneAt(float x, float z) const;
@@ -113,12 +130,18 @@ public:
 
 private:
     HeightmapTerrain* heightmapTerrain = nullptr;
+    // Low-resolution CPU copy of the terrain wadi mask, used for surface physics.
+    std::vector<unsigned char> wadiSurfaceMask;
+    int wadiSurfaceMaskW = 0;
+    int wadiSurfaceMaskH = 0;
 
     // Geometry-based road system
     RoadGraph*       roadGraph       = nullptr;
     RoadDeformer*    roadDeformer    = nullptr;
     RoadMeshBuilder* roadMeshBuilder = nullptr;
+    RoadTileField*   roadTileField   = nullptr;
     HeightSampler    roadHeightSampler;
+    TerrainCoordinateMapper roadMapper;   // plan→world transform shared by the road pipeline
     ObjModel* trainStationModel = nullptr;
     ObjModel* cityWallModel = nullptr;
     ObjModel* rockModel = nullptr;
@@ -135,6 +158,14 @@ private:
     mutable std::vector<CustomRenderTask> cachedCustomRenderTasks;
     mutable std::map<std::string, std::vector<glm::mat4>> cachedBatches;
     mutable bool batchesDirty = true;
+
+    struct CarCollisionInstance {
+        const std::string* modelPath = nullptr;
+        glm::mat4 modelMatrix{1.0f};
+    };
+    mutable std::unordered_map<std::uint64_t,
+        std::vector<CarCollisionInstance>> carCollisionGrid;
+    mutable bool carCollisionGridDirty = true;
 
     // GTA-style visibility caching: instanced object culling is expensive to redo
     // every frame across thousands of instances, and re-uploading GPU instance
@@ -176,6 +207,7 @@ private:
     void buildStreetMesh();
     void renderStreets(const glm::mat4& proj, const glm::mat4& view,
                        const glm::vec3& lightDir, const glm::vec3& viewPos) const;
+    void rebuildCarCollisionGrid() const;
     float distToSegment(float px, float pz,
                         float x1, float z1, float x2, float z2) const;
 };

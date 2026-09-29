@@ -20,7 +20,7 @@ namespace GameplayUtils {
 // Snaps a position to the terrain surface with an optional vertical offset
 inline void snapToTerrain(Vec3& position, Terrain* terrain, float verticalOffset = 0.01f) {
     if (terrain) {
-        float terrainHeight = terrain->getHeight(position.x, position.z);
+        float terrainHeight = terrain->getGroundSurfaceHeight(position.x, position.z);
         position.y = terrainHeight + verticalOffset;
     }
 }
@@ -28,7 +28,7 @@ inline void snapToTerrain(Vec3& position, Terrain* terrain, float verticalOffset
 // Gets terrain height at a given XZ position
 inline float getTerrainHeightAt(Terrain* terrain, float x, float z) {
     if (terrain) {
-        return terrain->getHeight(x, z);
+        return terrain->getGroundSurfaceHeight(x, z);
     }
     return 0.0f;
 }
@@ -36,7 +36,7 @@ inline float getTerrainHeightAt(Terrain* terrain, float x, float z) {
 // Checks if a position is above terrain (accounting for a ground clearance threshold)
 inline bool isAboveTerrain(const Vec3& position, Terrain* terrain, float clearanceThreshold = 0.1f) {
     if (!terrain) return true;
-    float terrainHeight = terrain->getHeight(position.x, position.z);
+    float terrainHeight = terrain->getGroundSurfaceHeight(position.x, position.z);
     return position.y > terrainHeight + clearanceThreshold;
 }
 

@@ -12,7 +12,7 @@
 
 class WaterSimulation {
 public:
-    static constexpr int SIM_SIZE = 256; // 256x256 simulation grid
+    static constexpr int SIM_SIZE = 512; // 512x512 grid resolves narrow coastal barriers
     
     WaterSimulation() {
         terrainHeights.resize(SIM_SIZE * SIM_SIZE, 0.0f);
@@ -204,18 +204,10 @@ private:
             }
         };
 
-        // Ocean seeds: East border (Mediterranean Sea) and painted rivers
+        // Ocean enters from the east border only; painted rivers are separate seeds.
         for (int z = 0; z < SIM_SIZE; ++z) {
             trySeed(z * SIM_SIZE + (SIM_SIZE - 1)); // East border
         }
-        for (int x = SIM_SIZE / 2; x < SIM_SIZE; ++x) {
-            trySeed(x);                            // Top-East border
-            trySeed((SIM_SIZE - 1) * SIM_SIZE + x); // Bottom-East border
-        }
-        // Inland Lake seed: Sebkha de Sahline basin (WX ~ 5200, WZ ~ 7620)
-        int lakeGx = 175, lakeGz = 197;
-        trySeed(lakeGz * SIM_SIZE + lakeGx);
-
         for (int i = 0; i < SIM_SIZE * SIM_SIZE; ++i) {
             if (riverMask[i]) trySeed(i);
         }
@@ -259,7 +251,7 @@ private:
 
     float worldMinX = 0.0f, worldMaxX = 0.0f;
     float worldMinZ = 0.0f, worldMaxZ = 0.0f;
-    float oceanWaterLevel = -48.5f;
+    float oceanWaterLevel = -55.0f;
 };
 
 #endif // WATER_SIMULATION_H

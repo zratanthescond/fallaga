@@ -132,9 +132,16 @@ int main() {
         std::cerr << "Failed to initialize GLEW\n";
         return -1;
     }
+    std::cout << "[OpenGL] vendor=" << reinterpret_cast<const char*>(glGetString(GL_VENDOR))
+              << " renderer=" << reinterpret_cast<const char*>(glGetString(GL_RENDERER))
+              << " version=" << reinterpret_cast<const char*>(glGetString(GL_VERSION)) << '\n';
 
-    // --- ENABLE VSYNC ---
-    glfwSwapInterval(1); 
+    // --- Prefer low-latency presentation; allow users to restore VSync ---
+    const char* vsyncEnv = std::getenv("FALLAGA_VSYNC");
+    const int swapInterval = vsyncEnv ? (std::atoi(vsyncEnv) != 0 ? 1 : 0) : 0;
+    glfwSwapInterval(swapInterval);
+    std::cout << "[Display] " << WINDOW_WIDTH << "x" << WINDOW_HEIGHT
+              << " @ " << mode->refreshRate << " Hz, vsync=" << swapInterval << '\n';
 
     // --- RENDER LOADING SCREEN ---
     // Clear screen to a "Loading" color (e.g., Dark Grey) or text if possible
@@ -465,11 +472,14 @@ int main() {
                 glfwSetWindowShouldClose(window, GLFW_TRUE);
             }
 
-            if (carSeqEnv && atoi(carSeqEnv) == 1) {
-                // Ensure camera is locked at a cinematic angle looking directly at the driver side
-                game->camera->setAngles(110.0f, 16.0f);
-                game->camera->distance = 5.5f;
-                game->camera->reset();
+            if (carSeqEnv && (atoi(carSeqEnv) == 1 || atoi(carSeqEnv) == 2)) {
+                // Keep the entry camera setup for the animation, then let it
+                // follow the moving car during sequence 2's controlled drive.
+                if (frameNo == 1) {
+                    game->camera->setAngles(110.0f, 16.0f);
+                    game->camera->distance = 5.5f;
+                    game->camera->reset();
+                }
 
                 static int enterFrame = -1;
                 static int driveStartFrame = -1;
@@ -493,15 +503,33 @@ int main() {
                 if (game->player->isDriving() && driveStartFrame < 0) {
                     driveStartFrame = frameNo;
                     std::cout << "[TEST] Reached DrivingCar at frame " << frameNo << "\n";
+                    if (atoi(carSeqEnv) == 2) {
+                        game->player->keys['w'] = true;
+                        std::cout << "[TEST] Starting controlled 3-second drive\n";
+                    }
                 }
 
                 if (driveStartFrame > 0 && frameNo == driveStartFrame + 10) {
                     saveCapture("scratch/car_seq_3_seated_driving.png");
                 }
-                if (driveStartFrame > 0 && frameNo == driveStartFrame + 15) {
+                if (atoi(carSeqEnv) == 1 && driveStartFrame > 0 &&
+                    frameNo == driveStartFrame + 15) {
                     std::cout << "[TEST] Triggering dismount at frame " << frameNo << "\n";
                     game->keyDown(GLFW_KEY_E);
                     exitStartFrame = frameNo;
+                }
+
+                if (atoi(carSeqEnv) == 2 && driveStartFrame > 0 &&
+                    frameNo == driveStartFrame + 180) {
+                    game->player->keys['w'] = false;
+                    std::cout << "[TEST] Controlled drive finished at frame "
+                              << frameNo << "\n";
+                    glfwSetWindowShouldClose(window, GLFW_TRUE);
+                }
+
+                if (atoi(carSeqEnv) == 2 && driveStartFrame < 0 && frameNo > 360) {
+                    std::cout << "[TEST] Timed out before controlled drive began\n";
+                    glfwSetWindowShouldClose(window, GLFW_TRUE);
                 }
 
                 if (exitStartFrame > 0 && frameNo == exitStartFrame + 25) {
