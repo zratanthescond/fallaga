@@ -5,7 +5,9 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <unordered_map>
 #include <sys/stat.h>
@@ -598,8 +600,6 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     }
     if (nearbyTriangles.empty()) return;
 
-    int changedMinX = visualW, changedMaxX = -1, changedMinZ = visualH, changedMaxZ = -1;
-
     auto closestPointOnSegment = [](const glm::vec2& p, const glm::vec2& a,
                                     const glm::vec2& b, float& t) {
         const glm::vec2 d = b - a;
@@ -607,6 +607,13 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
         t = d2 > 1e-10f ? glm::clamp(glm::dot(p - a, d) / d2, 0.0f, 1.0f) : 0.0f;
         return a + d * t;
     };
+    // Distance to the ribbon AND the ribbon's own height there. Both are needed:
+    // the road network can stack several surfaces over one XZ (a spliced extension,
+    // a junction pad, a second branch), and the one that matters is the nearest,
+    // not whichever triangle the index buffer happens to list first. Returning on
+    // the first containing triangle graded the ground to whatever surface came
+    // first -- measured 8.26 m of terrain left standing above a road whose real
+    // surface was 9 m lower at the same point.
     auto sampleTriangle = [&](const RoadTriangle& tri, const glm::vec2& p,
                               float& distanceSquared, float& surfaceY) {
         const glm::vec2 a(tri.a->position.x, tri.a->position.z);
@@ -622,6 +629,9 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
             surfaceY = wa * tri.a->position.y + wb * tri.b->position.y + wc * tri.c->position.y;
             return;
         }
+        // Outside the triangle: the nearest point on its boundary gives the
+        // distance, and the interpolated height at that point is the surface to
+        // grade to.
         float t = 0.0f;
         float bestD2 = std::numeric_limits<float>::infinity();
         float bestY = 0.0f;
@@ -634,7 +644,8 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
         const glm::vec2 caPoint = closestPointOnSegment(p, c, a, t);
         const float caD2 = glm::dot(p - caPoint, p - caPoint);
         if (caD2 < bestD2) { bestD2 = caD2; bestY = glm::mix(tri.c->position.y, tri.a->position.y, t); }
-        if (bestD2 < distanceSquared) { distanceSquared = bestD2; surfaceY = bestY; }
+        distanceSquared = bestD2;
+        surfaceY = bestY;
     };
 
     // Leave the terrain 1 cm below the final road ribbon. The ribbon receives a
@@ -657,8 +668,24 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     // that distance, so a narrower corridor leaves those vertices only partially pulled
     // and the triangle still juts through the asphalt. Measured with an 8 m corridor:
     // 10.7% of probes had terrain more than 0.25 m proud of the road, worst 2.40 m.
-    const float kRoadCorridor = cellReach + 3.0f;
-    const float kRoadBermWidth = std::max(15.0f, bermWidth);
+    //
+    // cellReach alone is not enough. A terrain cell is ~22 m across on the shipped DEM,
+    // so a triangle whose vertices sit inside a one-cell corridor still spans the road
+    // and rises over it: the measured poke extended past the old corridor and reached
+    // 8.26 m at 3215 road vertices. The corridor is therefore widened by kCorridorReach
+    // metres of ribbon distance, in which the ground is held at road level, and the
+    // remaining slope out to natural ground is the graded berm beyond it.
+    float kCorridorReach = 16.0f;
+    float kRoadBermWidth = std::max(15.0f, bermWidth);
+    if (const char* env = std::getenv("FALLAGA_CONFORM_REACH")) {
+        const float requested = std::strtof(env, nullptr);
+        if (requested > 0.0f) kCorridorReach = requested;
+    }
+    if (const char* env = std::getenv("FALLAGA_CONFORM_BERM")) {
+        const float requested = std::strtof(env, nullptr);
+        if (requested > 0.0f) kRoadBermWidth = requested;
+    }
+    const float kRoadCorridor = cellReach + kCorridorReach;
     float conformSkirt = kRoadCorridor + kRoadBermWidth;
     if (const char* env = std::getenv("FALLAGA_CONFORM_SKIRT")) {
         const float requested = std::strtof(env, nullptr);
@@ -666,77 +693,108 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     }
     const float conformSkirtSquared = conformSkirt * conformSkirt;
     const float cellReachSquared = cellReach * cellReach;
-    struct RoadTarget { float height; float distanceSquared; };
-    std::unordered_map<size_t, RoadTarget> roadTargets;
-    roadTargets.reserve(nearbyTriangles.size());
+
+    // ── Dominant-surface raster ───────────────────────────────────────────────
+    // The road network stacks surfaces over one XZ: a junction pad over a ribbon, a
+    // spliced extension, a second branch. The ground has to end up below the surface
+    // the player actually drives on, and that surface is identified by the same
+    // `surfacePriority` the road shader uses to decide which fragment wins.
+    //
+    // Rasterising that decision once -- per coarse cell keep the highest priority
+    // seen together with the lowest height among triangles at that priority --
+    // replaces a per-cell nearest-triangle search. That search was O(grid cells x
+    // triangles) and took minutes on the shipped network (175k triangles over a
+    // 1254x1254 visual grid), which is far too slow to run on every edit.
+    const int surfRes = 640;
+    const float surfMinX = wholeNetwork ? worldMinX : minWorldX;
+    const float surfMinZ = wholeNetwork ? worldMinZ : minWorldZ;
+    const float surfMaxX = wholeNetwork ? worldMaxX : maxWorldX;
+    const float surfMaxZ = wholeNetwork ? worldMaxZ : maxWorldZ;
+    const float surfCellX = std::max(1e-3f, (surfMaxX - surfMinX) / (float)surfRes);
+    const float surfCellZ = std::max(1e-3f, (surfMaxZ - surfMinZ) / (float)surfRes);
+    constexpr float kNoPriority = -1e30f;
+    std::vector<float> surfPriority((size_t)surfRes * surfRes, kNoPriority);
+    std::vector<float> surfHeight((size_t)surfRes * surfRes,
+                                  std::numeric_limits<float>::infinity());
     for (const RoadTriangle& tri : nearbyTriangles) {
-        const float triMinX = std::max(minWorldX, tri.minX - conformSkirt);
-        const float triMaxX = std::min(maxWorldX, tri.maxX + conformSkirt);
-        const float triMinZ = std::max(minWorldZ, tri.minZ - conformSkirt);
-        const float triMaxZ = std::min(maxWorldZ, tri.maxZ + conformSkirt);
-        if (triMinX > triMaxX || triMinZ > triMaxZ) continue;
-        const int tx0 = std::max(0, (int)std::floor((triMinX - worldMinX) / worldWidth * (visualW - 1)));
-        const int tx1 = std::min(visualW - 1, (int)std::ceil((triMaxX - worldMinX) / worldWidth * (visualW - 1)));
-        const int tz0 = std::max(0, (int)std::floor((triMinZ - worldMinZ) / worldDepth * (visualH - 1)));
-        const int tz1 = std::min(visualH - 1, (int)std::ceil((triMaxZ - worldMinZ) / worldDepth * (visualH - 1)));
-        for (int z = tz0; z <= tz1; ++z) {
-            const float worldZ = worldMinZ + (float)z / (visualH - 1) * worldDepth;
-            for (int x = tx0; x <= tx1; ++x) {
-                const float worldX = worldMinX + (float)x / (visualW - 1) * worldWidth;
-                if (!wholeNetwork && glm::length(glm::vec2(worldX - wx, worldZ - wz)) > radius) continue;
-                float distanceSquared = std::numeric_limits<float>::infinity();
-                float surfaceY = 0.0f;
-                sampleTriangle(tri, glm::vec2(worldX, worldZ), distanceSquared, surfaceY);
-                if (distanceSquared > conformSkirtSquared) continue;
-                const size_t idx = (size_t)z * visualW + x;
-                const float targetHeight = surfaceY - kTerrainBelowRoad;
-                auto it = roadTargets.find(idx);
-                if (it == roadTargets.end()) {
-                    roadTargets.emplace(idx, RoadTarget{targetHeight, distanceSquared});
-                } else if (distanceSquared < it->second.distanceSquared) {
-                    // Closest ribbon wins, so a lower road further away cannot yank the
-                    // ground away from the road actually overhead. Only genuinely
-                    // overlapping ribbons (equal distance) resolve to the lower surface.
-                    it->second = RoadTarget{targetHeight, distanceSquared};
-                } else if (distanceSquared <= it->second.distanceSquared + 1e-4f) {
-                    it->second.height = std::min(it->second.height, targetHeight);
+        const float triPrio = std::max(tri.a->surfacePriority,
+                                       std::max(tri.b->surfacePriority, tri.c->surfacePriority));
+        const float triLow = std::min(tri.a->position.y,
+                                      std::min(tri.b->position.y, tri.c->position.y));
+        const int cx0 = std::clamp((int)((tri.minX - surfMinX) / surfCellX), 0, surfRes - 1);
+        const int cx1 = std::clamp((int)((tri.maxX - surfMinX) / surfCellX), 0, surfRes - 1);
+        const int cz0 = std::clamp((int)((tri.minZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+        const int cz1 = std::clamp((int)((tri.maxZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+        for (int cz = cz0; cz <= cz1; ++cz) {
+            for (int cx = cx0; cx <= cx1; ++cx) {
+                const size_t slot = (size_t)cz * surfRes + cx;
+                if (triPrio > surfPriority[slot]) {
+                    // A strictly more dominant surface takes the cell.
+                    surfPriority[slot] = triPrio;
+                    surfHeight[slot] = triLow;
+                } else if (triPrio == surfPriority[slot] && triLow < surfHeight[slot]) {
+                    // Same surface, overlapping pieces: keep the lower one so the
+                    // ground has to clear all of it.
+                    surfHeight[slot] = triLow;
                 }
             }
         }
     }
+    auto gradeTargetNear = [&](float worldX, float worldZ, float& outSurfaceY) -> bool {
+        if (worldX < surfMinX - surfCellX || worldX > surfMaxX + surfCellX ||
+            worldZ < surfMinZ - surfCellZ || worldZ > surfMaxZ + surfCellZ) return false;
+        const int gx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
+        const int gz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+        const float h = surfHeight[(size_t)gz * surfRes + gx];
+        if (h == std::numeric_limits<float>::infinity()) return false; // no ribbon here
+        outSurfaceY = h;
+        return true;
+    };
 
-    for (const auto& entry : roadTargets) {
-        const size_t idx = entry.first;
-        const RoadTarget& target = entry.second;
-        const int x = (int)(idx % (size_t)visualW);
-        const int z = (int)(idx / (size_t)visualW);
-        const float worldX = worldMinX + (float)x / (visualW - 1) * worldWidth;
+    int changedMinX = visualW, changedMaxX = -1, changedMinZ = visualH, changedMaxZ = -1;
+    // Grade every visual-grid vertex whose coarse cell carries a road surface. The
+    // cost is bounded by the visual grid, not by the triangle count.
+    for (int z = 0; z < visualH; ++z) {
         const float worldZ = worldMinZ + (float)z / (visualH - 1) * worldDepth;
-        float falloff = 1.0f;
-        const float corridorT = kRoadBermWidth > 1e-4f
-            ? glm::clamp((std::sqrt(target.distanceSquared) - kRoadCorridor) /
-                         kRoadBermWidth, 0.0f, 1.0f)
-            : (target.distanceSquared <= cellReachSquared ? 0.0f : 1.0f);
-        falloff *= 1.0f - corridorT * corridorT * (3.0f - 2.0f * corridorT);
-        if (!wholeNetwork) {
-            const float brushDistance = glm::length(glm::vec2(worldX - wx, worldZ - wz));
-            const float t = glm::clamp(brushDistance / radius, 0.0f, 1.0f);
-            falloff *= 1.0f - t * t * (3.0f - 2.0f * t);
+        for (int x = 0; x < visualW; ++x) {
+            const float worldX = worldMinX + (float)x / (visualW - 1) * worldWidth;
+            if (!wholeNetwork && glm::length(glm::vec2(worldX - wx, worldZ - wz)) > radius) continue;
+            float surfaceY = 0.0f;
+            if (!gradeTargetNear(worldX, worldZ, surfaceY)) continue;
+            const int gx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
+            const int gz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+            const float cellCentreX = surfMinX + ((float)gx + 0.5f) * surfCellX;
+            const float cellCentreZ = surfMinZ + ((float)gz + 0.5f) * surfCellZ;
+            const float cellDist = glm::length(glm::vec2(worldX - cellCentreX,
+                                                         worldZ - cellCentreZ));
+            const float corridorT = kRoadBermWidth > 1e-4f
+                ? glm::clamp((cellDist - kRoadCorridor) / kRoadBermWidth, 0.0f, 1.0f)
+                : (cellDist <= cellReach ? 0.0f : 1.0f);
+            float falloff = 1.0f - corridorT * corridorT * (3.0f - 2.0f * corridorT);
+            if (!wholeNetwork) {
+                const float brushDistance = glm::length(glm::vec2(worldX - wx, worldZ - wz));
+                const float t = glm::clamp(brushDistance / radius, 0.0f, 1.0f);
+                falloff *= 1.0f - t * t * (3.0f - 2.0f * t);
+            }
+            if (falloff <= 0.0f) continue;
+            const float targetHeight = surfaceY - kTerrainBelowRoad;
+            const size_t idx = (size_t)z * visualW + x;
+            const float oldHeight = visualHeights[idx];
+            const float nextHeight = glm::clamp(
+                glm::mix(oldHeight, targetHeight, brushBlend * falloff), minHeight, maxHeight);
+            const float appliedDelta = nextHeight - oldHeight;
+            if (std::fabs(appliedDelta) < 0.001f) continue;
+            if (appliedRoadConformOffsets.size() != visualHeights.size())
+                appliedRoadConformOffsets.assign(visualHeights.size(), 0.0f);
+            visualHeights[idx] = nextHeight;
+            if ((size_t)idx < physicsVisualHeights.size())
+                physicsVisualHeights[idx] = nextHeight;
+            appliedRoadConformOffsets[idx] += appliedDelta;
+            changedMinX = std::min(changedMinX, x); changedMaxX = std::max(changedMaxX, x);
+            changedMinZ = std::min(changedMinZ, z); changedMaxZ = std::max(changedMaxZ, z);
         }
-        const float oldHeight = visualHeights[idx];
-        const float nextHeight = glm::clamp(
-            glm::mix(oldHeight, target.height, brushBlend * falloff), minHeight, maxHeight);
-        const float appliedDelta = nextHeight - oldHeight;
-        if (std::fabs(appliedDelta) < 0.001f) continue;
-        if (appliedRoadConformOffsets.size() != visualHeights.size())
-            appliedRoadConformOffsets.assign(visualHeights.size(), 0.0f);
-        visualHeights[idx] = nextHeight;
-        if ((size_t)idx < physicsVisualHeights.size())
-            physicsVisualHeights[idx] = nextHeight;
-        appliedRoadConformOffsets[idx] += appliedDelta;
-        changedMinX = std::min(changedMinX, x); changedMaxX = std::max(changedMaxX, x);
-        changedMinZ = std::min(changedMinZ, z); changedMaxZ = std::max(changedMaxZ, z);
     }
+
     if (changedMaxX < changedMinX || changedMaxZ < changedMinZ) return;
     logHeightfieldSignature(wholeNetwork ? "conform/whole" : "conform/brush");
     if (wholeNetwork && std::getenv("FALLAGA_ROADGAP")) {
