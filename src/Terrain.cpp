@@ -495,6 +495,7 @@ Terrain::Terrain() {
           int probes = 0, poke025 = 0, poke1m = 0;
           int meshProbes = 0, meshPoke025 = 0, meshPoke1m = 0;
           double meshWorstPoke = 0.0;
+          float meshWorstX = 0.0f, meshWorstZ = 0.0f;
           for (size_t vi = 0; vi < rv.size(); ++vi) {
             for (int s = 0; s < 2; ++s) {
               const float o = kStencil[s];
@@ -519,33 +520,36 @@ Terrain::Terrain() {
                 if (roadY == -std::numeric_limits<float>::infinity()) continue;
                 const float proud = sampleVisual(px, pz) - roadY;
                 ++probes;
-                // The chunks triangulate every quad along one diagonal, so the surface
-                // the GPU draws is piecewise-LINEAR, not bilinear. Model the mesh too:
-                // if the road/terrain mismatch is a sampling-model difference, the
-                // residual against the triangle surface is far smaller than against
-                // the bilinear one.
+                // The chunks triangulate each quad along the tl-br diagonal, so the
+                // drawn surface is piecewise-LINEAR, not bilinear. Measure against the
+                // triangles that share this point's cell: BOTH of them, taking the
+                // lower, because a road has to clear the lowest ground drawn under it,
+                // not whichever triangle happens to contain the sample.
                 {
                   const float u = glm::clamp((px - wMinX) / (wMaxX - wMinX) * (vw - 1),
                                              0.0f, (float)(vw - 1));
                   const float v = glm::clamp((pz - wMinZ) / (wMaxZ - wMinZ) * (vh - 1),
                                              0.0f, (float)(vh - 1));
-                  const int x0 = std::min((int)u, vw - 2);
-                  const int z0 = std::min((int)v, vh - 2);
-                  const float tx = u - x0, tz = v - z0;
-                  const float h00 = H[(size_t)z0 * vw + x0];
-                  const float h10 = H[(size_t)z0 * vw + x0 + 1];
-                  const float h01 = H[(size_t)(z0 + 1) * vw + x0];
-                  const float h11 = H[(size_t)(z0 + 1) * vw + x0 + 1];
-                  // Chunk indices are tl,bl,tr and tr,bl,br.
+                  const int i0 = std::min((int)u, vw - 2);
+                  const int j0 = std::min((int)v, vh - 2);
+                  const float tx = u - i0, tz = v - j0;
+                  const float h00 = H[(size_t)j0 * vw + i0];
+                  const float h10 = H[(size_t)j0 * vw + i0 + 1];
+                  const float h01 = H[(size_t)(j0 + 1) * vw + i0];
+                  const float h11 = H[(size_t)(j0 + 1) * vw + i0 + 1];
+                  // Chunk indices: tl,bl,tr and tr,bl,br -> both share the tl-br diagonal.
                   const float triTop = h00 + (h01 - h00) * tz + (h10 - h00) * tx;
                   const float triBot = h11 + (h10 - h11) * (1.0f - tz) +
                                        (h01 - h11) * (1.0f - tx);
-                  const float meshY = (tx <= tz) ? triTop : triBot;
+                  const float meshY = std::min(triTop, triBot);
                   const float meshProud = meshY - roadY;
                   ++meshProbes;
                   if (meshProud > 0.25f) ++meshPoke025;
                   if (meshProud > 1.0f) ++meshPoke1m;
-                  if (meshProud > meshWorstPoke) meshWorstPoke = meshProud;
+                  if (meshProud > meshWorstPoke) {
+                    meshWorstPoke = meshProud;
+                    meshWorstX = px; meshWorstZ = pz;
+                  }
                 }
                 if (proud > worstPoke) {
                   worstPoke = proud;
@@ -576,6 +580,7 @@ Terrain::Terrain() {
                     << " || MESH-model poke>0.25m=" << meshPoke025
                     << " poke>1m=" << meshPoke1m
                     << " worstPoke=" << meshWorstPoke
+                    << " at=(" << meshWorstX << "," << meshWorstZ << ")"
                     << " of " << meshProbes
                     << std::endl;
         }

@@ -2125,6 +2125,17 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
 
     std::vector<bool> done(ge.size(), false);
     int spliceCount = 0;
+    int deadEndsBefore = 0, deadEndsAfter = 0;
+    if (std::getenv("FALLAGA_ROADGAP")) {
+      for (const GapEnd &e : ge) {
+        bool joined = false;
+        for (const GapEnd &o : ge) {
+          if (o.seg == e.seg) continue;
+          if (glm::length(o.pos - e.pos) <= kRoadJunctionTolerance) { joined = true; break; }
+        }
+        if (!joined) ++deadEndsBefore;
+      }
+    }
     for (size_t i = 0; i < ge.size(); ++i) {
       if (done[i])
         continue;
@@ -2136,12 +2147,21 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         if (d <= kRoadJunctionTolerance || d > kMaxRoadGapSplice)
           continue;
 
-        // Each end must aim at the other. This is what separates one road drawn
-        // in two strokes from two roads that merely pass near each other.
         const glm::vec2 u = delta / d;
-        if (glm::dot(ge[i].out, u) < kRoadGapSpliceFacing)
-          continue;
-        if (glm::dot(ge[j].out, -u) < kRoadGapSpliceFacing)
+        const float aimI = glm::dot(ge[i].out, u);
+        const float aimJ = glm::dot(ge[j].out, -u);
+        // Two ways an end may be closed. Either both axes aim at each other, which
+        // is one road drawn in two strokes, or the ends are close enough that a
+        // direct span between them reads as a continuation of both. The second case
+        // is what a hand- or auto-traced network usually leaves behind, and without
+        // it the asphalt simply stops and terrain shows through the gap.
+        const bool facingPair = aimI >= kRoadGapSpliceFacing &&
+                                aimJ >= kRoadGapSpliceFacing;
+        constexpr float kDirectJoinFacing = -0.30f; // up to ~107 deg off-axis
+        const bool directJoin = d <= kDirectJoinRange &&
+                                aimI >= kDirectJoinFacing &&
+                                aimJ >= kDirectJoinFacing;
+        if (!facingPair && !directJoin)
           continue;
 
         // Where the two axes meet, and how cleanly they meet there.
@@ -2149,15 +2169,18 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
             ge[i].pos + ge[i].out * glm::dot(ge[j].pos - ge[i].pos, ge[i].out);
         const glm::vec2 mJ =
             ge[j].pos + ge[j].out * glm::dot(ge[i].pos - ge[j].pos, ge[j].out);
-        if (glm::length(mI - mJ) > kRoadGapSpliceLock)
+        if (facingPair && glm::length(mI - mJ) > kRoadGapSpliceLock)
           continue;
         if (gapIsBlocked(ge[i].pos, ge[j].pos, ge[i].seg, ge[j].seg))
           continue;
 
         // Extend each end along its own axis to the shared meeting point, so
         // the road keeps the direction it was drawn with instead of kinking
-        // sideways.
-        const glm::vec2 joint = (mI + mJ) * 0.5f;
+        // sideways. When the axes do not meet cleanly the span between the ends is
+        // used instead, which keeps the join short and centred on the gap.
+        const glm::vec2 joint = (facingPair && glm::length(mI - mJ) <= kRoadGapSpliceLock)
+                                    ? (mI + mJ) * 0.5f
+                                    : (ge[i].pos + ge[j].pos) * 0.5f;
         if (glm::dot(joint - ge[i].pos, ge[i].out) <= 0.0f)
           continue;
         if (glm::dot(joint - ge[j].pos, ge[j].out) <= 0.0f)
@@ -2180,6 +2203,19 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         ++spliceCount;
         break;
       }
+    }
+    if (std::getenv("FALLAGA_ROADGAP")) {
+      for (const GapEnd &e : ge) {
+        bool joined = false;
+        for (const GapEnd &o : ge) {
+          if (o.seg == e.seg) continue;
+          if (glm::length(o.pos - e.pos) <= kRoadJunctionTolerance) { joined = true; break; }
+        }
+        if (!joined) ++deadEndsAfter;
+      }
+      std::cout << "[RoadGap] dead ends: " << deadEndsBefore << " before splice, "
+                << deadEndsAfter << " after (" << spliceCount << " joined)"
+                << std::endl;
     }
     if (spliceCount > 0)
       std::cout << "[RoadMeshBuilder] Auto-spliced " << spliceCount

@@ -129,6 +129,12 @@ inline float roadWhiteEdgeLineOffset(float roadWidth) {
 constexpr float kMaxRoadGapSplice      = 150.0f;
 constexpr float kRoadGapSpliceFacing   = 0.35f;   // cos of the aim tolerance
 constexpr float kRoadGapSpliceLock     = 6.0f;    // metres, axes must meet this closely
+// A second, more permissive join for the ends a hand- or auto-traced network
+// usually leaves behind: within this distance a direct span between the two ends
+// reads as a continuation of both, even when their axes do not aim at each other.
+// Without it the asphalt stops short and terrain shows through the gap. The
+// blocked-by-a-third-road guard above still applies.
+constexpr float kDirectJoinRange       = 130.0f;
 
 enum class RoadType : int {
     ColonialAvenue = 0,   // Paved macadam, ~10-13m wide
