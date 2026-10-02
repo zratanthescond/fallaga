@@ -774,6 +774,11 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
             worldZ < surfMinZ - surfCellZ || worldZ > surfMaxZ + surfCellZ) return false;
         const int gx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
         const int gz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+        // Only this vertex's own cell. Widening this to a 3x3 neighbourhood (tried)
+        // does cut the terrain-over-road poke further, but it also drags a ~90 m band
+        // of ground down to road level and the road then reads as raised: measured
+        // meanGap 0.20 m -> 0.71 m and worst 9.8 m -> 20.6 m. That is the same
+        // trade-off, just moved, so the narrow lookup is kept.
         const int32_t ti = surfTri[(size_t)gz * surfRes + gx];
         if (ti < 0) return false; // no ribbon here
         outSurfaceY = roadHeightOnTri(nearbyTriangles[(size_t)ti], worldX, worldZ);
@@ -813,8 +818,16 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
             const float targetHeight = surfaceY - kTerrainBelowRoad;
             const size_t idx = (size_t)z * visualW + x;
             const float oldHeight = visualHeights[idx];
-            const float nextHeight = glm::clamp(
-                glm::mix(oldHeight, targetHeight, brushBlend * falloff), minHeight, maxHeight);
+            const float blended = glm::mix(oldHeight, targetHeight, brushBlend * falloff);
+            // The blend above is a soft grade; it leaves the ground only partially
+            // pulled down near the corridor edge. A terrain triangle spanning from
+            // there across the road still crests over the asphalt, which is exactly
+            // the flat-road poking in the screenshots. So the ground is ALSO hard
+            // capped just under the road surface, at full strength, wherever a road
+            // surface governs this vertex. That removes the poke instead of trading
+            // it against floating.
+            const float capped = std::min(blended, surfaceY - (kTerrainBelowRoad * 0.5f));
+            const float nextHeight = glm::clamp(capped, minHeight, maxHeight);
             const float appliedDelta = nextHeight - oldHeight;
             if (std::fabs(appliedDelta) < 0.001f) continue;
             if (appliedRoadConformOffsets.size() != visualHeights.size())
