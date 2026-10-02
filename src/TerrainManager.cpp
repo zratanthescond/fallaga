@@ -772,7 +772,22 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
             }
         }
     }
-    updateGPUHeightmapTexture();
+    if (changedMaxX < changedMinX || changedMaxZ < changedMinZ) return;
+    logHeightfieldSignature(wholeNetwork ? "conform/whole" : "conform/brush");
+    // Upload only the texels this pass could have touched. changedMin/Max are in
+    // visual-grid pixels, so scale them into the native grid the texture uses.
+    {
+        const float sx = (visualW > 1 && gridW > 1)
+                             ? (float)(gridW - 1) / (float)(visualW - 1) : 1.0f;
+        const float sz = (visualH > 1 && gridH > 1)
+                             ? (float)(gridH - 1) / (float)(visualH - 1) : 1.0f;
+        updateGPUHeightmapTextureRect(
+            (int)std::floor(changedMinX * sx) - 1, (int)std::floor(changedMinZ * sz) - 1,
+            (int)std::ceil (changedMaxX * sx) + 1, (int)std::ceil (changedMaxZ * sz) + 1);
+    }
+    // Widen the visual box by one cell for the chunk-overlap test below. The
+    // texture upload above already adds its own margin, so this only affects
+    // which chunk meshes are considered dirty.
     changedMinX = std::max(0, changedMinX - 1); changedMinZ = std::max(0, changedMinZ - 1);
     changedMaxX = std::min(visualW - 1, changedMaxX + 1); changedMaxZ = std::min(visualH - 1, changedMaxZ + 1);
     for (TerrainChunk* chunk : chunks) {
@@ -946,8 +961,17 @@ void TerrainManager::sculpt(float wx, float wz, float radius, float speed, int m
         }
     }
 
-    // Update GPU heightmap texture in real-time
-    updateGPUHeightmapTexture();
+    // Update GPU heightmap texture in real-time. The sync block above only wrote
+    // native pixels inside the scaled brush box, so upload just those.
+    {
+        const float sx = (visualW > 1 && gridW > 1)
+                             ? (float)(gridW - 1) / (float)(visualW - 1) : 1.0f;
+        const float sz = (visualH > 1 && gridH > 1)
+                             ? (float)(gridH - 1) / (float)(visualH - 1) : 1.0f;
+        updateGPUHeightmapTextureRect(
+            (int)std::floor(minX * sx) - 1, (int)std::floor(minZ * sz) - 1,
+            (int)std::ceil (maxX * sx) + 1, (int)std::ceil (maxZ * sz) + 1);
+    }
 
     // Rebuild affected chunks
     for (auto c : chunks) {
@@ -1011,9 +1035,18 @@ void TerrainManager::paint(float wx, float wz, float radius, float speed, int la
         }
     }
 
-    // Re-upload updated road mask to GPU
+    // Re-upload only the painted rectangle. roadMaskData is a full roadW x roadH
+    // RGBA image, so GL_UNPACK_ROW_LENGTH lets glTexSubImage2D read the
+    // sub-rectangle straight out of it without a staging copy. (The whole mask
+    // used to be re-uploaded on every paint frame.) GL_UNPACK_ROW_LENGTH is
+    // restored because it is global state other uploads rely on being 0.
     glBindTexture(GL_TEXTURE_2D, roadMask);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, roadW, roadH, GL_RGBA, GL_UNSIGNED_BYTE, roadMaskData.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, roadW);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, minX, minZ, maxX - minX + 1, maxZ - minZ + 1,
+                    GL_RGBA, GL_UNSIGNED_BYTE,
+                    roadMaskData.data() + ((size_t)minZ * roadW + minX) * 4);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
 }
 
 #include <stb_image_write.h>
@@ -1321,16 +1354,40 @@ void TerrainManager::erodeGlobal() {
 }
 
 void TerrainManager::updateGPUHeightmapTexture() {
-    if (heightmapTexID == 0 || heights.empty()) return;
+    updateGPUHeightmapTextureRect(0, 0, gridW - 1, gridH - 1);
+}
 
-    std::vector<float> texData(gridW * gridH);
-    float heightRange = maxHeight - minHeight;
-    float invHeightRange = (heightRange > 0.0001f) ? (1.0f / heightRange) : 1.0f;
-    for (int i = 0; i < gridW * gridH; ++i) {
-        texData[i] = std::max(0.0f, std::min((heights[i] - minHeight) * invHeightRange, 1.0f));
+void TerrainManager::updateGPUHeightmapTextureRect(int minX, int minZ, int maxX,
+                                                   int maxZ) {
+    if (heightmapTexID == 0 || heights.empty() || gridW <= 0 || gridH <= 0) return;
+
+    // Clamp to the grid; an inverted rectangle becomes empty.
+    minX = std::max(0, std::min(minX, gridW - 1));
+    minZ = std::max(0, std::min(minZ, gridH - 1));
+    maxX = std::max(0, std::min(maxX, gridW - 1));
+    maxZ = std::max(0, std::min(maxZ, gridH - 1));
+    if (maxX < minX || maxZ < minZ) return;
+
+    const int w = maxX - minX + 1;
+    const int h = maxZ - minZ + 1;
+
+    // Reuse one scratch buffer instead of allocating a full-grid vector per call.
+    hmScratch.resize((size_t)w * (size_t)h);
+
+    const float heightRange = maxHeight - minHeight;
+    const float invHeightRange = (heightRange > 0.0001f) ? (1.0f / heightRange) : 1.0f;
+    for (int z = 0; z < h; ++z) {
+        const float* src = heights.data() + (size_t)(minZ + z) * gridW + minX;
+        float* dst = hmScratch.data() + (size_t)z * w;
+        for (int x = 0; x < w; ++x) {
+            dst[x] = std::min(std::max((src[x] - minHeight) * invHeightRange, 0.0f), 1.0f);
+        }
     }
+
     glBindTexture(GL_TEXTURE_2D, heightmapTexID);
-    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, gridW, gridH, GL_RED, GL_FLOAT, texData.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, minX, minZ, w, h, GL_RED, GL_FLOAT,
+                    hmScratch.data());
     glBindTexture(GL_TEXTURE_2D, 0);
 }
 

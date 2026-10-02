@@ -35,6 +35,10 @@ public:
     void saveTerrain();
     void erodeGlobal();
     void updateGPUHeightmapTexture();
+    // Upload only a rectangle of the heightmap texture. Without it every brush
+    // frame re-normalised and re-uploaded the whole native grid (8129^2 floats in
+    // the worst case) for a change covering a few hundred texels.
+    void updateGPUHeightmapTextureRect(int minX, int minZ, int maxX, int maxZ);
     // FALLAGA_ROADGAP: coarse signature of the rendered heightfield. Used to trace which
     // stage of a tool stroke raises terrain back, since the brush, the roadbed deform and
     // the conform all write the same array.
@@ -63,6 +67,11 @@ public:
 
 private:
     void loadHeightmap(const std::string& path);
+    // Pending dirty rectangle of the heightmap texture, in native grid pixels.
+    // -1 in any field means "nothing pending".
+    int hmDirtyMinX = -1, hmDirtyMinZ = -1, hmDirtyMaxX = -1, hmDirtyMaxZ = -1;
+    std::vector<float> hmScratch; // reused scratch for the normalized upload
+
     void setupTextures(const std::string& pmPath);
     void erode(int numDroplets, float brushX, float brushZ, float radius, bool isLocal);
     std::vector<float> heights;
