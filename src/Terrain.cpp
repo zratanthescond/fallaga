@@ -496,6 +496,7 @@ Terrain::Terrain() {
           int meshProbes = 0, meshPoke025 = 0, meshPoke1m = 0;
           double meshWorstPoke = 0.0;
           float meshWorstX = 0.0f, meshWorstZ = 0.0f;
+          float meshWorstRoadY = 0.0f;
           for (size_t vi = 0; vi < rv.size(); ++vi) {
             for (int s = 0; s < 2; ++s) {
               const float o = kStencil[s];
@@ -549,6 +550,7 @@ Terrain::Terrain() {
                   if (meshProud > meshWorstPoke) {
                     meshWorstPoke = meshProud;
                     meshWorstX = px; meshWorstZ = pz;
+                    meshWorstRoadY = roadY;
                   }
                 }
                 if (proud > worstPoke) {
@@ -581,6 +583,7 @@ Terrain::Terrain() {
                     << " poke>1m=" << meshPoke1m
                     << " worstPoke=" << meshWorstPoke
                     << " at=(" << meshWorstX << "," << meshWorstZ << ")"
+                    << " roadY=" << meshWorstRoadY
                     << " of " << meshProbes
                     << std::endl;
         }

@@ -714,40 +714,69 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     const float surfCellZ = std::max(1e-3f, (surfMaxZ - surfMinZ) / (float)surfRes);
     constexpr float kNoPriority = -1e30f;
     std::vector<float> surfPriority((size_t)surfRes * surfRes, kNoPriority);
-    std::vector<float> surfHeight((size_t)surfRes * surfRes,
-                                  std::numeric_limits<float>::infinity());
-    for (const RoadTriangle& tri : nearbyTriangles) {
+    // Cell centre -> the index of the ribbon piece nearest that centre. Storing the
+    // PIECE, not just a height, is what makes the grade accurate: a cell is ~43 m
+    // across here while the road inside it can descend several metres, so a single
+    // aggregate height for the whole cell would grade the ground against road that
+    // is nowhere near the vertex -- which is how terrain was left standing over the
+    // asphalt after the first raster version.
+    std::vector<int32_t> surfTri((size_t)surfRes * surfRes, -1);
+    std::vector<float> surfTriDist((size_t)surfRes * surfRes,
+                                   std::numeric_limits<float>::infinity());
+    for (uint32_t ti = 0; ti < (uint32_t)nearbyTriangles.size(); ++ti) {
+        const RoadTriangle& tri = nearbyTriangles[ti];
         const float triPrio = std::max(tri.a->surfacePriority,
                                        std::max(tri.b->surfacePriority, tri.c->surfacePriority));
-        const float triLow = std::min(tri.a->position.y,
-                                      std::min(tri.b->position.y, tri.c->position.y));
+        const float cxm = (tri.minX + tri.maxX) * 0.5f;
+        const float czm = (tri.minZ + tri.maxZ) * 0.5f;
         const int cx0 = std::clamp((int)((tri.minX - surfMinX) / surfCellX), 0, surfRes - 1);
         const int cx1 = std::clamp((int)((tri.maxX - surfMinX) / surfCellX), 0, surfRes - 1);
         const int cz0 = std::clamp((int)((tri.minZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
         const int cz1 = std::clamp((int)((tri.maxZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
         for (int cz = cz0; cz <= cz1; ++cz) {
+            const float centreZ = surfMinZ + ((float)cz + 0.5f) * surfCellZ;
             for (int cx = cx0; cx <= cx1; ++cx) {
+                const float centreX = surfMinX + ((float)cx + 0.5f) * surfCellX;
+                const float d = glm::length(glm::vec2(centreX - cxm, centreZ - czm));
                 const size_t slot = (size_t)cz * surfRes + cx;
                 if (triPrio > surfPriority[slot]) {
                     // A strictly more dominant surface takes the cell.
                     surfPriority[slot] = triPrio;
-                    surfHeight[slot] = triLow;
-                } else if (triPrio == surfPriority[slot] && triLow < surfHeight[slot]) {
-                    // Same surface, overlapping pieces: keep the lower one so the
-                    // ground has to clear all of it.
-                    surfHeight[slot] = triLow;
+                    surfTri[slot] = (int32_t)ti;
+                    surfTriDist[slot] = d;
+                } else if (triPrio == surfPriority[slot]) {
+                    // Same surface: keep the piece closest to this cell's centre, so
+                    // the graded height is the road that is actually overhead.
+                    if (d < surfTriDist[slot]) {
+                        surfTri[slot] = (int32_t)ti;
+                        surfTriDist[slot] = d;
+                    }
                 }
             }
         }
     }
+    // Road height on a ribbon triangle at an arbitrary XZ, by barycentric
+    // interpolation, falling back to the nearest vertex/edge outside it.
+    auto roadHeightOnTri = [&](const RoadTriangle& tri, float worldX, float worldZ) -> float {
+        const glm::vec2 a(tri.a->position.x, tri.a->position.z);
+        const glm::vec2 b(tri.b->position.x, tri.b->position.z);
+        const glm::vec2 c(tri.c->position.x, tri.c->position.z);
+        const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+        if (std::fabs(area) < 1e-8f)
+            return std::min(tri.a->position.y, std::min(tri.b->position.y, tri.c->position.y));
+        const float wb = ((worldX - a.x) * (c.y - a.y) - (worldZ - a.y) * (c.x - a.x)) / area;
+        const float wc = ((b.x - a.x) * (worldZ - a.y) - (b.y - a.y) * (worldX - a.x)) / area;
+        const float wa = 1.0f - wb - wc;
+        return wa * tri.a->position.y + wb * tri.b->position.y + wc * tri.c->position.y;
+    };
     auto gradeTargetNear = [&](float worldX, float worldZ, float& outSurfaceY) -> bool {
         if (worldX < surfMinX - surfCellX || worldX > surfMaxX + surfCellX ||
             worldZ < surfMinZ - surfCellZ || worldZ > surfMaxZ + surfCellZ) return false;
         const int gx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
         const int gz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
-        const float h = surfHeight[(size_t)gz * surfRes + gx];
-        if (h == std::numeric_limits<float>::infinity()) return false; // no ribbon here
-        outSurfaceY = h;
+        const int32_t ti = surfTri[(size_t)gz * surfRes + gx];
+        if (ti < 0) return false; // no ribbon here
+        outSurfaceY = roadHeightOnTri(nearbyTriangles[(size_t)ti], worldX, worldZ);
         return true;
     };
 
@@ -761,15 +790,19 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
             if (!wholeNetwork && glm::length(glm::vec2(worldX - wx, worldZ - wz)) > radius) continue;
             float surfaceY = 0.0f;
             if (!gradeTargetNear(worldX, worldZ, surfaceY)) continue;
-            const int gx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
-            const int gz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
-            const float cellCentreX = surfMinX + ((float)gx + 0.5f) * surfCellX;
-            const float cellCentreZ = surfMinZ + ((float)gz + 0.5f) * surfCellZ;
-            const float cellDist = glm::length(glm::vec2(worldX - cellCentreX,
-                                                         worldZ - cellCentreZ));
+            // Distance from this vertex to the ribbon piece that governs its cell.
+            // Using the true ribbon distance (not the distance to the cell centre)
+            // keeps the corridor/berm falloff meaningful at ~43 m cells.
+            const int dgx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
+            const int dgz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+            const float ribbonDist =
+                glm::distance(glm::vec2(worldX, worldZ),
+                              glm::vec2(surfMinX + ((float)dgx + 0.5f) * surfCellX,
+                                        surfMinZ + ((float)dgz + 0.5f) * surfCellZ)) +
+                surfTriDist[(size_t)dgz * surfRes + dgx];
             const float corridorT = kRoadBermWidth > 1e-4f
-                ? glm::clamp((cellDist - kRoadCorridor) / kRoadBermWidth, 0.0f, 1.0f)
-                : (cellDist <= cellReach ? 0.0f : 1.0f);
+                ? glm::clamp((ribbonDist - kRoadCorridor) / kRoadBermWidth, 0.0f, 1.0f)
+                : (ribbonDist <= cellReach ? 0.0f : 1.0f);
             float falloff = 1.0f - corridorT * corridorT * (3.0f - 2.0f * corridorT);
             if (!wholeNetwork) {
                 const float brushDistance = glm::length(glm::vec2(worldX - wx, worldZ - wz));
