@@ -800,10 +800,25 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     if (wholeNetwork && std::getenv("FALLAGA_ROADGAP")) {
         const long long cells = (long long)(changedMaxX - changedMinX + 1) *
                                 (changedMaxZ - changedMinZ + 1);
-        std::cout << "[Conform] skirt=" << conformSkirt << "m cells=" << cells
+        // How many cells in the graded box actually carry a road surface, and how
+        // far the outermost one is from a ribbon. The raster is only painted where a
+        // triangle exists, so this shows whether the conform reaches the whole box.
+        int gradedCells = 0;
+        float probe = 0.0f;
+        for (int z = std::max(0, changedMinZ); z <= std::min(visualH - 1, changedMaxZ); ++z) {
+            for (int x = std::max(0, changedMinX); x <= std::min(visualW - 1, changedMaxX); ++x) {
+                const float gx = worldMinX + (float)x / (visualW - 1) * worldWidth;
+                const float gz = worldMinZ + (float)z / (visualH - 1) * worldDepth;
+                if (gradeTargetNear(gx, gz, probe)) ++gradedCells;
+            }
+        }
+        std::cout << "[Conform] skirt=" << conformSkirt << "m corridor=" << kRoadCorridor
+                  << "m berm=" << kRoadBermWidth << "m cellReach=" << cellReach
+                  << "m cells=" << cells
                   << " of " << (long long)visualW * visualH
                   << " box=" << (changedMaxX - changedMinX + 1) << "x"
-                  << (changedMaxZ - changedMinZ + 1) << std::endl;
+                  << (changedMaxZ - changedMinZ + 1)
+                  << " gradedCells=" << gradedCells << std::endl;
     }
 
     // Keep native-resolution height queries and collision aligned with the mesh.
