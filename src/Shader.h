@@ -12,7 +12,36 @@ class Shader
 {
 public:
     // Program ID
-    unsigned int ID;
+    unsigned int ID = 0;
+
+    // Shader owns a GL program, so it must not be copied (a copy would free the
+    // same program twice). Moves transfer ownership and leave the source at 0.
+    Shader(const Shader&) = delete;
+    Shader& operator=(const Shader&) = delete;
+    Shader(Shader&& other) noexcept : ID(other.ID) { other.ID = 0; }
+    Shader& operator=(Shader&& other) noexcept {
+        if (this != &other) {
+            release();
+            ID = other.ID;
+            other.ID = 0;
+        }
+        return *this;
+    }
+
+    // Every `new Shader(...)` used to leak its linked program: nothing in the
+    // codebase ever called glDeleteProgram.
+    ~Shader() { release(); }
+
+    void release() {
+        if (ID != 0) {
+            glDeleteProgram(ID);
+            ID = 0;
+        }
+    }
+
+    bool isValid() const { return ID != 0; }
+
+   
     void setVec2(const std::string &name, const glm::vec2 &value) const
     {
         glUniform2fv(glGetUniformLocation(ID, name.c_str()), 1, glm::value_ptr(value));
@@ -28,6 +57,7 @@ public:
     // Constructor reads and builds the shader
     Shader(const char* vertexPath, const char* fragmentPath)
     {
+        ID = 0;
         // 1. Retrieve the vertex/fragment source code from filePath
         std::string vertexCode;
         std::string fragmentCode;

@@ -98,8 +98,24 @@ TerrainManager::TerrainManager(const std::string& hmPath, const std::string& pmP
 
 TerrainManager::~TerrainManager() {
     for (auto c : chunks) delete c;
-    if (roadGeometryMask) glDeleteTextures(1, &roadGeometryMask);
+    chunks.clear();
+    // Everything this manager allocated itself. Previously only roadGeometryMask
+    // was freed, so each run leaked the 16-bit heightmap texture plus the two
+    // 15-slice 1024^2 texture arrays (~160 MB with mipmaps).
+    if (roadGeometryMask)  glDeleteTextures(1, &roadGeometryMask);
+    if (heightmapTexID)    glDeleteTextures(1, &heightmapTexID);
+    if (roadMask)          glDeleteTextures(1, &roadMask);
+    if (terrainLayerArray) glDeleteTextures(1, &terrainLayerArray);
+    if (terrainNormalArray) glDeleteTextures(1, &terrainNormalArray);
+    if (terrainDispArray)  glDeleteTextures(1, &terrainDispArray);
+    if (terrainRoughArray) glDeleteTextures(1, &terrainRoughArray);
+    roadGeometryMask = heightmapTexID = roadMask = 0;
+    terrainLayerArray = terrainNormalArray = terrainDispArray = terrainRoughArray = 0;
+    // portMask / albedoTex / splatmap2Tex are owned by TextureEngine's cache and
+    // are released by TextureEngine::cleanup(), so they are deliberately not
+    // deleted here (that would be a double free).
     delete terrainShader;
+    terrainShader = nullptr;
 }
 
 void TerrainManager::setRoadGeometryMask(const unsigned char* mask, int maskW, int maskH) {
@@ -129,6 +145,9 @@ void TerrainManager::loadHeightmap(const std::string& path) {
         gridW = w; 
         gridH = h; 
         heights.resize(w * h);
+        // `resize` may reallocate; tell caching consumers (HeightSampler) that any
+        // pointer they hold to the previous buffer is now dangling.
+        ++heightRevision;
 
         // Single loop to convert 16-bit raw data to float elevations
         float invDivisor = 1.0f / 65535.0f;
@@ -838,19 +857,9 @@ void TerrainManager::sculpt(float wx, float wz, float radius, float speed, int m
                 }
             }
         }
-        if (visualSmoothingAffectsPhysics) {
-            for (int z = minZ; z <= maxZ; ++z) {
-                for (int x = minX; x <= maxX; ++x) {
-                    float dx = (float)x - gridCenterX;
-                    float dz = (float)z - gridCenterZ;
-                    float dist = sqrt(dx*dx + dz*dz);
-                    if (dist <= gridRadius && (size_t)(z * visualW + x) < physicsVisualHeights.size()) {
-                        physicsVisualHeights[z * visualW + x] = visualHeights[z * visualW + x];
-                    }
-                }
-            }
-        }
-        // Don't sync native heights for visual-only smooth unless physics affected
+        // The sync block below mirrors this into physicsVisualHeights (and from
+        // there into the native `heights` grid), so the smooth brush can no longer
+        // reshape the rendered surface while collision keeps the old height.
     } else if (mode == 4) { // Erode brush
         int numDroplets = (int)(radius * speed * dt * 30.0f);
         if (numDroplets < 1) numDroplets = 1;
@@ -889,9 +898,11 @@ void TerrainManager::sculpt(float wx, float wz, float radius, float speed, int m
         }
     }
 
-    // Sync edited heights back to physics/native heights
-    bool affectsPhysics = (mode != 3) || visualSmoothingAffectsPhysics;
-    if (affectsPhysics) {
+    // Sync edited heights back to physics/native heights. Every brush that is
+    // visible must also move the collision surface, otherwise the mesh and
+    // getHeightAt() disagree and characters/cars float or sink by the full brush
+    // delta. This used to be conditional on `visualSmoothingAffectsPhysics`.
+    {
         // Mirror visual edits to physics heights
         for (int z = minZ; z <= maxZ; ++z) {
             for (int x = minX; x <= maxX; ++x) {

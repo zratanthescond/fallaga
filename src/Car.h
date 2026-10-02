@@ -60,8 +60,8 @@ public:
   };
 
   struct Wheel {
-    glm::vec3 localPos;
-    glm::vec3 worldPos;
+    glm::vec3 localPos = glm::vec3(0.0f);
+    glm::vec3 worldPos = glm::vec3(0.0f);
     float radius = 0.35f;
     float spinAngle = 0.0f;
     float angularVelocity = 0.0f;
@@ -203,8 +203,15 @@ private:
 
   int meshBody = -1;
   int meshFL = -1, meshFR = -1, meshBL = -1, meshBR = -1;
-  glm::vec3 wheelOffsetFL, wheelOffsetFR, wheelOffsetBL, wheelOffsetBR;
-  glm::vec3 carCenter;
+  // Zero-initialised: resolveWheelMeshes() only assigns these when wheel
+  // detection succeeds, but they are read unconditionally afterwards.
+  glm::vec3 wheelOffsetFL = glm::vec3(0.0f);
+  glm::vec3 wheelOffsetFR = glm::vec3(0.0f);
+  glm::vec3 wheelOffsetBL = glm::vec3(0.0f);
+  glm::vec3 wheelOffsetBR = glm::vec3(0.0f);
+  glm::vec3 carCenter = glm::vec3(0.0f);
+  // False when resolveWheelMeshes() could not identify four wheels.
+  bool wheelLayoutResolved = false;
 
   float m_Wheelbase = 2.8f;
   float m_TrackWidth = 1.6f;

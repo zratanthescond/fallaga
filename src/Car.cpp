@@ -33,6 +33,7 @@ void Car::resolveWheelMeshes() {
     return;
   meshBody = meshFL = meshFR = meshBL = meshBR = -1;
   isPaintedModel = false;
+  wheelLayoutResolved = false;
 
   const int total = model->getMeshCount();
   std::cout << "[Car] " << total << " meshes:\n";
@@ -163,6 +164,7 @@ void Car::resolveWheelMeshes() {
     wheelOffsetFR = remapOffset(meshFR);
     wheelOffsetBL = remapOffset(meshBL);
     wheelOffsetBR = remapOffset(meshBR);
+    wheelLayoutResolved = true;
   }
 
   if (meshFL >= 0 && meshBL >= 0) {
@@ -191,6 +193,22 @@ void Car::resolveWheelMeshes() {
     wheels[i].isFront = (i < 2);
     wheels[i].isDriven = true;
   }
+
+  if (!wheelLayoutResolved) {
+    // Wheel detection is heuristic (part-name tokens, then the four smallest
+    // AABBs), so it can legitimately fail on an unfamiliar model. Fall back to a
+    // symmetric layout derived from the configured wheelbase/track width instead
+    // of driving the tire solver from indeterminate hub positions.
+    const float halfTrack = std::max(0.5f, m_TrackWidth * 0.5f) / SCALE_FACTOR;
+    const float halfBase = std::max(1.0f, m_Wheelbase * 0.5f) / SCALE_FACTOR;
+    wheelOffsetFL = glm::vec3(-halfTrack, 0.0f, -halfBase);
+    wheelOffsetFR = glm::vec3(halfTrack, 0.0f, -halfBase);
+    wheelOffsetBL = glm::vec3(-halfTrack, 0.0f, halfBase);
+    wheelOffsetBR = glm::vec3(halfTrack, 0.0f, halfBase);
+    std::cerr << "[Car] Wheel detection failed; falling back to a synthetic "
+              << m_Wheelbase << "m x " << m_TrackWidth << "m wheel layout.\n";
+  }
+
   wheels[0].localPos = wheelOffsetFL;
   wheels[1].localPos = wheelOffsetFR;
   wheels[2].localPos = wheelOffsetBL;

@@ -82,6 +82,12 @@ public:
     bool loadProjRefMap();
     void commitRoadDraft();
     void cancelRoadDraft();
+    // Graceful shutdown request. The scripted FALLAGA_TEST_MODE harness used to
+    // call exit() straight from Game::update(), which skips every destructor and
+    // any pending save. main() polls this and leaves its loop instead.
+    void requestQuit(int exitCode) { quitRequested = true; requestedExitCode = exitCode; }
+    bool isQuitRequested() const { return quitRequested; }
+    int getRequestedExitCode() const { return requestedExitCode; }
     float projSaveFlash = 0.0f;   // seconds remaining of "SAVED" highlight on the map-panel button
     // Auto-save snapshot: last placement that was persisted to disk
     glm::vec2 projSavedCenter = glm::vec2(0.0f);
@@ -106,4 +112,11 @@ public:
     double lastFrameTime;
     double deltaTime;
     double totalTime;
+
+private:
+    bool quitRequested = false;
+    int requestedExitCode = 0;
+    // GPU timer queries. Members (not function-local statics) so the destructor can
+    // delete them; they used to be glGen'd and never freed.
+    unsigned int gpuTimerQueries[4] = {0, 0, 0, 0};
 };

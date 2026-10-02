@@ -587,19 +587,31 @@ int main() {
         }
 
         glfwPollEvents();
+
+        // The FALLAGA_TEST_MODE harness requests shutdown through this flag
+        // instead of calling exit() mid-frame, so the Game destructor (and any
+        // GL/audio teardown) still runs.
+        if (game->isQuitRequested()) break;
     }
 
     // 6. Cleanup
+    const int exitCode = game->getRequestedExitCode();
     delete game;
     glfwDestroyWindow(window);
     glfwTerminate();
-    return 0;
+    return exitCode;
 }
 
 // Initial OpenGL state setup
 void setup_opengl(int width, int height) {
     glClearColor(0.5f, 0.7f, 1.0f, 1.0f); 
     glEnable(GL_DEPTH_TEST);
+    // The engine renders most content two-sided (terrain chunk skirts, the water
+    // plane, the sky dome) and its geometry is not authored with a consistent
+    // winding order, so culling is deliberately off. It used to be disabled ad hoc
+    // inside render passes with no matching re-enable, which left the state
+    // implicit and order-dependent; declaring it once here makes it explicit.
+    glDisable(GL_CULL_FACE);
     glEnable(GL_LIGHTING);
     glEnable(GL_LIGHT0);
     glEnable(GL_COLOR_MATERIAL);

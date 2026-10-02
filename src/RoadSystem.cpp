@@ -580,10 +580,16 @@ static bool parseRoadObject(JsonReader &json, RoadSegment &seg) {
     } else if (key == "width") {
       if (!json.readFloat(seg.width))
         return false;
+      // A zero or negative width produces inverted, self-crossing ribbons and
+      // degenerate junction hulls further down the pipeline.
+      if (!(seg.width > 0.0f) || seg.width > 1000.0f)
+        return json.fail("\"width\" must be greater than 0 and at most 1000 metres");
       hasWidth = true;
     } else if (key == "shoulder") {
       if (!json.readFloat(seg.shoulderWidth))
         return false;
+      if (!(seg.shoulderWidth >= 0.0f) || seg.shoulderWidth > 1000.0f)
+        return json.fail("\"shoulder\" must be between 0 and 1000 metres");
       hasShoulder = true;
     } else if (key == "corner") {
       if (!json.readFloat(seg.cornerRadius))
@@ -686,12 +692,31 @@ bool RoadGraph::loadFromJSON(const std::string &path) {
               << ": ignoring trailing content after the JSON object"
               << std::endl;
 
+  // Duplicate ids make outranks() false in both directions, so neither road
+  // suppresses the other's paint and the junction surfaces z-fight. Treat them
+  // as a data error rather than silently building broken geometry.
+  {
+    std::unordered_map<uint32_t, size_t> seenIds;
+    for (size_t i = 0; i < loaded.size(); ++i) {
+      auto ins = seenIds.emplace(loaded[i].id, i);
+      if (!ins.second) {
+        std::cerr << "[RoadGraph] " << path << ": duplicate road id "
+                  << loaded[i].id << " (roads " << ins.first->second << " and "
+                  << i << ")" << std::endl;
+        return false;
+      }
+    }
+  }
+
+  // Commit only once the whole document has parsed. Committing before the
+  // success check meant a valid file with an empty "roads" array wiped the graph
+  // while still reporting failure to the caller.
   segments = std::move(loaded);
   nodes.clear();
 
   std::cout << "[RoadGraph] Loaded " << segments.size()
             << " road segments from " << path << std::endl;
-  return !segments.empty();
+  return true;
 }
 
 bool RoadGraph::saveToJSON(const std::string &path) const {
@@ -1997,6 +2022,28 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
     }
   }
 
+  // Attaching a branch moves and re-evaluates a host endpoint (line above), which
+  // can change a host segment's sample count. Any hostSample captured for that
+  // segment before this point may now be out of range, and bareAt[] is sized from
+  // the final counts, so every captured host index has to be re-validated here.
+  // (bareAt[host][stale] was an out-of-bounds heap write.)
+  for (BranchContact &contact : branchContacts) {
+    if (contact.host < 0 || contact.host >= S) {
+      contact.host = -1;
+      contact.hostSample = -1;
+      continue;
+    }
+    const int hostSamples = (int)segments[contact.host].splinePoints.size();
+    if (contact.hostSample < 0 || contact.hostSample >= hostSamples) {
+      // Re-point at the nearest still-valid sample rather than dropping the join.
+      contact.hostSample = glm::clamp(contact.hostSample, 0, std::max(0, hostSamples - 1));
+      if (hostSamples < 2) {
+        contact.host = -1;
+        contact.hostSample = -1;
+      }
+    }
+  }
+
   // â”€â”€â”€ 1. Endpoint clustering
   // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   // ── 0c. Automatic gap splicing ───────────────────────────────────────────
@@ -2517,6 +2564,11 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   // Add a fallback pad only when that road pair does not already have a nearby
   // crossing pad, avoiding the duplicate coplanar surfaces that caused blobs.
   for (const BranchContact &contact : branchContacts) {
+    // Contacts whose host could not be re-validated after the attach pass are
+    // dropped here; indexing segments[contact.host] with -1 would be fatal.
+    if (contact.host < 0 || contact.host >= S ||
+        contact.seg < 0 || contact.seg >= S)
+      continue;
     const float mergeDistance =
         std::max(segments[contact.seg].width, segments[contact.host].width) *
         1.5f;
@@ -2546,7 +2598,13 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
                       segments[contact.host].width * 0.5f);
     crossSites.push_back(site);
     bareAt[contact.seg][endIdx] = 1;
-    bareAt[contact.host][contact.hostSample] = 1;
+    // Guarded: the sample index is validated when the contact is captured, but
+    // bareAt[] is sized from the final sample counts, so never write blind here.
+    if (contact.host >= 0 && contact.host < S &&
+        contact.hostSample >= 0 &&
+        contact.hostSample < (int)bareAt[contact.host].size()) {
+      bareAt[contact.host][contact.hostSample] = 1;
+    }
     ++bareSamples;
   }
 
@@ -3811,20 +3869,24 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
 }
 
 void RoadMeshBuilder::upload() {
-  if (m_vertices.empty() || m_indices.empty())
+  // Create the GL objects only once and re-fill them in place afterwards. The old
+  // version deleted and re-glGen'd the VAO/VBO/EBO on every upload, and the road
+  // pipeline uploads more than once per frame while a control point is dragged.
+  // An empty rebuild must still release the previous buffers: rendering stops
+  // because m_VAO is 0, which removes the stale-geometry case the early return
+  // used to leave behind.
+  if (m_vertices.empty() || m_indices.empty()) {
+    destroy();
     return;
+  }
 
-  // Cleanup previous
-  if (m_VAO)
-    glDeleteVertexArrays(1, &m_VAO);
-  if (m_VBO)
-    glDeleteBuffers(1, &m_VBO);
-  if (m_EBO)
-    glDeleteBuffers(1, &m_EBO);
-
-  glGenVertexArrays(1, &m_VAO);
-  glGenBuffers(1, &m_VBO);
-  glGenBuffers(1, &m_EBO);
+  if (m_VAO == 0) glGenVertexArrays(1, &m_VAO);
+  if (m_VBO == 0) glGenBuffers(1, &m_VBO);
+  if (m_EBO == 0) glGenBuffers(1, &m_EBO);
+  if (m_VAO == 0 || m_VBO == 0 || m_EBO == 0) {
+    std::cerr << "[RoadMeshBuilder] Failed to allocate GPU buffers" << std::endl;
+    return;
+  }
 
   glBindVertexArray(m_VAO);
 

@@ -1,5 +1,6 @@
 #include "TerrainChunk.h"
 #include <algorithm>
+#include <iostream>
 
 TerrainChunk::TerrainChunk(int x, int z, int size) : gridX(x), gridZ(z), size(size) {}
 TerrainChunk::~TerrainChunk() {
@@ -45,9 +46,9 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
             float hN = globalHeights[std::min(globalH - 1, gRow + 1) * globalW + gCol];
             float hS = globalHeights[std::max(0, gRow - 1) * globalW + gCol];
 
-            // Pixel spacing in world units
-            float pixelSpacingX = worldWidth / (globalW - 1);
-            float pixelSpacingZ = worldHeight / (globalH - 1);
+            // Pixel spacing in world units (a 1-column/row grid would divide by zero)
+            float pixelSpacingX = worldWidth / std::max(1, globalW - 1);
+            float pixelSpacingZ = worldHeight / std::max(1, globalH - 1);
 
             // Normal from gradient: (dZ/dX, 1, dZ/dZ)
             glm::vec3 normal = glm::normalize(glm::vec3(
@@ -78,14 +79,17 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
 
     indexCount = (int)indices.size();
 
-    // Setup VAO/VBO/EBO
-    if (VAO) { glDeleteVertexArrays(1, &VAO); VAO = 0; }
-    if (VBO) { glDeleteBuffers(1, &VBO); VBO = 0; }
-    if (EBO) { glDeleteBuffers(1, &EBO); EBO = 0; }
-
-    glGenVertexArrays(1, &VAO);
-    glGenBuffers(1, &VBO);
-    glGenBuffers(1, &EBO);
+    // Setup VAO/VBO/EBO. The objects are created once and re-filled in place on
+    // later rebuilds: generateMesh runs on every brush frame while sculpting, and
+    // deleting/re-creating three GL objects per chunk per frame is pure driver
+    // churn. glBufferData orphans and refills the existing store.
+    if (VAO == 0) glGenVertexArrays(1, &VAO);
+    if (VBO == 0) glGenBuffers(1, &VBO);
+    if (EBO == 0) glGenBuffers(1, &EBO);
+    if (VAO == 0 || VBO == 0 || EBO == 0) {
+        std::cerr << "[TerrainChunk] Failed to allocate GPU buffers" << std::endl;
+        return;
+    }
 
     glBindVertexArray(VAO);
     glBindBuffer(GL_ARRAY_BUFFER, VBO);

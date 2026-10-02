@@ -29,78 +29,79 @@ bool AudioSystem::init() {
     }
     m_engine = engine;
 
-    // Allocate sounds
-    ma_sound* sIdle = new ma_sound;
-    ma_sound* sDriving = new ma_sound;
-    ma_sound* sIgnition = new ma_sound;
-    ma_sound* sStop = new ma_sound;
-    ma_sound* sHorn = new ma_sound;
+    // Load one sound. On failure the ma_sound must be destroyed immediately and
+    // reported as null: every later call site (cleanup, updateEngine, the one-shot
+    // events) would otherwise operate on a ma_sound that was never initialized,
+    // which reads indeterminate fields and is undefined behaviour.
+    auto loadSound = [this](const char* path, void*& out) {
+        ma_sound* sound = new ma_sound;
+        if (ma_sound_init_from_file((ma_engine*)m_engine, path, 0, NULL, NULL, sound) != MA_SUCCESS) {
+            std::cerr << "[AudioSystem] Failed to load " << path
+                      << " (sound disabled)" << std::endl;
+            delete sound;
+            out = nullptr;
+            return false;
+        }
+        out = sound;
+        return true;
+    };
 
     // Load sounds (relative to working directory)
-    ma_result result;
-    result = ma_sound_init_from_file(engine, "assets/cars/sound/engine_idle.mp3", 0, NULL, NULL, sIdle);
-    if (result != MA_SUCCESS) std::cerr << "[AudioSystem] Failed to load engine_idle.mp3" << std::endl;
-    
-    result = ma_sound_init_from_file(engine, "assets/cars/sound/engine_driving.mp3", 0, NULL, NULL, sDriving);
-    if (result != MA_SUCCESS) std::cerr << "[AudioSystem] Failed to load engine_driving.mp3" << std::endl;
+    loadSound("assets/cars/sound/engine_idle.mp3",   m_soundIdle);
+    loadSound("assets/cars/sound/engine_driving.mp3", m_soundDriving);
+    loadSound("assets/cars/sound/engin_ignition.mp3", m_soundIgnition);
+    loadSound("assets/cars/sound/engin_stop.mp3",     m_soundStop);
+    loadSound("assets/cars/sound/old-car-horn.mp3",   m_soundHorn);
 
-    result = ma_sound_init_from_file(engine, "assets/cars/sound/engin_ignition.mp3", 0, NULL, NULL, sIgnition);
-    if (result != MA_SUCCESS) std::cerr << "[AudioSystem] Failed to load engin_ignition.mp3" << std::endl;
+    if (!m_soundIdle && !m_soundDriving) {
+        std::cerr << "[AudioSystem] No engine audio could be loaded; audio disabled." << std::endl;
+        return false;
+    }
 
-    result = ma_sound_init_from_file(engine, "assets/cars/sound/engin_stop.mp3", 0, NULL, NULL, sStop);
-    if (result != MA_SUCCESS) std::cerr << "[AudioSystem] Failed to load engin_stop.mp3" << std::endl;
-
-    result = ma_sound_init_from_file(engine, "assets/cars/sound/old-car-horn.mp3", 0, NULL, NULL, sHorn);
-    if (result != MA_SUCCESS) std::cerr << "[AudioSystem] Failed to load old-car-horn.mp3" << std::endl;
-
-    // Set loops
-    ma_sound_set_looping(sIdle, MA_TRUE);
-    ma_sound_set_looping(sDriving, MA_TRUE);
-    ma_sound_set_looping(sHorn, MA_TRUE);
+    // Set loops (only on sounds that actually loaded)
+    if (m_soundIdle)    ma_sound_set_looping((ma_sound*)m_soundIdle, MA_TRUE);
+    if (m_soundDriving) ma_sound_set_looping((ma_sound*)m_soundDriving, MA_TRUE);
+    if (m_soundHorn)    ma_sound_set_looping((ma_sound*)m_soundHorn, MA_TRUE);
 
     // Initial volumes
-    ma_sound_set_volume(sIdle, 0.0f);
-    ma_sound_set_volume(sDriving, 0.0f);
+    if (m_soundIdle)    ma_sound_set_volume((ma_sound*)m_soundIdle, 0.0f);
+    if (m_soundDriving) ma_sound_set_volume((ma_sound*)m_soundDriving, 0.0f);
 
     // Configure 3D attenuation min distances
-    ma_sound_set_min_distance(sIdle, 5.0f);
-    ma_sound_set_min_distance(sDriving, 5.0f);
-    ma_sound_set_min_distance(sIgnition, 5.0f);
-    ma_sound_set_min_distance(sStop, 5.0f);
-    ma_sound_set_min_distance(sHorn, 10.0f);
-
-    m_soundIdle = sIdle;
-    m_soundDriving = sDriving;
-    m_soundIgnition = sIgnition;
-    m_soundStop = sStop;
-    m_soundHorn = sHorn;
+    if (m_soundIdle)     ma_sound_set_min_distance((ma_sound*)m_soundIdle, 5.0f);
+    if (m_soundDriving)  ma_sound_set_min_distance((ma_sound*)m_soundDriving, 5.0f);
+    if (m_soundIgnition) ma_sound_set_min_distance((ma_sound*)m_soundIgnition, 5.0f);
+    if (m_soundStop)     ma_sound_set_min_distance((ma_sound*)m_soundStop, 5.0f);
+    if (m_soundHorn)     ma_sound_set_min_distance((ma_sound*)m_soundHorn, 10.0f);
 
     m_initialized = true;
     m_engineRunning = true; // Auto-start for now unless explicitly stopped
-    
+
     // Start looping sounds
-    ma_sound_start(sIdle);
-    ma_sound_start(sDriving);
+    if (m_soundIdle)    ma_sound_start((ma_sound*)m_soundIdle);
+    if (m_soundDriving) ma_sound_start((ma_sound*)m_soundDriving);
 
     std::cout << "[AudioSystem] Sample-Based Engine Audio initialized." << std::endl;
     return true;
 }
 
 void AudioSystem::cleanup() {
-    if (m_initialized) {
-        if (m_soundIdle) { ma_sound_uninit((ma_sound*)m_soundIdle); delete (ma_sound*)m_soundIdle; }
-        if (m_soundDriving) { ma_sound_uninit((ma_sound*)m_soundDriving); delete (ma_sound*)m_soundDriving; }
-        if (m_soundIgnition) { ma_sound_uninit((ma_sound*)m_soundIgnition); delete (ma_sound*)m_soundIgnition; }
-        if (m_soundStop) { ma_sound_uninit((ma_sound*)m_soundStop); delete (ma_sound*)m_soundStop; }
-        if (m_soundHorn) { ma_sound_uninit((ma_sound*)m_soundHorn); delete (ma_sound*)m_soundHorn; }
-        
-        if (m_engine) { ma_engine_uninit((ma_engine*)m_engine); delete (ma_engine*)m_engine; }
-        
-        m_engine = nullptr; m_soundIdle = nullptr; m_soundDriving = nullptr;
-        m_soundIgnition = nullptr; m_soundStop = nullptr; m_soundHorn = nullptr;
-        m_initialized = false;
-        std::cout << "[AudioSystem] Audio cleaned up." << std::endl;
-    }
+    if (!m_initialized) return;
+
+    // uninit only what was really initialized; loadSound nulls every failure.
+    if (m_soundIdle)     { ma_sound_uninit((ma_sound*)m_soundIdle);     delete (ma_sound*)m_soundIdle; }
+    if (m_soundDriving)  { ma_sound_uninit((ma_sound*)m_soundDriving);  delete (ma_sound*)m_soundDriving; }
+    if (m_soundIgnition) { ma_sound_uninit((ma_sound*)m_soundIgnition); delete (ma_sound*)m_soundIgnition; }
+    if (m_soundStop)     { ma_sound_uninit((ma_sound*)m_soundStop);     delete (ma_sound*)m_soundStop; }
+    if (m_soundHorn)     { ma_sound_uninit((ma_sound*)m_soundHorn);     delete (ma_sound*)m_soundHorn; }
+
+    if (m_engine) { ma_engine_uninit((ma_engine*)m_engine); delete (ma_engine*)m_engine; }
+
+    m_engine = nullptr; m_soundIdle = nullptr; m_soundDriving = nullptr;
+    m_soundIgnition = nullptr; m_soundStop = nullptr; m_soundHorn = nullptr;
+    m_initialized = false;
+    m_engineRunning = false;
+    std::cout << "[AudioSystem] Audio cleaned up." << std::endl;
 }
 
 void AudioSystem::updateListener(const glm::vec3& pos, const glm::vec3& forward, const glm::vec3& up) {
@@ -115,6 +116,7 @@ void AudioSystem::playIgnition(const glm::vec3& position) {
     if (!m_initialized) return;
     m_engineRunning = true;
     ma_sound* sound = (ma_sound*)m_soundIgnition;
+    if (!sound) return;
     ma_sound_set_position(sound, position.x, position.y, position.z);
     ma_sound_seek_to_pcm_frame(sound, 0);
     ma_sound_start(sound);
@@ -123,9 +125,10 @@ void AudioSystem::playIgnition(const glm::vec3& position) {
 void AudioSystem::playStop(const glm::vec3& position) {
     if (!m_initialized) return;
     m_engineRunning = false;
-    ma_sound_set_volume((ma_sound*)m_soundIdle, 0.0f);
-    ma_sound_set_volume((ma_sound*)m_soundDriving, 0.0f);
+    if (m_soundIdle)    ma_sound_set_volume((ma_sound*)m_soundIdle, 0.0f);
+    if (m_soundDriving) ma_sound_set_volume((ma_sound*)m_soundDriving, 0.0f);
     ma_sound* sound = (ma_sound*)m_soundStop;
+    if (!sound) return;
     ma_sound_set_position(sound, position.x, position.y, position.z);
     ma_sound_seek_to_pcm_frame(sound, 0);
     ma_sound_start(sound);
@@ -134,13 +137,14 @@ void AudioSystem::playStop(const glm::vec3& position) {
 void AudioSystem::playHorn(const glm::vec3& position) {
     if (!m_initialized) return;
     ma_sound* sound = (ma_sound*)m_soundHorn;
+    if (!sound) return;
     ma_sound_set_position(sound, position.x, position.y, position.z);
     ma_sound_start(sound);
 }
 
 void AudioSystem::stopHorn() {
     if (!m_initialized) return;
-    ma_sound_stop((ma_sound*)m_soundHorn);
+    if (m_soundHorn) ma_sound_stop((ma_sound*)m_soundHorn);
 }
 
 void AudioSystem::updateEngine(float rpm, float throttle, float maxRpm, const glm::vec3& position) {
@@ -148,10 +152,13 @@ void AudioSystem::updateEngine(float rpm, float throttle, float maxRpm, const gl
 
     ma_sound* sIdle = (ma_sound*)m_soundIdle;
     ma_sound* sDriving = (ma_sound*)m_soundDriving;
+    // Either engine loop may have failed to load; the crossfade is still valid
+    // for whichever one survived.
+    if (!sIdle && !sDriving) return;
 
     // Update 3D positions
-    ma_sound_set_position(sIdle, position.x, position.y, position.z);
-    ma_sound_set_position(sDriving, position.x, position.y, position.z);
+    if (sIdle)    ma_sound_set_position(sIdle, position.x, position.y, position.z);
+    if (sDriving) ma_sound_set_position(sDriving, position.x, position.y, position.z);
 
     // Crossfade Logic
     // Idle sounds best at 800-1200 RPM, driving sounds best above 1500 RPM
@@ -171,9 +178,12 @@ void AudioSystem::updateEngine(float rpm, float throttle, float maxRpm, const gl
         drivingFade *= stutter;
     }
 
-    ma_sound_set_volume(sIdle, idleFade * 0.8f);
-    ma_sound_set_pitch(sIdle, idlePitch);
-
-    ma_sound_set_volume(sDriving, drivingFade * (0.6f + throttle * 0.4f));
-    ma_sound_set_pitch(sDriving, drivingPitch);
+    if (sIdle) {
+        ma_sound_set_volume(sIdle, idleFade * 0.8f);
+        ma_sound_set_pitch(sIdle, idlePitch);
+    }
+    if (sDriving) {
+        ma_sound_set_volume(sDriving, drivingFade * (0.6f + throttle * 0.4f));
+        ma_sound_set_pitch(sDriving, drivingPitch);
+    }
 }

@@ -114,6 +114,7 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 
 Game::~Game() {
     AudioSystem::getInstance().cleanup();
+    if (gpuTimerQueries[0]) glDeleteQueries(4, gpuTimerQueries);
     if (roadRefTex) glDeleteTextures(1, &roadRefTex);
     if (roadRefDrawTex) glDeleteTextures(1, &roadRefDrawTex);
     delete player;
@@ -162,7 +163,17 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
    
     deltaTime = currentTime - lastFrameTime;
     lastFrameTime = currentTime;
+    // Clamp the frame step. Without this an alt-tab, a window drag or a debugger
+    // breakpoint feeds a multi-second dt straight into character movement, gravity,
+    // sculpt and paint. The car already bounds its own catch-up internally.
+    constexpr double kMaxDeltaTime = 0.10; // 10 fps floor
+    if (deltaTime > kMaxDeltaTime) deltaTime = kMaxDeltaTime;
+    if (deltaTime < 0.0) deltaTime = 0.0;
     totalTime += deltaTime;
+    // TerrainManager can reallocate its heightfield when heightmap.png changes on
+    // disk. Refresh the road height sampler before anything samples terrain this
+    // frame, so no consumer ever reads through a freed pointer.
+    if (terrain) terrain->refreshHeightDependentCaches();
     if (projSaveFlash > 0.0f) projSaveFlash = glm::max(0.0f, projSaveFlash - (float)deltaTime);
 
     // Auto-persist projected map placement whenever it changes (throttled, no button needed)
@@ -624,7 +635,9 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                 }
             }
             // Check Right Panel Clicks (Details)
-            else if (selectedPlacedIdx != -1 && mouseX >= rpX && mouseX <= rpX + rpW && mouseY >= rpY && mouseY <= rpY + rpH) {
+            else if (selectedPlacedIdx >= 0 &&
+                     selectedPlacedIdx < (int)SousseMapData::liveLandmarks.size() &&
+                     mouseX >= rpX && mouseX <= rpX + rpW && mouseY >= rpY && mouseY <= rpY + rpH) {
                 clickedUI = true;
                 auto& landmark = SousseMapData::liveLandmarks[selectedPlacedIdx];
                 if (leftMouseDown) {
@@ -1220,7 +1233,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                     stateTimer = now;
                 } else if (now - stateTimer > 5.0) {
                     std::cerr << "[TEST] ERROR: Character failed to start entering the car!\n";
-                    exit(1);
+                    requestQuit(1);
                 }
                 break;
                 
@@ -1232,7 +1245,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                     stateTimer = now;
                 } else if (now - stateTimer > 10.0) {
                     std::cerr << "[TEST] ERROR: Character failed to get seated in the car!\n";
-                    exit(1);
+                    requestQuit(1);
                 }
                 break;
                 
@@ -1263,7 +1276,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                     stateTimer = now;
                 } else if (now - stateTimer > 10.0) {
                     std::cerr << "[TEST] ERROR: Character failed to exit the car!\n";
-                    exit(1);
+                    requestQuit(1);
                 }
                 break;
                 
@@ -1295,7 +1308,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                     stateTimer = now;
                 } else if (now - stateTimer > 10.0) {
                     std::cerr << "[TEST] ERROR: Character failed to mount the horse!\n";
-                    exit(1);
+                    requestQuit(1);
                 }
                 break;
                 
@@ -1323,10 +1336,10 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                 if (!player->isRiding()) {
                     std::cout << "[TEST] Step 13: Exited horse successfully!\n";
                     std::cout << "[TEST] ALL TESTS COMPLETED SUCCESSFULLY!\n";
-                    exit(0);
+                    requestQuit(0);
                 } else if (now - stateTimer > 10.0) {
                     std::cerr << "[TEST] ERROR: Character failed to dismount from the horse!\n";
-                    exit(1);
+                    requestQuit(1);
                 }
                 break;
                 
@@ -1442,7 +1455,6 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
 void Game::render() {
     using RenderPerfClock = std::chrono::steady_clock;
     static const bool profileRender = std::getenv("FALLAGA_RENDER_PERF") != nullptr;
-    static GLuint gpuTimerQueries[4] = {};
     static bool gpuTimerPending[4] = {};
     static int gpuTimerFrame = 0;
     static int gpuTimerSamples = 0;
@@ -1661,7 +1673,6 @@ void Game::render() {
             glDisable(GL_LIGHTING);
             glDepthMask(GL_FALSE);
             glDepthFunc(GL_LEQUAL);
-            glDisable(GL_CULL_FACE);
             glEnable(GL_BLEND);
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glEnable(GL_TEXTURE_2D);

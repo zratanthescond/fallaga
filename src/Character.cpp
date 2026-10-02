@@ -615,17 +615,24 @@ void Character::toggleNoclip() {
         if (m_isRiding && m_MountedHorse) {
             m_MountedHorse->dismountCharacter(this);
         }
-        if (m_isDriving) {
-            m_isDriving = false;
-            m_MountedCar = nullptr;
+        // Hand the car back through its own dismount path. Clearing only the
+        // character-side flags used to leave Car::m_Driver set and Car::state at
+        // DRIVEN, which permanently soft-locks the car: Car::update() early-returns
+        // on "DRIVEN && driver && !driver->isDriving()" and mountCharacter() refuses
+        // to remount while m_Driver is non-null. m_Driver is also set during the
+        // entering transition, so that case has to be handed back too.
+        if (m_MountedCar && (m_isDriving || m_isEnteringCar || m_isExitingCar)) {
+            m_MountedCar->dismountCharacter(this);
         }
+        m_isDriving = false;
         m_isEnteringCar = false;
         m_isExitingCar = false;
+        m_MountedCar = nullptr;
         velocity.y = 0.0f;
     } else {
         velocity.y = 0.0f;
     }
-    std::cout << "[NOCLIP] " << (m_isNoclip ? "ENABLED" : "DISABLED") << " - Speed: 40.0 / 150.0 (Shift)" << std::endl;
+    std::cout << "[NOCLIP] " << (m_isNoclip ? "ENABLED" : "DISABLED") << std::endl;
 }
 
 void Character::keyDown(int key) {

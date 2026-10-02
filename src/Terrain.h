@@ -93,6 +93,9 @@ public:
     // heightfield. Without this the asphalt keeps its pre-deform height and hovers
     // above the rendered surface (measured up to 2.6 m on a 22 m cell grid).
     void snapRoadsToRenderedTerrain();
+    // Re-inits roadHeightSampler (and any other cache holding a pointer into the
+    // heightfield) when TerrainManager reports that the heights buffer moved.
+    void refreshHeightDependentCaches();
     void saveRoadsToJSON(const std::string& path) const;
 
     // Whole-road-network graph transforms (world space, pivot = center of network)
@@ -175,6 +178,8 @@ private:
     std::unordered_map<std::uint64_t, std::vector<RoadSurfaceEdge>> roadSurfaceEdgeGrid;
     bool roadSurfaceIndexReady = false;
     std::uint64_t collisionSurfaceRevision = 0;
+    // TerrainManager::getHeightRevision() value the height samplers were built for.
+    unsigned int cachedHeightRevision = 0;
 
     // GTA-style visibility caching: instanced object culling is expensive to redo
     // every frame across thousands of instances, and re-uploading GPU instance

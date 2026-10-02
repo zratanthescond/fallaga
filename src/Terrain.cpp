@@ -358,6 +358,7 @@ Terrain::Terrain() {
 
       roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
                              terrainManager->getGridW(), terrainManager->getGridH());
+      cachedHeightRevision = terrainManager->getHeightRevision();
       roadMapper = mapper;
 
       // 2. Road graph: the old auto-traced road network is REMOVED â€” roads are
@@ -611,6 +612,19 @@ Terrain::~Terrain() {
   // Cleanup water FBOs
   if (reflFBO) { glDeleteFramebuffers(1, &reflFBO); glDeleteTextures(1, &reflColorTex); glDeleteRenderbuffers(1, &reflDepthRBO); }
   if (refrFBO) { glDeleteFramebuffers(1, &refrFBO); glDeleteTextures(1, &refrColorTex); glDeleteTextures(1, &refrDepthTex); }
+
+  // Cleanup water textures. flatNormalTex is the procedural fallback that
+  // normalMap1 may alias, so it is deleted once and aliases are excluded.
+  if (normalMap1 && normalMap1 != flatNormalTex) glDeleteTextures(1, &normalMap1);
+  if (normalMap2 && normalMap2 != flatNormalTex) glDeleteTextures(1, &normalMap2);
+  if (foamTex    && foamTex    != flatNormalTex) glDeleteTextures(1, &foamTex);
+  if (flatNormalTex) glDeleteTextures(1, &flatNormalTex);
+  if (waterMapTex)   glDeleteTextures(1, &waterMapTex);
+  if (mapTexture)    glDeleteTextures(1, &mapTexture);
+  waterMapTex = flatNormalTex = normalMap1 = normalMap2 = foamTex = mapTexture = 0;
+
+  // roadGeometryMask / heightmapTexID / texture arrays are owned by TerrainManager,
+  // which is deleted above.
 
   // Cleanup road system
   delete roadGraph;
@@ -1107,6 +1121,10 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
       glDeleteBuffers(1, &wallVBO);
       glDeleteBuffers(1, &wallEBO);
       wallVAO = 0;
+      // Zero these too: they used to keep their old names, so the re-gen below
+      // leaked two buffer objects on every batchesDirty rebuild.
+      wallVBO = 0;
+      wallEBO = 0;
     }
 
     std::vector<glm::vec2> perimeter = SousseMapData::getMedinaPerimeter();
@@ -2337,7 +2355,31 @@ bool Terrain::pointInPolygon(float x, float z,
 void Terrain::update(const glm::vec3& camPos) {
   if (terrainManager) {
     terrainManager->update(camPos);
+    // TerrainManager hot-reloads heightmap.png when its mtime changes, and that
+    // reload reallocates `heights`. roadHeightSampler caches a raw pointer into
+    // that buffer, so without this refresh every subsequent road sample would
+    // read freed memory.
+    refreshHeightDependentCaches();
   }
+}
+
+void Terrain::refreshHeightDependentCaches() {
+  if (!terrainManager) return;
+  if (cachedHeightRevision == terrainManager->getHeightRevision()) return;
+
+  TerrainCoordinateMapper mapper;
+  mapper.bounds = { terrainManager->getWorldMinX(), terrainManager->getWorldMaxX(),
+                    terrainManager->getWorldMinZ(), terrainManager->getWorldMaxZ(),
+                    terrainManager->getMinHeight(), terrainManager->getMaxHeight() };
+  mapper.heightmapW = terrainManager->getGridW();
+  mapper.heightmapH = terrainManager->getGridH();
+
+  roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
+                         terrainManager->getGridW(), terrainManager->getGridH());
+  roadMapper = mapper;
+  cachedHeightRevision = terrainManager->getHeightRevision();
+  std::cout << "[Terrain] Heightfield reloaded; road height sampler re-initialised."
+            << std::endl;
 }
 
 void Terrain::saveTerrain() {

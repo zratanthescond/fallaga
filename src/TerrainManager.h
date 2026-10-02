@@ -14,8 +14,6 @@ public:
     void update(const glm::vec3& camPos);
     void render(const glm::mat4& proj, const glm::mat4& view, const glm::vec3& camPos, const glm::vec3& lightDir, const glm::vec3& lightColor, float waterLevel, const glm::vec4& clipPlane = glm::vec4(0.0f, -1.0f, 0.0f, 100000.0f), float maxDrawDistance = 6000.0f);
     float getHeightAt(float x, float z) const;
-    void setVisualSmoothingAffectsPhysics(bool v) { visualSmoothingAffectsPhysics = v; }
-    bool getVisualSmoothingAffectsPhysics() const { return visualSmoothingAffectsPhysics; }
     void exportToOBJ(const std::string& filename, int downsample = 4) const;
     glm::vec3 getNormalAt(float x, float z) const;
     float getRoadAt(float x, float z) const;
@@ -46,6 +44,10 @@ public:
     const float* getHeightsData() const { return heights.data(); }
     int getGridW() const { return gridW; }
     int getGridH() const { return gridH; }
+    // Bumped whenever `heights` may have reallocated. Consumers that cache
+    // getHeightsData() (e.g. Terrain's HeightSampler) must re-init when this
+    // changes; otherwise their pointer is left dangling by the reallocation.
+    unsigned int getHeightRevision() const { return heightRevision; }
     int getVisualGridW() const { return visualW; }
     int getVisualGridH() const { return visualH; }
     float getWorldMinX() const { return worldMinX; }
@@ -66,7 +68,7 @@ private:
     std::vector<float> heights;
     std::vector<float> visualHeights;
     std::vector<float> physicsVisualHeights; // authoritative for height queries (visual grid res)
-    bool visualSmoothingAffectsPhysics = false;
+    unsigned int heightRevision = 0;         // see getHeightRevision()
     std::vector<float> appliedRoadOffsets;
     std::vector<float> appliedRoadConformOffsets;
     std::vector<unsigned char> roadMaskData;
