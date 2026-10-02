@@ -640,7 +640,13 @@ void setup_opengl(int width, int height) {
 // Called when the window is resized (now also called at startup with full dimensions)
 void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
     glViewport(0, 0, width, height);
-    
+
+    // The HUD layout, UI hit-testing and raycast normalisation all read the size from
+    // Game, which otherwise only learned it once in Game::setup(). This callback also
+    // runs once from setup_opengl() — before/around Game's construction — so `game`
+    // must be checked for null before it is dereferenced.
+    if (game) game->setWindowSize(width, height);
+
     // Note: The legacy glMatrixMode/gluPerspective calls remain commented out
     // as per the previous fix, delegating matrix creation to Game::render().
 }

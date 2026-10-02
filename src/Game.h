@@ -88,6 +88,9 @@ public:
     void requestQuit(int exitCode) { quitRequested = true; requestedExitCode = exitCode; }
     bool isQuitRequested() const { return quitRequested; }
     int getRequestedExitCode() const { return requestedExitCode; }
+    // Keeps the HUD layout, UI hit-testing and raycast normalisation in step with
+    // the framebuffer after a resize; the size is otherwise only known at setup().
+    void setWindowSize(int w, int h) { windowWidth = w; windowHeight = h; }
     float projSaveFlash = 0.0f;   // seconds remaining of "SAVED" highlight on the map-panel button
     // Auto-save snapshot: last placement that was persisted to disk
     glm::vec2 projSavedCenter = glm::vec2(0.0f);
@@ -116,6 +119,20 @@ public:
 private:
     bool quitRequested = false;
     int requestedExitCode = 0;
+    // Cache for the reference map draped over the terrain (road edit mode only).
+    // Rebuilding it costs 1089 terrain->getHeight() queries per frame; the grid is
+    // valid only while the terrain heights and the map's placement are unchanged,
+    // so the inputs are remembered alongside the heights they produced.
+    std::vector<float> projRefHeightGrid;
+    std::size_t projRefHeightGridCount = 0;   // 0 = cache empty (GN never changes)
+    unsigned int projRefHeightGridHeightRev = 0;
+    std::uint64_t projRefHeightGridSurfaceRev = 0;
+    glm::vec2 projRefHeightGridCenter = glm::vec2(0.0f);
+    float projRefHeightGridMapW = 0.0f;
+    float projRefHeightGridScale = 0.0f;
+    bool projRefHeightGridFlipX = false;
+    bool projRefHeightGridFlipZ = false;
+    float projRefHeightGridYOffset = 0.0f;
     // GPU timer queries. Members (not function-local statics) so the destructor can
     // delete them; they used to be glGen'd and never freed.
     unsigned int gpuTimerQueries[4] = {0, 0, 0, 0};

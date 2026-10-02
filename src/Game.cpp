@@ -1580,10 +1580,15 @@ void Game::render() {
     // ── PROJECTED REFERENCE MAP ON THE TERRAIN (road edit mode, reference only) ──
     if (editMode && activeEditorMode == 5) {
         if (!roadRefLoaded) {
-            roadRefLoaded = true;
-            int w = 0, h = 0, ch = 0;
             const char* path = roadRefPaths[roadRefIdx];
-            unsigned char* d = stbi_load(path, &w, &h, &ch, 4);
+            // A failed load must not latch. roadRefLoaded is set true only after the
+            // pixels are on the GPU, and a per-index latch remembers the failure so a
+            // missing file is not re-read (and re-logged) on every single frame.
+            static int failedRoadRefIdx = -1;
+            {
+            int w = 0, h = 0, ch = 0;
+            const bool attemptedLoad = (failedRoadRefIdx != roadRefIdx);
+            unsigned char* d = attemptedLoad ? stbi_load(path, &w, &h, &ch, 4) : nullptr;
             if (d) {
                 if (roadRefTex) glDeleteTextures(1, &roadRefTex);
                 if (roadRefDrawTex) glDeleteTextures(1, &roadRefDrawTex);
@@ -1621,9 +1626,20 @@ void Game::render() {
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 stbi_image_free(d);
                 roadRefW = w; roadRefH = h;
+                roadRefLoaded = true;   // only now is a texture really loaded
+                failedRoadRefIdx = -1;
                 std::cout << "[Road] Reference image loaded: " << path << " (" << w << "x" << h << ")\n";
-            } else {
-                std::cerr << "[Road] Failed to load reference image " << path << "\n";
+            } else if (attemptedLoad) {
+                // Drop whatever was bound before, so the panel does not keep showing
+                // the previous map while claiming the new file loaded.
+                if (roadRefTex) { glDeleteTextures(1, &roadRefTex); roadRefTex = 0; }
+                if (roadRefDrawTex) { glDeleteTextures(1, &roadRefDrawTex); roadRefDrawTex = 0; }
+                roadRefW = 0; roadRefH = 0;
+                roadRefLoaded = false;
+                failedRoadRefIdx = roadRefIdx;
+                std::cerr << "[Road] Failed to load reference image " << path
+                          << " (no texture bound; the REF MAP panel stays hidden)\n";
+            }
             }
         }
         RoadGraph* rgp = terrain->getRoadGraph();
@@ -1730,14 +1746,46 @@ void Game::render() {
             const float lift = 0.7f + projRefYOffset; // small vertical lift above the draped surface
             const int G = 32;   // grid resolution: drapes the map onto the terrain surface
             const int GN = G + 1;
-            std::vector<float> gH((size_t)GN * GN);
-            for (int gyy = 0; gyy < GN; ++gyy) {
-                const float wz = projRefCenter.y - halfH + (float)gyy * (mh / G);
-                for (int gxx = 0; gxx < GN; ++gxx) {
-                    const float wx = projRefCenter.x - halfW + (float)gxx * (mw / G);
-                    gH[(size_t)gyy * GN + gxx] = terrain->getHeight(wx, wz) + lift;
+            // Cache key: the two terrain revisions (a heightmap reload reallocates the
+            // heights buffer, a road-mesh rebuild re-seats/conforms the surface) plus every
+            // placement input the draped grid depends on. mh is derived from mw and the
+            // reference aspect, so those two are covered.
+            const unsigned int heightRev =
+                terrain->terrainManager ? terrain->terrainManager->getHeightRevision() : 0u;
+            const std::uint64_t surfaceRev = terrain->getCollisionSurfaceRevision();
+            const bool gridCacheHit =
+                projRefHeightGridCount == (std::size_t)GN * GN &&
+                projRefHeightGridHeightRev == heightRev &&
+                projRefHeightGridSurfaceRev == surfaceRev &&
+                projRefHeightGridMapW == projRefMapW &&
+                projRefHeightGridScale == projRefScale &&
+                projRefHeightGridFlipX == projRefFlipX &&
+                projRefHeightGridFlipZ == projRefFlipZ &&
+                projRefHeightGridYOffset == projRefYOffset &&
+                projRefHeightGridCenter == projRefCenter;
+            if (!gridCacheHit) {
+                // Cache miss: resample the whole draped grid exactly as before.
+                projRefHeightGrid.assign((size_t)GN * GN, 0.0f);
+                for (int gyy = 0; gyy < GN; ++gyy) {
+                    const float wz = projRefCenter.y - halfH + (float)gyy * (mh / G);
+                    for (int gxx = 0; gxx < GN; ++gxx) {
+                        const float wx = projRefCenter.x - halfW + (float)gxx * (mw / G);
+                        projRefHeightGrid[(size_t)gyy * GN + gxx] = terrain->getHeight(wx, wz) + lift;
+                    }
                 }
+                projRefHeightGridCount = (std::size_t)GN * GN;
+                projRefHeightGridHeightRev = heightRev;
+                projRefHeightGridSurfaceRev = surfaceRev;
+                projRefHeightGridCenter = projRefCenter;
+                projRefHeightGridMapW = projRefMapW;
+                projRefHeightGridScale = projRefScale;
+                projRefHeightGridFlipX = projRefFlipX;
+                projRefHeightGridFlipZ = projRefFlipZ;
+                projRefHeightGridYOffset = projRefYOffset;
             }
+            // The quads themselves are immediate mode, so they are re-emitted every
+            // frame — they just read the cached grid instead of resampling the terrain.
+            const std::vector<float>& gH = projRefHeightGrid;
             for (int gy = 0; gy < G; ++gy) {
                 for (int gx = 0; gx < G; ++gx) {
                     const float tx0 = projRefFlipX ? 1.0f - (float)gx / G : (float)gx / G;

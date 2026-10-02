@@ -1461,14 +1461,25 @@ void TerrainManager::applyRoadBedHeightfield(const float* offsets, int offsetW, 
 
     // Keep native-resolution physics and height queries in sync with the edited
     // visual heightfield, including terrains whose source DEM is downsampled.
+    // Only the native pixels inside the edited visual box can have changed, so the
+    // resample and the texture upload are both restricted to that box instead of
+    // sweeping the entire native grid on every roadbed frame.
     if (gridW > 1 && gridH > 1) {
         const float scaleX = (float)(visualW - 1) / (gridW - 1);
         const float scaleZ = (float)(visualH - 1) / (gridH - 1);
-        for (int z = 0; z < gridH; ++z) {
+        const int natMinX = (scaleX > 0.0f) ? (int)std::floor(minX / scaleX) - 1 : 0;
+        const int natMaxX = (scaleX > 0.0f) ? (int)std::ceil (maxX / scaleX) + 1 : gridW - 1;
+        const int natMinZ = (scaleZ > 0.0f) ? (int)std::floor(minZ / scaleZ) - 1 : 0;
+        const int natMaxZ = (scaleZ > 0.0f) ? (int)std::ceil (maxZ / scaleZ) + 1 : gridH - 1;
+        const int safeMinX = std::max(0, std::min(natMinX, gridW - 1));
+        const int safeMaxX = std::max(0, std::min(natMaxX, gridW - 1));
+        const int safeMinZ = std::max(0, std::min(natMinZ, gridH - 1));
+        const int safeMaxZ = std::max(0, std::min(natMaxZ, gridH - 1));
+        for (int z = safeMinZ; z <= safeMaxZ; ++z) {
             const float srcZ = z * scaleZ;
             const int z0 = (int)srcZ, z1 = std::min(z0 + 1, visualH - 1);
             const float tz = srcZ - z0;
-            for (int x = 0; x < gridW; ++x) {
+            for (int x = safeMinX; x <= safeMaxX; ++x) {
                 const float srcX = x * scaleX;
                 const int x0 = (int)srcX, x1 = std::min(x0 + 1, visualW - 1);
                 const float tx = srcX - x0;
@@ -1479,7 +1490,7 @@ void TerrainManager::applyRoadBedHeightfield(const float* offsets, int offsetW, 
                     visualHeights[z1 * visualW + x1] * tx * tz;
             }
         }
-        updateGPUHeightmapTexture();
+        updateGPUHeightmapTextureRect(safeMinX, safeMinZ, safeMaxX, safeMaxZ);
     }
 
     minX = std::max(0, minX - 1); minZ = std::max(0, minZ - 1);

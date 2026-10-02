@@ -773,14 +773,37 @@ void Terrain::buildStreetMesh() {
     return;
   }
   uint32_t vCount = 0, iCount = 0;
-  fread(&vCount, sizeof(uint32_t), 1, f);
-  fread(&iCount, sizeof(uint32_t), 1, f);
+  // A truncated file must not drive the resizes below: a garbage count turns into
+  // a multi-gigabyte allocation, and a short read leaves the buffers half-filled.
+  if (fread(&vCount, sizeof(uint32_t), 1, f) != 1 ||
+      fread(&iCount, sizeof(uint32_t), 1, f) != 1) {
+    std::cerr << "[Terrain] " << binPath << ": truncated header" << std::endl;
+    fclose(f);
+    return;
+  }
+  constexpr uint32_t kMaxMeshVertices = 8u * 1024u * 1024u;
+  constexpr uint32_t kMaxMeshIndices  = 24u * 1024u * 1024u;
+  if (vCount == 0 || iCount == 0) {
+    std::cerr << "[Terrain] " << binPath << ": empty road mesh" << std::endl;
+    fclose(f);
+    return;
+  }
+  if (vCount > kMaxMeshVertices || iCount > kMaxMeshIndices) {
+    std::cerr << "[Terrain] " << binPath << ": implausible counts (v=" << vCount
+              << " i=" << iCount << "), ignoring" << std::endl;
+    fclose(f);
+    return;
+  }
 
   std::vector<float> vData((size_t)vCount * 9);
-  fread(vData.data(), sizeof(float), (size_t)vCount * 9, f);
-
   std::vector<uint32_t> iData((size_t)iCount);
-  fread(iData.data(), sizeof(uint32_t), (size_t)iCount, f);
+  if (fread(vData.data(), sizeof(float), vData.size(), f) != vData.size() ||
+      fread(iData.data(), sizeof(uint32_t), iData.size(), f) != iData.size()) {
+    std::cerr << "[Terrain] " << binPath << ": truncated payload, ignoring"
+              << std::endl;
+    fclose(f);
+    return;
+  }
   fclose(f);
 
   streetVertexCount = (int)vCount;
@@ -902,23 +925,42 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           char magic[4];
           if (fread(magic, 1, 4, f) == 4 && memcmp(magic, "FOLI", 4) == 0) {
               uint32_t numTrees = 0, numRocks = 0, numGrass = 0;
-              fread(&numTrees, sizeof(uint32_t), 1, f);
-              fread(&numRocks, sizeof(uint32_t), 1, f);
-              fread(&numGrass, sizeof(uint32_t), 1, f);
+              bool headerOk = fread(&numTrees, sizeof(uint32_t), 1, f) == 1 &&
+                              fread(&numRocks, sizeof(uint32_t), 1, f) == 1 &&
+                              fread(&numGrass, sizeof(uint32_t), 1, f) == 1;
+              // Cap the counts before resizing: a truncated or corrupt file would
+              // otherwise request an enormous allocation from a garbage header.
+              constexpr uint32_t kMaxInstances = 4u * 1024u * 1024u;
+              const bool countsSane = numTrees <= kMaxInstances &&
+                                      numRocks <= kMaxInstances &&
+                                      numGrass <= kMaxInstances;
+              if (headerOk && countsSane) {
+                  proceduralTrees.resize(numTrees);
+                  proceduralRocks.resize(numRocks);
+                  proceduralGrass.resize(numGrass);
 
-              proceduralTrees.resize(numTrees);
-              proceduralRocks.resize(numRocks);
-              proceduralGrass.resize(numGrass);
+                  const bool payloadOk =
+                      fread(proceduralTrees.data(), sizeof(glm::mat4), numTrees, f) == numTrees &&
+                      fread(proceduralRocks.data(), sizeof(glm::mat4), numRocks, f) == numRocks &&
+                      fread(proceduralGrass.data(), sizeof(glm::mat4), numGrass, f) == numGrass;
 
-              fread(proceduralTrees.data(), sizeof(glm::mat4), numTrees, f);
-              fread(proceduralRocks.data(), sizeof(glm::mat4), numRocks, f);
-              fread(proceduralGrass.data(), sizeof(glm::mat4), numGrass, f);
-
-              proceduralInitialized = true;
-              std::cout << "[Terrain] Successfully loaded binary roadside foliage: " 
-                        << numTrees << " trees, " 
-                        << numRocks << " rocks, " 
-                        << numGrass << " grass patches." << std::endl;
+                  if (payloadOk) {
+                      proceduralInitialized = true;
+                      std::cout << "[Terrain] Successfully loaded binary roadside foliage: "
+                                << numTrees << " trees, "
+                                << numRocks << " rocks, "
+                                << numGrass << " grass patches." << std::endl;
+                  } else {
+                      std::cerr << "[Terrain] foliage.bin is truncated; regenerating procedurally"
+                                << std::endl;
+                      proceduralTrees.clear();
+                      proceduralRocks.clear();
+                      proceduralGrass.clear();
+                  }
+              } else {
+                  std::cerr << "[Terrain] foliage.bin has an unusable header; regenerating procedurally"
+                            << std::endl;
+              }
           }
           fclose(f);
       }
