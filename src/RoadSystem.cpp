@@ -1809,6 +1809,22 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   // flat and floating above cuts. 0.3 keeps the bed close to the ground while
   // cutting the twist ~3x.
   const float EDGE_CONFORM = kRoadEdgeConform;
+
+  // Minimum vertical clearance the ribbon keeps over the sampled ground. A terrain
+  // cell is ~22 m across on the shipped DEM while roads are 8-40 m wide, and a rim
+  // pillar only adopts EDGE_CONFORM of its own ground height, so a terrain triangle
+  // leaning over the asphalt can still stand above the ribbon. That is the "roads
+  // going under the terrain" defect: the ground renders over the asphalt.
+  const float kMinClearance = 0.02f;
+  // Lowest y a road vertex may take at this XZ so the asphalt stays visible.
+  auto minSurfaceY = [&](const glm::vec3 &at, float surfaceY) {
+    if (!sampler.isValid())
+      return surfaceY;
+    float ground = sampler.sample(at.x, at.z);
+    if (deformer && deformer->isBuilt())
+      ground += deformer->getDeformation(at.x, at.z);
+    return std::max(surfaceY, ground + kMinClearance);
+  };
   // Endpoint clustering tolerance, metres. Shared with RoadGraph::buildTopology
   // so the reported topology and the drawn junctions always agree.
   const float JN_TOL = kRoadJunctionTolerance;
@@ -3020,7 +3036,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         if (deformer && deformer->isBuilt())
           y += deformer->getDeformation(pos.x, pos.z);
         const float crown = crownHeight * (1.0f - off * off);
-        pos.y = y + Z_BIAS + crown + stripLift;
+        pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
 
         ringPositions[j] = pos;
         m_vertices.push_back(
@@ -3155,7 +3171,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       const float yC = P.y;
 
       glm::vec3 capO = P;
-      capO.y = yC + Z_BIAS + crownHeight + stripLift;
+      capO.y = minSurfaceY(capO, yC + Z_BIAS + crownHeight + stripLift);
       const uint32_t capBase = (uint32_t)m_vertices.size();
       m_vertices.push_back(
           {capO, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec2(0.5f, vEnd), rtype,
@@ -3175,7 +3191,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
           y += deformer->getDeformation(pos.x, pos.z);
         const float lateral = std::cos(ang);
         const float crown = crownHeight * (1.0f - lateral * lateral);
-        pos.y = y + Z_BIAS + crown + stripLift;
+        pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
         if (k == 0)
           arcL = pos;
         if (k == M)
@@ -3399,8 +3415,9 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         if (deformer && deformer->isBuilt())
           y += deformer->getDeformation(p2.x, p2.y);
         const float crown = centerVertex ? crownHeight : 0.0f;
+        const glm::vec3 at(p2.x, 0.0f, p2.y);
         m_vertices.push_back(
-            {glm::vec3(p2.x, y + Z_BIAS + crown + lift, p2.y),
+            {glm::vec3(p2.x, minSurfaceY(at, y + Z_BIAS + crown + lift), p2.y),
              glm::vec3(0.0f, 1.0f, 0.0f),
              glm::vec2(0.5f, glm::length(p2 - origin) * TEX_SCALE),
              (float)jnType, std::max(0.0f, 5.0f - (float)jnType), 0.0f});
@@ -3685,7 +3702,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         centerY += (sampler.sample(C.x, C.y) - baseCenterY) * EDGE_CONFORM;
       if (deformer && deformer->isBuilt())
         centerY += deformer->getDeformation(C.x, C.y);
-      centerY += Z_BIAS + crownHeight;
+      centerY = minSurfaceY(glm::vec3(C.x, 0.0f, C.y), centerY + Z_BIAS + crownHeight);
 
       glm::vec3 nSum(0.0f);
       for (int ai = 0; ai < N; ++ai)
