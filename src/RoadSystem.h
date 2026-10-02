@@ -198,6 +198,7 @@ public:
 // ──────────────────────── SPLINE SYSTEM ─────────────────────────────────────
 
 namespace RoadSpline {
+    inline constexpr float kCrownHeight = 0.08f;
     // Catmull-Rom spline evaluation from 2D control points.
     // Samples heightmap for Y, then smooths elevation.
     // Straight stretches resample every (1/samplesPerMeter) meters; curved
@@ -216,6 +217,10 @@ namespace RoadSpline {
         float smoothSigma = 3.0f,
         bool closed = false
     );
+
+    // Match the inner-bend width used by RoadMeshBuilder at a spline ring.
+    float meshHalfWidth(const RoadSegment& road, int idx, bool wrap,
+                        float side, float fullHalfWidth);
 }
 
 // ──────────────────────── TERRAIN DEFORMATION ───────────────────────────────
@@ -238,6 +243,7 @@ public:
     float getRoadInfluence(float x, float z) const;
 
     const float* getDeformationData() const { return m_deformMap.empty() ? nullptr : m_deformMap.data(); }
+    const unsigned char* getSurfaceMaskData() const { return m_surfaceMask.empty() ? nullptr : m_surfaceMask.data(); }
     int getMapWidth() const { return m_mapW; }
     int getMapHeight() const { return m_mapH; }
 
@@ -246,6 +252,7 @@ public:
 private:
     std::vector<float> m_deformMap;     // Per-pixel elevation offset
     std::vector<float> m_influenceMap;  // Per-pixel road influence [0,1]
+    std::vector<unsigned char> m_surfaceMask; // Compact per-pixel profile from the same spline distances
     int m_mapW = 0, m_mapH = 0;
     TerrainCoordinateMapper m_mapper;
 };
@@ -348,7 +355,8 @@ public:
     void build(std::vector<RoadSegment> segments,
                const HeightSampler& sampler,
                const RoadDeformer* deformer = nullptr,
-               float snapMargin = 1.5f);
+               float snapMargin = 1.5f,
+               bool addCrown = true);
 
     // Upload to GPU
     void upload();

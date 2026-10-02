@@ -62,6 +62,7 @@ public:
     bool roadRefVisible = true;
     bool roadRefLoaded = false;
     unsigned int roadRefTex = 0;
+    unsigned int roadRefDrawTex = 0;
     int roadRefW = 0, roadRefH = 0;
     int roadRefIdx = 0;              // which reference map file is shown
     // Projected reference map (drawn on the terrain surface, reference only)

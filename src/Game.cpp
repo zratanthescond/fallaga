@@ -16,6 +16,7 @@
 #include <sstream>
 #include <iomanip>
 #include <fstream>
+#include <vector>
 #include "Shader.h"
 #include "AudioSystem.h"
 #include "Car.h"
@@ -113,6 +114,8 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 
 Game::~Game() {
     AudioSystem::getInstance().cleanup();
+    if (roadRefTex) glDeleteTextures(1, &roadRefTex);
+    if (roadRefDrawTex) glDeleteTextures(1, &roadRefDrawTex);
     delete player;
     delete camera;
     delete terrain;
@@ -1571,9 +1574,37 @@ void Game::render() {
             unsigned char* d = stbi_load(path, &w, &h, &ch, 4);
             if (d) {
                 if (roadRefTex) glDeleteTextures(1, &roadRefTex);
+                if (roadRefDrawTex) glDeleteTextures(1, &roadRefDrawTex);
                 glGenTextures(1, &roadRefTex);
                 glBindTexture(GL_TEXTURE_2D, roadRefTex);
                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, d);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+                // Keep the reference untouched for normal viewing, but build a
+                // higher-contrast, slightly more saturated copy for road drawing.
+                const size_t byteCount = (size_t)w * (size_t)h * 4;
+                std::vector<unsigned char> drawPixels(d, d + byteCount);
+                for (size_t i = 0; i < byteCount; i += 4) {
+                    const float r = d[i + 0] / 255.0f;
+                    const float g = d[i + 1] / 255.0f;
+                    const float b = d[i + 2] / 255.0f;
+                    const float luma = 0.2126f * r + 0.7152f * g + 0.0722f * b;
+                    const float contrast = glm::clamp((luma - 0.5f) * 1.35f + 0.515f,
+                                                      0.0f, 1.0f);
+                    const float enhanced[3] = {
+                        glm::clamp(contrast + (r - luma) * 1.2f + 0.012f, 0.0f, 1.0f),
+                        glm::clamp(contrast + (g - luma) * 1.2f + 0.006f, 0.0f, 1.0f),
+                        glm::clamp(contrast + (b - luma) * 1.2f - 0.008f, 0.0f, 1.0f)
+                    };
+                    drawPixels[i + 0] = (unsigned char)(enhanced[0] * 255.0f + 0.5f);
+                    drawPixels[i + 1] = (unsigned char)(enhanced[1] * 255.0f + 0.5f);
+                    drawPixels[i + 2] = (unsigned char)(enhanced[2] * 255.0f + 0.5f);
+                }
+                glGenTextures(1, &roadRefDrawTex);
+                glBindTexture(GL_TEXTURE_2D, roadRefDrawTex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                             drawPixels.data());
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
                 stbi_image_free(d);
@@ -1635,7 +1666,8 @@ void Game::render() {
             glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
             glEnable(GL_TEXTURE_2D);
             glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, roadRefTex);
+            glBindTexture(GL_TEXTURE_2D,
+                          (roadToolMode == 1 && roadRefDrawTex) ? roadRefDrawTex : roadRefTex);
             glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
             if (std::getenv("FALLAGA_PROJ_DEBUG")) {
                 static bool dbgDone = false;
@@ -1680,7 +1712,7 @@ void Game::render() {
                 glEnable(GL_LIGHTING);
             } else {
                 // While drawing roads, dim the map so the road mesh + terrain read through
-                float effOpacity = (roadToolMode == 1) ? 0.40f : projRefOpacity;
+                float effOpacity = (roadToolMode == 1) ? 0.58f : projRefOpacity;
                 glColor4f(1.0f, 1.0f, 1.0f, effOpacity);
             }
             glBegin(GL_QUADS);
@@ -1758,8 +1790,14 @@ void Game::render() {
                 }
                 RoadSpline::evaluate(tempSeg, terrain->getRoadHeightSampler(), 0.5f);
 
-                // curve spine
-                glColor3f(1.0f, 0.85f, 0.0f);
+                // Draw the centerline with a dark halo so it remains distinct on
+                // both bright paper and dark water areas of the reference map.
+                glColor3f(0.015f, 0.025f, 0.045f);
+                glLineWidth(6.0f);
+                glBegin(GL_LINE_STRIP);
+                for (const auto& sp : tempSeg.splinePoints) glVertex3f(sp.x, sp.y + 0.15f, sp.z);
+                glEnd();
+                glColor3f(1.0f, 0.78f, 0.04f);
                 glLineWidth(3.0f);
                 glBegin(GL_LINE_STRIP);
                 for (const auto& sp : tempSeg.splinePoints) glVertex3f(sp.x, sp.y + 0.15f, sp.z);
@@ -1768,20 +1806,43 @@ void Game::render() {
                 // road-width footprint (left & right edges) - shows the real scale
                 if (tempSeg.rightVecs.size() >= 2) {
                     const float halfW = roadDrawWidth * 0.5f;
-                    glColor3f(0.3f, 0.9f, 1.0f);
-                    glLineWidth(2.0f);
-                    glBegin(GL_LINE_STRIP);
-                    for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
-                        const glm::vec3& sp = tempSeg.splinePoints[i];
-                        glVertex3f(sp.x + tempSeg.rightVecs[i].x * halfW, sp.y + 0.05f, sp.z + tempSeg.rightVecs[i].z * halfW);
-                    }
-                    glEnd();
-                    glBegin(GL_LINE_STRIP);
-                    for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
-                        const glm::vec3& sp = tempSeg.splinePoints[i];
-                        glVertex3f(sp.x - tempSeg.rightVecs[i].x * halfW, sp.y + 0.05f, sp.z - tempSeg.rightVecs[i].z * halfW);
-                    }
-                    glEnd();
+                    auto drawRoadEdges = [&]() {
+                        glBegin(GL_LINE_STRIP);
+                        for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
+                            const glm::vec3& sp = tempSeg.splinePoints[i];
+                            glVertex3f(sp.x + tempSeg.rightVecs[i].x * halfW,
+                                       sp.y + 0.10f,
+                                       sp.z + tempSeg.rightVecs[i].z * halfW);
+                        }
+                        glEnd();
+                        glBegin(GL_LINE_STRIP);
+                        for (size_t i = 0; i < tempSeg.splinePoints.size(); ++i) {
+                            const glm::vec3& sp = tempSeg.splinePoints[i];
+                            glVertex3f(sp.x - tempSeg.rightVecs[i].x * halfW,
+                                       sp.y + 0.10f,
+                                       sp.z - tempSeg.rightVecs[i].z * halfW);
+                        }
+                        glEnd();
+                        const size_t endpointIndices[2] = {
+                            0, tempSeg.splinePoints.size() - 1
+                        };
+                        for (size_t endpointIndex : endpointIndices) {
+                            const glm::vec3& sp = tempSeg.splinePoints[endpointIndex];
+                            const glm::vec3& right = tempSeg.rightVecs[endpointIndex];
+                            glBegin(GL_LINES);
+                            glVertex3f(sp.x - right.x * halfW, sp.y + 0.10f,
+                                       sp.z - right.z * halfW);
+                            glVertex3f(sp.x + right.x * halfW, sp.y + 0.10f,
+                                       sp.z + right.z * halfW);
+                            glEnd();
+                        }
+                    };
+                    glColor3f(0.015f, 0.025f, 0.045f);
+                    glLineWidth(5.0f);
+                    drawRoadEdges();
+                    glColor3f(0.05f, 1.0f, 0.95f);
+                    glLineWidth(2.5f);
+                    drawRoadEdges();
                     glLineWidth(1.0f);
                 }
             }
@@ -2792,7 +2853,8 @@ if (projSaveFlash > 0.0f) {
                 drawStr(rx, ry - 16, title, 0.85f, 0.85f, 0.85f);
                 glEnable(GL_TEXTURE_2D);
                 glActiveTexture(GL_TEXTURE0);
-                glBindTexture(GL_TEXTURE_2D, roadRefTex);
+                glBindTexture(GL_TEXTURE_2D,
+                              (roadToolMode == 1 && roadRefDrawTex) ? roadRefDrawTex : roadRefTex);
                 glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
                 glColor4f(1.0f, 1.0f, 1.0f, 0.85f);
                 glBegin(GL_QUADS);

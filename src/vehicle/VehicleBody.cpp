@@ -1,10 +1,12 @@
 #include "VehicleBody.h"
 
 #include <btBulletDynamicsCommon.h>
+#include <BulletCollision/CollisionShapes/btHeightfieldTerrainShape.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
+#include <limits>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -23,10 +25,28 @@ glm::quat fromBullet(const btQuaternion &q) {
   return {static_cast<float>(q.w()), static_cast<float>(q.x()),
           static_cast<float>(q.y()), static_cast<float>(q.z())};
 }
+
+std::uint64_t terrainTileKey(int x, int z) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
+         static_cast<std::uint32_t>(z);
+}
 } // namespace
 
+struct VehicleBody::TerrainTile {
+  int tileX = 0;
+  int tileZ = 0;
+  int nextSampleRow = 0;
+  float minHeight = std::numeric_limits<float>::max();
+  float maxHeight = std::numeric_limits<float>::lowest();
+  std::vector<float> heights;
+  std::unique_ptr<btHeightfieldTerrainShape> shape;
+  std::unique_ptr<btCollisionObject> object;
+};
+
 VehicleBody::VehicleBody(float massKg, const glm::vec3 &halfExtentsM,
-                         float centerOfMassDropM, float yawInertiaKgM2) {
+                         float centerOfMassDropM, float yawInertiaKgM2)
+    : chassisHalfExtentsM(halfExtentsM),
+      centerOfMassDropM(centerOfMassDropM) {
   collisionConfiguration =
       std::make_unique<btDefaultCollisionConfiguration>();
   dispatcher = std::make_unique<btCollisionDispatcher>(collisionConfiguration.get());
@@ -67,7 +87,13 @@ VehicleBody::VehicleBody(float massKg, const glm::vec3 &halfExtentsM,
 
 VehicleBody::~VehicleBody() {
   if (world && body) world->removeRigidBody(body.get());
-  if (world && terrainObject) world->removeCollisionObject(terrainObject.get());
+  for (auto &entry : terrainTiles) removeTerrainTile(*entry.second);
+}
+
+void VehicleBody::removeTerrainTile(TerrainTile &tile) {
+  if (world && tile.object) world->removeCollisionObject(tile.object.get());
+  tile.object.reset();
+  tile.shape.reset();
 }
 
 void VehicleBody::synchronize(const State &state) {
@@ -84,161 +110,151 @@ void VehicleBody::synchronize(const State &state) {
   body->activate(true);
 }
 
-void VehicleBody::rebuildTerrainCollision(const TerrainHeightQuery &heightAt,
-                                         const glm::vec3 &center) {
-  if (!heightAt) return;
-  constexpr int kCells = 128;
-  constexpr float kCellSizeM = 2.0f;
-  constexpr float kHalfExtentM = kCells * kCellSizeM * 0.5f;
-  constexpr int kRowsPerFrame = 16;
-  const glm::vec2 nextCenter(center.x, center.z);
-
-  // Building Bullet's BVH is also expensive, so do it away from the frame
-  // thread. The active collider and its mesh stay alive until the worker has
-  // finished and the replacement can be installed safely here.
-  if (pendingTerrainShapeFuture.valid()) {
-    if (pendingTerrainShapeFuture.wait_for(std::chrono::seconds(0)) !=
-        std::future_status::ready)
-      return;
-
-    auto nextShape = pendingTerrainShapeFuture.get();
-    auto nextObject = std::make_unique<btCollisionObject>();
-    nextObject->setCollisionShape(nextShape.get());
-    nextObject->setCollisionFlags(nextObject->getCollisionFlags() |
-                                  btCollisionObject::CF_STATIC_OBJECT);
-    btTransform identity;
-    identity.setIdentity();
-    nextObject->setWorldTransform(identity);
-    if (terrainObject) {
-      world->removeCollisionObject(terrainObject.get());
-      terrainObject.reset();
-    }
-    // A BVH shape refers to its triangle mesh, so destroy the old shape before
-    // releasing its mesh.
-    terrainShape.reset();
-    terrainMesh.reset();
-    terrainMesh = std::move(pendingTerrainMesh);
-    terrainShape = std::move(nextShape);
-    terrainObject = std::move(nextObject);
-    world->addCollisionObject(terrainObject.get(), btBroadphaseProxy::StaticFilter,
-                              btBroadphaseProxy::DefaultFilter |
-                                  btBroadphaseProxy::CharacterFilter);
-    terrainCenterXZ = pendingTerrainCenterXZ;
-    pendingTerrainHeights.clear();
-    pendingNextSampleRow = 0;
-    pendingNextTriangleRow = 0;
-    hasTerrainCollision = true;
-    return;
+void VehicleBody::prepareTerrainCollision(const TerrainHeightQuery &heightAt,
+                                          const glm::vec3 &center,
+                                          std::uint64_t surfaceRevision) {
+  terrainHeightQuery = heightAt;
+  if (terrainSurfaceRevision != surfaceRevision) {
+    for (auto &entry : terrainTiles) removeTerrainTile(*entry.second);
+    terrainTiles.clear();
+    terrainSurfaceRevision = surfaceRevision;
   }
-
-  // Keep a 32 m edge margin for chassis and wheel rays while avoiding
-  // synchronous BVH rebuilds on every short stretch of driving. Build the next
-  // patch alongside the active one so the old surface remains queryable until
-  // the replacement is complete.
-  if (hasTerrainCollision && glm::distance(nextCenter, terrainCenterXZ) < 96.0f &&
-      pendingTerrainMesh == nullptr)
-    return;
-
-  if (pendingTerrainMesh &&
-      glm::distance(nextCenter, pendingTerrainCenterXZ) >= 96.0f) {
-    pendingTerrainMesh.reset();
-    pendingTerrainHeights.clear();
-    pendingNextSampleRow = 0;
-    pendingNextTriangleRow = 0;
-  }
-
-  if (!pendingTerrainMesh) {
-    pendingTerrainMesh = std::make_unique<btTriangleMesh>(true, false);
-    pendingTerrainHeights.resize(static_cast<size_t>(kCells + 1) * (kCells + 1));
-    pendingTerrainCenterXZ = nextCenter;
-    pendingNextSampleRow = 0;
-    pendingNextTriangleRow = 0;
-  }
-
-  const float startX = pendingTerrainCenterXZ.x - kHalfExtentM;
-  const float startZ = pendingTerrainCenterXZ.y - kHalfExtentM;
-  const int sampleEndRow = std::min(kCells + 1,
-                                    pendingNextSampleRow + kRowsPerFrame);
-  for (int iz = pendingNextSampleRow; iz < sampleEndRow; ++iz) {
-    for (int ix = 0; ix <= kCells; ++ix) {
-      const float x = startX + ix * kCellSizeM;
-      const float z = startZ + iz * kCellSizeM;
-      pendingTerrainHeights[static_cast<size_t>(iz) * (kCells + 1) + ix] =
-          heightAt(x, z);
-    }
-  }
-  pendingNextSampleRow = sampleEndRow;
-
-  const int triangleEndRow = std::min(kCells, pendingNextSampleRow - 1);
-  const int row = kCells + 1;
-  for (int iz = pendingNextTriangleRow; iz < triangleEndRow; ++iz) {
-    for (int ix = 0; ix < kCells; ++ix) {
-      const int a = iz * row + ix;
-      const int b = a + 1;
-      const int c = a + row;
-      const int d = c + 1;
-      const float x0 = startX + ix * kCellSizeM;
-      const float x1 = x0 + kCellSizeM;
-      const float z0 = startZ + iz * kCellSizeM;
-      const float z1 = z0 + kCellSizeM;
-      const float h00 = pendingTerrainHeights[static_cast<size_t>(a)];
-      const float h10 = pendingTerrainHeights[static_cast<size_t>(b)];
-      const float h01 = pendingTerrainHeights[static_cast<size_t>(c)];
-      const float h11 = pendingTerrainHeights[static_cast<size_t>(d)];
-      // Wind triangles so their normals point up (+Y).
-      pendingTerrainMesh->addTriangle({x0, h00, z0}, {x0, h01, z1},
-                                      {x1, h10, z0}, true);
-      pendingTerrainMesh->addTriangle({x1, h10, z0}, {x0, h01, z1},
-                                      {x1, h11, z1}, true);
-    }
-  }
-  pendingNextTriangleRow = triangleEndRow;
-
-  // Height sampling and triangle insertion are spread across rendered frames.
-  if (pendingNextSampleRow <= kCells || pendingNextTriangleRow < kCells)
-    return;
-
-  btTriangleMesh *meshForBuild = pendingTerrainMesh.get();
-  pendingTerrainShapeFuture = std::async(
-      std::launch::async, [meshForBuild]() {
-        auto shape = std::make_unique<btBvhTriangleMeshShape>(
-            meshForBuild, true, true);
-        shape->setMargin(0.04f);
-        return shape;
-      });
+  ensureTerrainTiles(center);
 }
 
-void VehicleBody::prepareTerrainCollision(const TerrainHeightQuery &heightAt,
-                                         const glm::vec3 &center) {
-  rebuildTerrainCollision(heightAt, center);
+void VehicleBody::ensureTerrainTiles(const glm::vec3 &center) {
+  if (!terrainHeightQuery) return;
+  constexpr int kTileCells = 32;
+  constexpr int kTilePoints = kTileCells + 1;
+  constexpr float kCellSizeM = 2.0f;
+  constexpr float kTileSizeM = kTileCells * kCellSizeM;
+  constexpr int kSamplesPerFrame = 256;
+
+  const int centerTileX = static_cast<int>(std::floor(center.x / kTileSizeM));
+  const int centerTileZ = static_cast<int>(std::floor(center.z / kTileSizeM));
+
+  for (auto it = terrainTiles.begin(); it != terrainTiles.end();) {
+    TerrainTile &tile = *it->second;
+    if (std::abs(tile.tileX - centerTileX) > 1 ||
+        std::abs(tile.tileZ - centerTileZ) > 1) {
+      removeTerrainTile(tile);
+      it = terrainTiles.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
+  for (int tileZ = centerTileZ - 1; tileZ <= centerTileZ + 1; ++tileZ) {
+    for (int tileX = centerTileX - 1; tileX <= centerTileX + 1; ++tileX) {
+      const std::uint64_t key = terrainTileKey(tileX, tileZ);
+      if (terrainTiles.find(key) != terrainTiles.end()) continue;
+      auto tile = std::make_unique<TerrainTile>();
+      tile->tileX = tileX;
+      tile->tileZ = tileZ;
+      tile->heights.resize(static_cast<size_t>(kTilePoints) * kTilePoints);
+      terrainTiles.emplace(key, std::move(tile));
+    }
+  }
+
+  std::vector<TerrainTile *> orderedTiles;
+  orderedTiles.reserve(terrainTiles.size());
+  for (auto &entry : terrainTiles) orderedTiles.push_back(entry.second.get());
+  const auto priority = [&](const TerrainTile *tile) {
+    const bool containsCar = tile->tileX == centerTileX && tile->tileZ == centerTileZ;
+    const float tileCenterX = (tile->tileX + 0.5f) * kTileSizeM;
+    const float tileCenterZ = (tile->tileZ + 0.5f) * kTileSizeM;
+    const float dx = tileCenterX - center.x;
+    const float dz = tileCenterZ - center.z;
+    return std::tuple<int, float, int, int>(containsCar ? 0 : 1, dx * dx + dz * dz,
+                                           tile->tileZ, tile->tileX);
+  };
+  std::sort(orderedTiles.begin(), orderedTiles.end(),
+            [&](const TerrainTile *a, const TerrainTile *b) {
+              return priority(a) < priority(b);
+            });
+
+  int sampleBudget = kSamplesPerFrame;
+  for (TerrainTile *tile : orderedTiles) {
+    while (tile->nextSampleRow < kTilePoints &&
+           sampleBudget >= kTilePoints) {
+      const int row = tile->nextSampleRow++;
+      const float z = tile->tileZ * kTileSizeM + row * kCellSizeM;
+      for (int column = 0; column < kTilePoints; ++column) {
+        const float x = tile->tileX * kTileSizeM + column * kCellSizeM;
+        const float height = terrainHeightQuery(x, z);
+        tile->heights[static_cast<size_t>(row) * kTilePoints + column] = height;
+        tile->minHeight = std::min(tile->minHeight, height);
+        tile->maxHeight = std::max(tile->maxHeight, height);
+      }
+      sampleBudget -= kTilePoints;
+    }
+
+    if (tile->nextSampleRow == kTilePoints && !tile->object) {
+      const float minHeight = tile->minHeight - 0.05f;
+      const float maxHeight = tile->maxHeight + 0.05f;
+      auto shape = std::make_unique<btHeightfieldTerrainShape>(
+          kTilePoints, kTilePoints, tile->heights.data(), minHeight,
+          maxHeight, 1, false);
+      shape->setLocalScaling(btVector3(kCellSizeM, 1.0f, kCellSizeM));
+      shape->setMargin(0.04f);
+
+      auto object = std::make_unique<btCollisionObject>();
+      object->setCollisionShape(shape.get());
+      object->setCollisionFlags(object->getCollisionFlags() |
+                                btCollisionObject::CF_STATIC_OBJECT);
+      btTransform transform;
+      transform.setIdentity();
+      transform.setOrigin(btVector3(
+          (tile->tileX + 0.5f) * kTileSizeM,
+          (tile->minHeight + tile->maxHeight) * 0.5f,
+          (tile->tileZ + 0.5f) * kTileSizeM));
+      object->setWorldTransform(transform);
+      world->addCollisionObject(object.get(), btBroadphaseProxy::StaticFilter,
+                                btBroadphaseProxy::DefaultFilter |
+                                    btBroadphaseProxy::CharacterFilter);
+      tile->shape = std::move(shape);
+      tile->object = std::move(object);
+    }
+
+    if (sampleBudget < kTilePoints) break;
+  }
+}
+
+bool VehicleBody::hasTerrainTileAt(float x, float z) const {
+  constexpr float kTileSizeM = 64.0f;
+  const int tileX = static_cast<int>(std::floor(x / kTileSizeM));
+  const int tileZ = static_cast<int>(std::floor(z / kTileSizeM));
+  const auto tile = terrainTiles.find(terrainTileKey(tileX, tileZ));
+  return tile != terrainTiles.end() && tile->second->object != nullptr;
 }
 
 bool VehicleBody::raycastTerrain(const glm::vec3 &from, const glm::vec3 &to,
                                  glm::vec3 &hitPosition,
                                  glm::vec3 &hitNormal) const {
-  if (!world || !terrainObject || !hasTerrainCollision) return false;
+  if (!world || terrainTiles.empty()) return false;
 
   struct TerrainOnlyRayCallback final
       : btCollisionWorld::ClosestRayResultCallback {
-    const btCollisionObject *terrain;
+    const btCollisionObject *chassis;
 
     TerrainOnlyRayCallback(const btVector3 &fromPoint,
                            const btVector3 &toPoint,
-                           const btCollisionObject *terrainObject)
+                           const btCollisionObject *chassisObject)
         : btCollisionWorld::ClosestRayResultCallback(fromPoint, toPoint),
-          terrain(terrainObject) {}
+          chassis(chassisObject) {}
 
     bool needsCollision(btBroadphaseProxy *proxy) const override {
-      if (!proxy || proxy->m_clientObject != terrain) return false;
+      if (!proxy || proxy->m_clientObject == chassis) return false;
       return btCollisionWorld::ClosestRayResultCallback::needsCollision(proxy);
     }
-  } callback(toBullet(from), toBullet(to), terrainObject.get());
+  } callback(toBullet(from), toBullet(to), body.get());
 
   world->rayTest(toBullet(from), toBullet(to), callback);
   if (!callback.hasHit()) return false;
   hitPosition = fromBullet(callback.m_hitPointWorld);
-  hitNormal = glm::dot(fromBullet(callback.m_hitNormalWorld), fromBullet(callback.m_hitNormalWorld)) > 1.0e-8f
-                  ? glm::normalize(fromBullet(callback.m_hitNormalWorld))
+  const glm::vec3 normal = fromBullet(callback.m_hitNormalWorld);
+  hitNormal = glm::dot(normal, normal) > 1.0e-8f
+                  ? glm::normalize(normal)
                   : glm::vec3(0.0f, 1.0f, 0.0f);
   return true;
 }
@@ -246,11 +262,43 @@ bool VehicleBody::raycastTerrain(const glm::vec3 &from, const glm::vec3 &to,
 VehicleBody::State VehicleBody::step(const State &state,
                                      const glm::vec3 &forceN,
                                      const glm::vec3 &torqueNm, float dt,
-                                     const TerrainHeightQuery &) {
+                                     const TerrainHeightQuery &heightAt) {
   synchronize(state);
   body->applyCentralForce(toBullet(forceN));
   body->applyTorque(toBullet(torqueNm));
   world->stepSimulation(std::max(0.0f, dt), 0, std::max(1.0e-4f, dt));
+
+  // Keep a direct-query safety net while the heightfield tile under the car is
+  // still being sampled. Once it is loaded, Bullet handles chassis contact.
+  if (heightAt && !hasTerrainTileAt(state.position.x, state.position.z)) {
+    btTransform corrected = body->getWorldTransform();
+    float correction = 0.0f;
+    for (int iz = -1; iz <= 1; ++iz) {
+      for (int ix = -1; ix <= 1; ++ix) {
+        const btVector3 localPoint(
+            static_cast<btScalar>(ix) * chassisHalfExtentsM.x,
+            centerOfMassDropM - chassisHalfExtentsM.y,
+            static_cast<btScalar>(iz) * chassisHalfExtentsM.z);
+        const btVector3 worldPoint = corrected * localPoint;
+        const float groundY = heightAt(static_cast<float>(worldPoint.x()),
+                                       static_cast<float>(worldPoint.z()));
+        correction = std::max(correction,
+                              groundY - static_cast<float>(worldPoint.y()));
+      }
+    }
+    if (correction > 0.0f) {
+      btVector3 origin = corrected.getOrigin();
+      origin.setY(origin.y() + correction);
+      corrected.setOrigin(origin);
+      body->setWorldTransform(corrected);
+      body->setInterpolationWorldTransform(corrected);
+      if (body->getMotionState()) body->getMotionState()->setWorldTransform(corrected);
+      btVector3 velocity = body->getLinearVelocity();
+      if (velocity.y() < 0.0f) velocity.setY(0.0f);
+      body->setLinearVelocity(velocity);
+      world->updateSingleAabb(body.get());
+    }
+  }
 
   const btTransform &transform = body->getWorldTransform();
   State result;

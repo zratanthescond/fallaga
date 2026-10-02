@@ -120,6 +120,7 @@ if(BUILD_TESTING)
         src/vehicle/VehicleSurface.cpp
     )
     target_include_directories(vehicle_assists_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vehicle_assists_test PRIVATE assimp::assimp)
     add_test(NAME vehicle_assists_test COMMAND vehicle_assists_test)
 
     add_executable(road_bed_random_test road_bed_random_test.cpp)

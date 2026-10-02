@@ -503,14 +503,12 @@ void Car::update(float dt, Terrain *terrain, float totalTime, Camera *camera) {
     updateRoamingAI(dt, terrain, totalTime);
   }
 
-  // Build/recenter the terrain collider incrementally once per rendered frame.
-  // The old path sampled 16,641 heights and rebuilt Bullet's full BVH in one
-  // physics substep, causing visible stalls on entry and again while driving.
   const TerrainHeightQuery heightAt = [terrain](float x, float z) {
     return terrain->getGroundSurfaceHeight(x, z);
   };
   vehicleBody->prepareTerrainCollision(
-      heightAt, glm::vec3(position.x, position.y, position.z));
+      heightAt, glm::vec3(position.x, position.y, position.z),
+      terrain->getCollisionSurfaceRevision());
 
   // Mounting and dismounting are animation-only transitions. Keep the parked
   // chassis still until the enter animation finishes, and while exiting.

@@ -1,4 +1,4 @@
-﻿#include "Terrain.h"
+#include "Terrain.h"
 #include "PhysicsSystem.h"
 #include "WaterSimulation.h"
 #include "ProceduralMapData.h"
@@ -29,8 +29,14 @@ namespace {
 constexpr float HISTORIC_PLAN_OFFSET_X = 3600.0f;
 constexpr float HISTORIC_PLAN_OFFSET_Z = -701.0f;
 constexpr float kCarCollisionCellSize = 64.0f;
+constexpr float kRoadSurfaceCellSize = 64.0f;
 
 std::uint64_t carCollisionCellKey(int x, int z) {
+  return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
+         static_cast<std::uint32_t>(z);
+}
+
+std::uint64_t roadSurfaceCellKey(int x, int z) {
   return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(x)) << 32) |
          static_cast<std::uint32_t>(z);
 }
@@ -376,7 +382,9 @@ Terrain::Terrain() {
           RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
       }
       roadMeshBuilder = new RoadMeshBuilder();
-      roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
+      // Build a flat support ribbon for the terrain conform pass. The rendered
+      // crowned mesh is rebuilt from the resulting heightfield in snapRoads.
+      roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr, 1.5f, false);
       roadMeshBuilder->upload();
 
       // Cut/fill the terrain heightfield itself under the authored road ribbons.
@@ -386,11 +394,12 @@ Terrain::Terrain() {
       const int deformW = terrainManager->getVisualGridW();
       const int deformH = terrainManager->getVisualGridH();
       roadDeformer->build(roadGraph->segments, roadHeightSampler, roadMapper, deformW, deformH);
+      terrainManager->setRoadGeometryMask(roadDeformer->getSurfaceMaskData(), deformW, deformH);
       terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
       // Final support pass follows the built mesh itself so curved widths, end
       // caps, and junction surfaces all have terrain directly beneath them.
       terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
-          roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true);
+          roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true, 20.0f);
       // Seat the ribbon on the graded heightfield before anything samples it again.
       snapRoadsToRenderedTerrain();
 
@@ -2010,12 +2019,78 @@ float Terrain::getGroundSurfaceHeight(float x, float z) const {
   const float terrainY = getHeight(x, z);
   if (!roadGraph || roadGraph->segments.empty()) return terrainY;
 
-  // Match the road ribbon cross-section in RoadMeshBuilder: full width is applied
-  // along the mitered right vector, with the same restrained 2% terrain crossfall.
+  // Match the road ribbon that is actually rendered: spline heights are snapped
+  // to the visual terrain grid, and bends use RoadMeshBuilder's inner-edge width.
   constexpr float kEdgeConform = 0.02f;
-  constexpr float kRoadSurfaceBias = 0.04f;
+  constexpr float kRoadSurfaceBias = 0.01f;
   float surfaceY = terrainY;
-  for (const RoadSegment& road : roadGraph->segments) {
+
+  auto sampleEdge = [&](size_t segmentIndex, size_t i) {
+    const RoadSegment& road = roadGraph->segments[segmentIndex];
+    const size_t n = road.splinePoints.size();
+    if (n < 2 || road.width <= 0.0f || road.rightVecs.size() != n || i >= n) return;
+    const size_t edgeCount = road.closed ? n : n - 1;
+    if (i >= edgeCount) return;
+    const size_t j = (i + 1) % n;
+    const glm::vec2 a(road.splinePoints[i].x, road.splinePoints[i].z);
+    const glm::vec2 b(road.splinePoints[j].x, road.splinePoints[j].z);
+    const glm::vec2 d = b - a;
+    const float len2 = glm::dot(d, d);
+    if (len2 < 1e-8f) return;
+    const glm::vec2 p(x, z);
+    const float rawT = glm::dot(p - a, d) / len2;
+    const float segmentLength = std::sqrt(len2);
+    const float t = glm::clamp(rawT, 0.0f, 1.0f);
+    const glm::vec2 center = a + d * t;
+    const glm::vec2 delta = p - center;
+    const glm::vec3 right3 = glm::mix(road.rightVecs[i], road.rightVecs[j], t);
+    const glm::vec2 right(right3.x, right3.z);
+    const float rightLen = glm::length(right);
+    if (rightLen < 1e-5f) return;
+    const glm::vec2 rightDir = right / rightLen;
+    const float lateral = glm::dot(delta, rightDir);
+    const float fullHalfWidth = road.width * 0.5f;
+    const float halfLeft = glm::mix(
+        RoadSpline::meshHalfWidth(road, static_cast<int>(i), road.closed, -1.0f, fullHalfWidth),
+        RoadSpline::meshHalfWidth(road, static_cast<int>(j), road.closed, -1.0f, fullHalfWidth),
+        t) * rightLen;
+    const float halfRight = glm::mix(
+        RoadSpline::meshHalfWidth(road, static_cast<int>(i), road.closed, 1.0f, fullHalfWidth),
+        RoadSpline::meshHalfWidth(road, static_cast<int>(j), road.closed, 1.0f, fullHalfWidth),
+        t) * rightLen;
+    const float halfWidth = std::max(halfLeft, halfRight);
+    // Allow a round end cap, but do not extend the segment along its tangent.
+    if (lateral < -halfLeft || lateral > halfRight ||
+        rawT < -halfWidth / segmentLength || rawT > 1.0f + halfWidth / segmentLength) return;
+
+    const float centerY = glm::mix(road.splinePoints[i].y, road.splinePoints[j].y, t);
+    // The ribbon is re-seated on the rendered (visual) heightfield in
+    // snapRoadsToRenderedTerrain(). Sampling roadHeightSampler here used the
+    // coarser source DEM instead, which could place car collision metres away
+    // from the drawn road edge on steep terrain.
+    const float edgeY = getHeight(x, z);
+    const float sideHalfWidth = lateral < 0.0f ? halfLeft : halfRight;
+    const float lateralT = glm::clamp(
+        std::fabs(lateral) / std::max(sideHalfWidth, 1e-4f), 0.0f, 1.0f);
+    const float crown = RoadSpline::kCrownHeight * (1.0f - lateralT * lateralT);
+    const float roadY = centerY + (edgeY - centerY) * kEdgeConform +
+                        crown + kRoadSurfaceBias;
+    surfaceY = std::max(surfaceY, roadY);
+  };
+
+  if (roadSurfaceIndexReady) {
+    const int cellX = static_cast<int>(std::floor(x / kRoadSurfaceCellSize));
+    const int cellZ = static_cast<int>(std::floor(z / kRoadSurfaceCellSize));
+    const auto cell = roadSurfaceEdgeGrid.find(roadSurfaceCellKey(cellX, cellZ));
+    if (cell == roadSurfaceEdgeGrid.end()) return terrainY;
+    for (const RoadSurfaceEdge& edge : cell->second)
+      sampleEdge(edge.segmentIndex, edge.pointIndex);
+    return surfaceY;
+  }
+
+  // Keep a correct fallback during startup before the road index is built.
+  for (size_t segmentIndex = 0; segmentIndex < roadGraph->segments.size(); ++segmentIndex) {
+    const RoadSegment& road = roadGraph->segments[segmentIndex];
     const size_t n = road.splinePoints.size();
     if (n < 2 || road.width <= 0.0f || road.rightVecs.size() != n) continue;
     if (road.surfaceBoundsValid) {
@@ -2036,39 +2111,43 @@ float Terrain::getGroundSurfaceHeight(float x, float z) const {
           z < minZ - reach || z > maxZ + reach) continue;
     }
     const size_t edgeCount = road.closed ? n : n - 1;
-    for (size_t i = 0; i < edgeCount; ++i) {
-      const size_t j = (i + 1) % n;
-      const glm::vec2 a(road.splinePoints[i].x, road.splinePoints[i].z);
-      const glm::vec2 b(road.splinePoints[j].x, road.splinePoints[j].z);
-      const glm::vec2 d = b - a;
-      const float len2 = glm::dot(d, d);
-      if (len2 < 1e-8f) continue;
-      const glm::vec2 p(x, z);
-      const float rawT = glm::dot(p - a, d) / len2;
-      const float segmentLength = std::sqrt(len2);
-      const float t = glm::clamp(rawT, 0.0f, 1.0f);
-      const glm::vec2 center = a + d * t;
-      const glm::vec2 delta = p - center;
-      const glm::vec3 right3 = glm::mix(road.rightVecs[i], road.rightVecs[j], t);
-      const glm::vec2 right(right3.x, right3.z);
-      const float rightLen = glm::length(right);
-      if (rightLen < 1e-5f) continue;
-      const float halfWidth = road.width * 0.5f * rightLen;
-      const glm::vec2 rightDir = right / rightLen;
-      const float lateral = glm::dot(delta, rightDir);
-      // Allow a round end cap, but do not extend the segment along its tangent.
-      if (std::fabs(lateral) > halfWidth ||
-          rawT < -halfWidth / segmentLength || rawT > 1.0f + halfWidth / segmentLength) continue;
-
-      const float centerY = glm::mix(road.splinePoints[i].y, road.splinePoints[j].y, t);
-      const float edgeY = roadHeightSampler.isValid()
-          ? roadHeightSampler.sample(x, z)
-          : centerY;
-      const float roadY = centerY + (edgeY - centerY) * kEdgeConform + kRoadSurfaceBias;
-      surfaceY = std::max(surfaceY, roadY);
-    }
+    for (size_t i = 0; i < edgeCount; ++i) sampleEdge(segmentIndex, i);
   }
   return surfaceY;
+}
+
+void Terrain::rebuildRoadSurfaceIndex() {
+  roadSurfaceEdgeGrid.clear();
+  roadSurfaceIndexReady = false;
+  if (!roadGraph) {
+    roadSurfaceIndexReady = true;
+    return;
+  }
+
+  for (size_t segmentIndex = 0; segmentIndex < roadGraph->segments.size(); ++segmentIndex) {
+    const RoadSegment& road = roadGraph->segments[segmentIndex];
+    const size_t n = road.splinePoints.size();
+    if (n < 2 || road.width <= 0.0f || road.rightVecs.size() != n) continue;
+    const size_t edgeCount = road.closed ? n : n - 1;
+    const float reach = road.width + 1.0f;
+    for (size_t i = 0; i < edgeCount; ++i) {
+      const size_t j = (i + 1) % n;
+      const glm::vec3& a = road.splinePoints[i];
+      const glm::vec3& b = road.splinePoints[j];
+      const int minCellX = static_cast<int>(std::floor((std::min(a.x, b.x) - reach) / kRoadSurfaceCellSize));
+      const int maxCellX = static_cast<int>(std::floor((std::max(a.x, b.x) + reach) / kRoadSurfaceCellSize));
+      const int minCellZ = static_cast<int>(std::floor((std::min(a.z, b.z) - reach) / kRoadSurfaceCellSize));
+      const int maxCellZ = static_cast<int>(std::floor((std::max(a.z, b.z) + reach) / kRoadSurfaceCellSize));
+      const RoadSurfaceEdge edge{static_cast<uint32_t>(segmentIndex),
+                                 static_cast<uint32_t>(i)};
+      for (int cellZ = minCellZ; cellZ <= maxCellZ; ++cellZ) {
+        for (int cellX = minCellX; cellX <= maxCellX; ++cellX) {
+          roadSurfaceEdgeGrid[roadSurfaceCellKey(cellX, cellZ)].push_back(edge);
+        }
+      }
+    }
+  }
+  roadSurfaceIndexReady = true;
 }
 
 glm::vec3 Terrain::getNormalAt(float x, float z) const {
@@ -2278,17 +2357,21 @@ void Terrain::rebuildRoadMesh() {
   }
   roadGraph->buildTopology();
   roadMeshBuilder->destroy();
-  roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr);
+  // Use a flat support ribbon while grading the terrain; snapRoads rebuilds
+  // the final visible ribbon with its crown after the heightfield is settled.
+  roadMeshBuilder->build(roadGraph->segments, roadHeightSampler, nullptr, 1.5f, false);
   roadMeshBuilder->upload();
   if (!roadDeformer) roadDeformer = new RoadDeformer();
   const int deformW = terrainManager ? terrainManager->getVisualGridW() : 0;
   const int deformH = terrainManager ? terrainManager->getVisualGridH() : 0;
   roadDeformer->build(roadGraph->segments, roadHeightSampler, roadMapper, deformW, deformH);
   if (terrainManager)
+    terrainManager->setRoadGeometryMask(roadDeformer->getSurfaceMaskData(), deformW, deformH);
+  if (terrainManager)
     terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
   if (terrainManager && roadMeshBuilder)
     terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
-        roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true);
+        roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true, 20.0f);
   if (roadTileField) roadTileField->build(roadGraph->segments, roadMapper);
   snapRoadsToRenderedTerrain();
   if (terrainManager) terrainManager->logHeightfieldSignature("rebuild/AFTER");
@@ -2298,11 +2381,19 @@ void Terrain::rebuildRoadMesh() {
 }
 
 void Terrain::snapRoadsToRenderedTerrain() {
-  if (!terrainManager || !roadGraph || !roadMeshBuilder) return;
+  if (!terrainManager || !roadGraph || !roadMeshBuilder) {
+    rebuildRoadSurfaceIndex();
+    ++collisionSurfaceRevision;
+    return;
+  }
   const int vw = terrainManager->getVisualGridW();
   const int vh = terrainManager->getVisualGridH();
   const std::vector<float>& visual = terrainManager->getVisualHeightsData();
-  if (vw < 2 || vh < 2 || visual.empty()) return;
+  if (vw < 2 || vh < 2 || visual.empty()) {
+    rebuildRoadSurfaceIndex();
+    ++collisionSurfaceRevision;
+    return;
+  }
 
   // Sample the exact array the terrain chunks are meshed from, so the ribbon and
   // the ground triangles are interpolated from the same bilinear surface. Anything
@@ -2323,7 +2414,9 @@ void Terrain::snapRoadsToRenderedTerrain() {
   roadMeshBuilder->build(roadGraph->segments, visualSampler, nullptr);
   roadMeshBuilder->upload();
   // Deliberately no conform pass here: the ribbon now sits on the surface, so
-  // re-conforming would drag the ground 5 cm lower on every rebuild and drift.
+  // re-conforming would lower the ground another 2 cm on every rebuild and drift.
+  rebuildRoadSurfaceIndex();
+  ++collisionSurfaceRevision;
 }
 
 void Terrain::saveRoadsToJSON(const std::string& path) const {

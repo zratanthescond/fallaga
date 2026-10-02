@@ -14,21 +14,25 @@ public:
     void update(const glm::vec3& camPos);
     void render(const glm::mat4& proj, const glm::mat4& view, const glm::vec3& camPos, const glm::vec3& lightDir, const glm::vec3& lightColor, float waterLevel, const glm::vec4& clipPlane = glm::vec4(0.0f, -1.0f, 0.0f, 100000.0f), float maxDrawDistance = 6000.0f);
     float getHeightAt(float x, float z) const;
+    void setVisualSmoothingAffectsPhysics(bool v) { visualSmoothingAffectsPhysics = v; }
+    bool getVisualSmoothingAffectsPhysics() const { return visualSmoothingAffectsPhysics; }
     void exportToOBJ(const std::string& filename, int downsample = 4) const;
     glm::vec3 getNormalAt(float x, float z) const;
     float getRoadAt(float x, float z) const;
     float getRiverAt(float x, float z) const;
     GLuint getHeightmapTexture() const { return heightmapTexID; }
     GLuint getRoadMask() const { return roadMask; }
-    // Apply/remove the road bed directly in the visual and physics heightfields.
-    // Passing null offsets restores the terrain from the last road deformation.
+    // Apply/remove road shaping in the visual and physics heightfields. Passing
+    // null offsets removes tracked road-bed and mesh-conformance changes.
     void applyRoadBedHeightfield(const float* offsets, int offsetW, int offsetH);
+    void setRoadGeometryMask(const unsigned char* mask, int maskW, int maskH);
     void sculpt(float wx, float wz, float radius, float speed, int mode, float dt,
                 float directionDegrees = 0.0f, float gradeDegrees = 20.0f);
     void conformTerrainToRoadMesh(float wx, float wz, float radius, float speed, float dt,
                                   const std::vector<RoadVertex>& roadVertices,
                                   const std::vector<uint32_t>& roadIndices,
-                                  bool wholeNetwork = false);
+                                  bool wholeNetwork = false,
+                                  float bermWidth = 30.0f);
     void paint(float wx, float wz, float radius, float speed, int layerIdx, float dt);
     void saveTerrain();
     void erodeGlobal();
@@ -61,14 +65,18 @@ private:
     void erode(int numDroplets, float brushX, float brushZ, float radius, bool isLocal);
     std::vector<float> heights;
     std::vector<float> visualHeights;
+    std::vector<float> physicsVisualHeights; // authoritative for height queries (visual grid res)
+    bool visualSmoothingAffectsPhysics = false;
     std::vector<float> appliedRoadOffsets;
+    std::vector<float> appliedRoadConformOffsets;
     std::vector<unsigned char> roadMaskData;
+    bool hasRoadGeometryMask = false;
     int gridW=0, gridH=0;
     int visualW=0, visualH=0;
     int roadW=0, roadH=0;
     float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
     std::vector<TerrainChunk*> chunks;
-    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
+    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, roadGeometryMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
     bool hasRoadMask = false;
     int activePaintLayerIdx = 2;
     Shader* terrainShader = nullptr;

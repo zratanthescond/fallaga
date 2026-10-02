@@ -6,7 +6,8 @@
 #include <vector>
 
 namespace {
-constexpr int kCloudNoiseSize = 256;
+constexpr int kCloudNoiseSize = 1024;
+constexpr int kCloudNoiseOctaves = 6;
 
 unsigned int cloudHash(int x, int y, int period) {
     x %= period;
@@ -64,7 +65,7 @@ void Sky::setupCloudNoise() {
             const float u = static_cast<float>(x) / kCloudNoiseSize;
             float value = 0.0f;
             float amplitude = 0.5f;
-            for (int octave = 0; octave < 5; ++octave) {
+            for (int octave = 0; octave < kCloudNoiseOctaves; ++octave) {
                 value += amplitude * cloudValueNoise(u, v, 4 << octave);
                 amplitude *= 0.5f;
             }
@@ -77,7 +78,8 @@ void Sky::setupCloudNoise() {
     glBindTexture(GL_TEXTURE_2D, cloudNoiseTexture);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, kCloudNoiseSize, kCloudNoiseSize, 0,
                  GL_RED, GL_UNSIGNED_BYTE, pixels.data());
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glGenerateMipmap(GL_TEXTURE_2D);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);

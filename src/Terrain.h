@@ -75,6 +75,7 @@ public:
     float     getHeight  (float x, float z) const;
     // Height of the walkable/drivable surface: road mesh where present, terrain elsewhere.
     float     getGroundSurfaceHeight(float x, float z) const;
+    std::uint64_t getCollisionSurfaceRevision() const { return collisionSurfaceRevision; }
     glm::vec3 getNormalAt(float x, float z) const;
     float     getRoadAt  (float x, float z) const;
     bool resolveCarCollision(glm::vec3& position, glm::vec3& velocity,
@@ -167,6 +168,14 @@ private:
         std::vector<CarCollisionInstance>> carCollisionGrid;
     mutable bool carCollisionGridDirty = true;
 
+    struct RoadSurfaceEdge {
+        uint32_t segmentIndex = 0;
+        uint32_t pointIndex = 0;
+    };
+    std::unordered_map<std::uint64_t, std::vector<RoadSurfaceEdge>> roadSurfaceEdgeGrid;
+    bool roadSurfaceIndexReady = false;
+    std::uint64_t collisionSurfaceRevision = 0;
+
     // GTA-style visibility caching: instanced object culling is expensive to redo
     // every frame across thousands of instances, and re-uploading GPU instance
     // buffers unconditionally each frame is even worse. Only recompute/reupload
@@ -208,6 +217,7 @@ private:
     void renderStreets(const glm::mat4& proj, const glm::mat4& view,
                        const glm::vec3& lightDir, const glm::vec3& viewPos) const;
     void rebuildCarCollisionGrid() const;
+    void rebuildRoadSurfaceIndex();
     float distToSegment(float px, float pz,
                         float x1, float z1, float x2, float z2) const;
 };

@@ -7,6 +7,7 @@ uniform sampler2DArray terrainTex;
 uniform sampler2DArray terrainNormal;
 uniform sampler2D portMask;
 uniform sampler2D roadMask;
+uniform sampler2D splineRoadMask;
 uniform sampler2D splatmap1;
 uniform sampler2D splatmap2;
 
@@ -14,6 +15,7 @@ uniform vec3 viewPos, lightDir, lightColor;
 uniform float sunTilt;
 uniform float time;
 uniform bool hasRoadMask;
+uniform bool hasSplineRoadMask;
 uniform float waterLevel;
 uniform int activePaintLayerIdx;
 
@@ -47,62 +49,6 @@ void main()
     vec3 N = normalize(Normal);
     vec3 V = normalize(viewPos - WorldPos);
     float dist = length(viewPos - WorldPos);
-    float alt = WorldPos.y;
-
-    // Distant terrain is heavily minified on screen, so skip the close-range
-    // material stack, repeated procedural noise, and normal-map work there.
-    // Preserve roads, harbor materials, broad biome variation, lighting, and fog.
-    if (dist > 180.0) {
-        vec3 distantColor = texture(terrainTex, vec3(WorldPos.xz * 0.14, 1.0)).rgb;
-        float broadTone = noise(WorldPos.xz * 0.0025);
-        distantColor *= mix(vec3(0.94, 0.97, 0.91),
-                            vec3(1.04, 1.02, 0.96), broadTone);
-
-        vec4 distantPort = texture(portMask, UV);
-        float quay = distantPort.r;
-        float breakwater = distantPort.g + distantPort.b;
-        if (quay > 0.05) {
-            vec3 stone = texture(terrainTex, vec3(WorldPos.xz * 0.16, 12.0)).rgb;
-            distantColor = mix(distantColor, stone, clamp(quay, 0.0, 1.0));
-        }
-        if (breakwater > 0.05) {
-            vec3 rock = texture(terrainTex, vec3(WorldPos.xz * 0.18, 14.0)).rgb;
-            distantColor = mix(distantColor, rock, clamp(breakwater, 0.0, 1.0));
-        }
-
-        if (hasRoadMask) {
-            vec4 road = texture(roadMask, UV);
-            float roadWeight = smoothstep(0.08, 0.45, road.r);
-            if (roadWeight > 0.01 && (alt > waterLevel + 0.3 || quay + breakwater > 0.05)) {
-                float roadLayer = road.g > 0.55 ? 10.0 : 8.0;
-                vec3 roadColor = texture(terrainTex, vec3(WorldPos.xz * 0.18, roadLayer)).rgb;
-                distantColor = mix(distantColor, roadColor, roadWeight);
-            }
-            float riverWeight = smoothstep(0.08, 0.55, road.b) *
-                                (1.0 - smoothstep(waterLevel + 0.2, waterLevel + 1.8, alt));
-            if (riverWeight > 0.01) {
-                vec3 riverbed = texture(terrainTex, vec3(WorldPos.xz * 0.20, 5.0)).rgb;
-                distantColor = mix(distantColor, riverbed, riverWeight * 0.7);
-            }
-        }
-
-        vec3 L = normalize(lightDir);
-        float dayFactor = clamp(smoothstep(-0.15, 0.25, lightDir.y), 0.35, 1.0);
-        float diffuseFactor = clamp((dot(N, L) + 0.25) / 1.25, 0.0, 1.0);
-        vec3 groundLight = mix(vec3(0.25, 0.20, 0.15), vec3(0.35, 0.55, 0.85),
-                               N.y * 0.5 + 0.5) * dayFactor;
-        vec3 result = distantColor * (groundLight + lightColor * diffuseFactor * dayFactor);
-        result = (result * (2.51 * result + 0.03)) /
-                 (result * (2.43 * result + 0.59) + 0.14);
-        result = pow(max(result, vec3(0.0)), vec3(1.0 / 2.2));
-
-        vec3 horizonColor = mix(vec3(0.05, 0.1, 0.2), vec3(0.5, 0.8, 1.0),
-                                smoothstep(-0.1, 0.5, lightDir.y));
-        float fogAmount = smoothstep(2500.0, 6500.0, dist) *
-                          pow(clamp(1.0 - abs(V.y), 0.0, 1.0), 1.5);
-        FragColor = vec4(mix(result, horizonColor, pow(fogAmount, 1.4)), 1.0);
-        return;
-    }
 
     vec4 portVals = texture(portMask, UV);
     float quayMask = portVals.r;       // Quays, Wharfs, Esplanade
@@ -112,6 +58,7 @@ void main()
 
     // Exact slope in degrees: 0° = completely flat horizontal, 90° = vertical wall
     float angleDeg = acos(clamp(N.y, -1.0, 1.0)) * 57.2958;
+    float alt = WorldPos.y;
     float specMask = 0.03; // Natural matte earth/grass default
 
     // Distance LOD fades to eliminate moire aliasing while keeping razor-sharp close-up detail
@@ -286,7 +233,7 @@ void main()
     vec3 worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
 
     // ── 5. ROADS, RAILWAYS, AND REALISTIC ASYMMETRIC WADIS ──
-    if (hasRoadMask) {
+    if (hasRoadMask || hasSplineRoadMask) {
         // High-frequency sub-texel organic domain warp in world meters
         // Completely breaks up the 3.43m square texel grid alignment!
         vec2 roadWarp = (vec2(
@@ -294,7 +241,10 @@ void main()
             noise(WorldPos.zx * 0.28 + vec2(4.3, 7.9))
         ) - 0.5) * 0.00032;
         vec2 roadUV = clamp(UV + roadWarp, 0.0, 1.0);
-        vec4 maskVals = texture(roadMask, roadUV);
+        vec4 maskVals = vec4(0.0);
+        if (hasRoadMask)
+            maskVals = texture(roadMask, roadUV);
+        float splineRoadRaw = hasSplineRoadMask ? texture(splineRoadMask, UV).r : 0.0;
 
         // A. Custom Painted Layer (Alpha) - only if active brush layer is selected
         if (maskVals.a > 0.05 && activePaintLayerIdx > 0) {
@@ -304,7 +254,8 @@ void main()
 
         // B. PHOTOREALISTIC MULTI-TIER ROAD SYSTEM
         // Hybrid rendering: terrain splatting provides seamless ground foundation
-        float rRaw = maskVals.r;
+        float paintedRoadRaw = maskVals.r;
+        float rRaw = max(paintedRoadRaw, splineRoadRaw);
         if (rRaw > 0.01 && (alt > waterLevel + 0.3 || isHarbor)) {
             // 1. Multi-scale organic edge breakup (fractal micro-noise for natural dirt-grass boundary)
             vec2 roadNoiseUV = WorldPos.xz * 0.38;
@@ -314,7 +265,14 @@ void main()
             float edgeNoise = (nEdge1 * 0.50 + nEdge2 * 0.35 + nEdge3 * 0.15 - 0.5);
 
             // Warp the distance gradient subtly and organically (avoiding jagged sawtooth spikes)
-            float rWarped = clamp(rRaw + edgeNoise * 0.025 * smoothstep(0.01, 0.40, rRaw), 0.0, 1.0);
+            float paintedRoadWarped = clamp(
+                paintedRoadRaw + edgeNoise * 0.025 * smoothstep(0.01, 0.40, paintedRoadRaw),
+                0.0, 1.0);
+            // Generated road material uses the unwarped spline raster, whose
+            // distance profile is shared with terrain grading. It takes priority
+            // inside its footprint; painted map roads keep their own edge warp
+            // everywhere outside generated roads.
+            float rWarped = splineRoadRaw > 0.0 ? splineRoadRaw : paintedRoadWarped;
 
             // Overall road presence: soft shoulder starts at 0.06, full roadbed inside 0.24
             float roadFactor = smoothstep(0.06, 0.24, rWarped);

@@ -9,7 +9,7 @@ uniform sampler2D cloudNoise;
 void main() {
     vec3 dir = normalize(viewDir);
     float sunTilt = lightDir.y; // Positive for day, negative for night
-    
+
     // 1. DYNAMIC SKY COLORS
     vec3 dayTop    = vec3(0.1, 0.5, 0.9);
     vec3 dayBottom = vec3(0.5, 0.8, 1.0);
@@ -40,14 +40,15 @@ void main() {
     vec3 skyColor = mix(skyBottom, skyTop, pow(vertical, 0.8));
 
     // 2. PROCEDURAL CLOUDS
-    // Only show clouds above horizon
-    float cloudMask = smoothstep(0.0, 0.2, dir.y);
     float cloudDensity = 0.0;
     if (dir.y > 0.0) {
         vec2 cloudUV = dir.xz / (dir.y + 0.01);
         float cloudSpeed = time * 0.01;
         cloudDensity = texture(cloudNoise, cloudUV * 0.5 + cloudSpeed).r;
     }
+
+    // Only show clouds above horizon
+    float cloudMask = smoothstep(0.0, 0.2, dir.y);
     vec3 cloudColor = vec3(1.0, 1.0, 1.0);
     if (sunTilt < 0.0) cloudColor *= 0.3; // Darker at night
     else if (sunTilt < 0.2) cloudColor = mix(vec3(1.0, 0.6, 0.3), cloudColor, smoothstep(0.0, 0.2, sunTilt));

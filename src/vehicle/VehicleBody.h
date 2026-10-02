@@ -4,21 +4,20 @@
 #include <glm/gtc/quaternion.hpp>
 
 #include <functional>
-#include <future>
+#include <cstdint>
 #include <memory>
-#include <vector>
+#include <unordered_map>
 
 using TerrainHeightQuery = std::function<float(float, float)>;
 class btBroadphaseInterface;
 class btCollisionConfiguration;
 class btCollisionDispatcher;
 class btCollisionShape;
+class btHeightfieldTerrainShape;
+class btCollisionObject;
 class btDiscreteDynamicsWorld;
 class btSequentialImpulseConstraintSolver;
 class btRigidBody;
-class btTriangleMesh;
-class btBvhTriangleMeshShape;
-class btCollisionObject;
 
 class VehicleBody {
 public:
@@ -40,14 +39,17 @@ public:
              const glm::vec3 &torqueNm, float dt,
              const TerrainHeightQuery &heightAt);
   void prepareTerrainCollision(const TerrainHeightQuery &heightAt,
-                               const glm::vec3 &center);
+                               const glm::vec3 &center,
+                               std::uint64_t surfaceRevision = 0);
   bool raycastTerrain(const glm::vec3 &from, const glm::vec3 &to,
                       glm::vec3 &hitPosition, glm::vec3 &hitNormal) const;
   void synchronize(const State &state);
 
 private:
-  void rebuildTerrainCollision(const TerrainHeightQuery &heightAt,
-                               const glm::vec3 &center);
+  struct TerrainTile;
+  void ensureTerrainTiles(const glm::vec3 &center);
+  void removeTerrainTile(TerrainTile &tile);
+  bool hasTerrainTileAt(float x, float z) const;
 
   std::unique_ptr<btCollisionConfiguration> collisionConfiguration;
   std::unique_ptr<btCollisionDispatcher> dispatcher;
@@ -58,17 +60,9 @@ private:
   std::unique_ptr<btCollisionShape> chassisShape;
   std::unique_ptr<btRigidBody> body;
 
-  std::unique_ptr<btTriangleMesh> terrainMesh;
-  std::unique_ptr<btBvhTriangleMeshShape> terrainShape;
-  std::unique_ptr<btCollisionObject> terrainObject;
-  glm::vec2 terrainCenterXZ{0.0f};
-  bool hasTerrainCollision = false;
-
-  std::unique_ptr<btTriangleMesh> pendingTerrainMesh;
-  std::vector<float> pendingTerrainHeights;
-  glm::vec2 pendingTerrainCenterXZ{0.0f};
-  int pendingNextSampleRow = 0;
-  int pendingNextTriangleRow = 0;
-  std::future<std::unique_ptr<btBvhTriangleMeshShape>>
-      pendingTerrainShapeFuture;
+  glm::vec3 chassisHalfExtentsM{0.0f};
+  float centerOfMassDropM = 0.0f;
+  TerrainHeightQuery terrainHeightQuery;
+  std::unordered_map<std::uint64_t, std::unique_ptr<TerrainTile>> terrainTiles;
+  std::uint64_t terrainSurfaceRevision = 0;
 };

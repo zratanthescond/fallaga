@@ -51,8 +51,7 @@ int main() {
   VehicleBody::State groundedState;
   groundedState.position = glm::vec3(0.0f, 10.0f, 0.0f);
   const TerrainHeightQuery flatGround = [](float, float) { return 0.0f; };
-  // Terrain collision is prepared in bounded row batches; nine calls complete
-  // the 129 sample rows. Bullet's BVH is then built asynchronously.
+  // Nearby Bullet heightfield tiles are sampled incrementally, nearest first.
   for (int i = 0; i < 9; ++i)
     groundedBody.prepareTerrainCollision(flatGround, groundedState.position);
   glm::vec3 terrainHit(0.0f), terrainNormal(0.0f);

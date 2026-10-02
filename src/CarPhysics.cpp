@@ -74,17 +74,11 @@ void Car::updateSuspension(float sdt, Terrain *terrain, glm::vec3 &totalForce, g
     const bool rayIntersection = vehicleBody->raycastTerrain(
         wp, wp - chassisUp * rayLength, hitPosition, hitNormal);
     const bool rayHit = rayIntersection && glm::dot(hitNormal, chassisUp) > 0.1f;
-    bool hasGroundContact = rayHit;
-    float distanceToGround = 0.0f;
-    if (rayHit) {
-      distanceToGround = glm::dot(wp - hitPosition, chassisUp);
-    } else {
-      // The direct terrain query preserves road/terrain detail smaller than
-      // the Bullet mesh cells when a ray passes through a mesh seam.
-      const float groundH = terrain->getGroundSurfaceHeight(cp.x, cp.z);
-      distanceToGround = wp.y - groundH;
-      hasGroundContact = distanceToGround <= rayLength;
-    }
+    const float groundH = terrain->getGroundSurfaceHeight(cp.x, cp.z);
+    const float distanceToGround = rayHit
+        ? glm::dot(wp - hitPosition, chassisUp)
+        : wp.y - groundH;
+    const bool hasGroundContact = rayHit || distanceToGround <= rayLength;
 
     wheels[i].currentLength = glm::clamp(distanceToGround - wheels[i].radius,
                                          0.0f, wheels[i].suspensionRest);
@@ -126,14 +120,12 @@ void Car::calculateTireForces(float sdt, Terrain *terrain,
                               glm::vec3 &totalForce, glm::vec3 &totalTorque) {
   bool handbrake = false;
   bool braking = false;
-  bool gas = false;
 
   if (state == State::DRIVEN && m_Driver && m_Driver->isDriving()) {
-    gas = driverInput.accelerate;
-    braking = driverInput.brake;
+    // In reverse, S is the accelerator. Keeping service-brake torque active
+    // here locks the wheels against the negative reverse-gear torque.
+    braking = driverInput.brake && engine.gear != 0;
     handbrake = driverInput.handbrake;
-  } else if (state == State::ROAMING) {
-    gas = (engine.throttle > 0.1f);
   }
 
   float engineTorque = engine.torqueCurve(engine.rpm) * engine.throttle;
@@ -200,7 +192,7 @@ void Car::calculateTireForces(float sdt, Terrain *terrain,
             vLong, omega * wheels[i].radius, drivingConfig.absEnabled,
             drivingConfig.absSlipThreshold);
         T_brake = serviceBrakeTorque * absScale;
-    } else if (std::abs(engine.throttle) < 0.1f) {
+    } else if (std::abs(engine.throttle) < 0.1f && engine.gear != 0) {
         T_brake = drivingConfig.engineBrakeTorqueNm;
     }
     T_brake += drivingConfig.rollingResistanceTorqueNm;
@@ -457,7 +449,8 @@ void Car::updateActivePhysics(float dt, Terrain *terrain) {
   // Keep the specified acceleration as a chassis limit. Capping wheel torque
   // here made launch torque too weak to overcome the wheel's own brake/drag
   // terms, leaving the vehicle stuck at rest.
-  const bool propulsionActive = engine.throttle > 0.1f && !driverInput.brake;
+  const bool propulsionActive = engine.throttle > 0.1f &&
+                                (!driverInput.brake || engine.gear == 0);
   if (hasPlanarForward && propulsionActive) {
     const float driveDirection = engine.gear == 0 ? -1.0f : 1.0f;
     const float forwardSpeed = velocity.x * planarForward.x +
@@ -492,7 +485,8 @@ void Car::updateActivePhysics(float dt, Terrain *terrain) {
         glm::vec3(position.x, position.y - 2.0f, position.z),
         hitPosition, hitNormal);
     const float floorY = (hitTerrain ? hitPosition.y
-                                     : terrain->getHeight(position.x, position.z)) + 0.16f;
+                                     : terrain->getGroundSurfaceHeight(position.x,
+                                                                      position.z)) + 0.16f;
     if (position.y < floorY) {
       position.y = floorY;
       if (velocity.y < 0.0f)

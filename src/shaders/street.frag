@@ -16,9 +16,9 @@ uniform int u_joinStrokeCount;
 uniform vec4 u_joinCurvePoints[128]; // four xz control points per shader-painted stroke
 uniform vec4 u_joinStrokeInfo[32];  // half-width, 1 for pavement/curb, 0 for white edge
 uniform int u_joinContactCount;
-uniform vec4 u_joinContactCenterT[8]; // host center xz and tangent xz
-uniform vec4 u_joinContactInfo[8];    // host side, white mouth half-span, pavement half-span, radius
-uniform vec4 u_joinContactDims[8];    // host road width
+uniform vec4 u_joinContactCenterT[32]; // host center xz and tangent xz
+uniform vec4 u_joinContactInfo[32];    // host side, white mouth half-span, pavement half-span, radius
+uniform vec4 u_joinContactDims[32];    // host road width
 
 // ---------------------------------------------------------------------------
 //  Procedural GTA-style road surface.
@@ -134,7 +134,7 @@ void main() {
         vec3 cGrime  = vec3(0.46, 0.41, 0.34);      // blown dust / dirt
 
         float rut = smoothstep(0.13, 0.02,
-                              min(abs(u - 0.28), abs(u - 0.72)));
+                              min(abs(u - 0.28), abs(u - 0.72))) * paint;
         float patch = smoothstep(0.68, 0.92, nMacro);
         float grit  = nFine * 0.6 + nRust * 0.4;
 
@@ -156,7 +156,7 @@ void main() {
         curb *= paint;
         float whiteSuppression = 0.0;
         float pavementSuppression = 0.0;
-        for (int j = 0; j < 8; ++j) {
+        for (int j = 0; j < 32; ++j) {
             if (j >= u_joinContactCount) break;
             vec4 centerT = u_joinContactCenterT[j];
             vec4 info = u_joinContactInfo[j];
@@ -166,14 +166,10 @@ void main() {
             vec2 hostRight = vec2(hostTangent.y, -hostTangent.x);
             float along = dot(wxz - hostCenter, hostTangent);
             float outward = dot(wxz - hostCenter, hostRight) * info.x;
-            float whiteCenter = hostWidth * (0.5 - 0.085);
-            float pavementCenter = hostWidth * (0.5 - 0.0335);
-            float whiteHalfWidth = hostWidth * 0.018;
-            float pavementHalfWidth = hostWidth * 0.0335;
-            if (abs(along) < info.y && abs(outward - whiteCenter) < whiteHalfWidth)
+            if (abs(along) < info.y && outward > hostWidth * 0.30) {
                 whiteSuppression = 1.0;
-            if (abs(along) < info.z && abs(outward - pavementCenter) < pavementHalfWidth)
                 pavementSuppression = 1.0;
+            }
         }
         curb *= 1.0 - pavementSuppression;
         vec3 cCurb = mix(vec3(0.60, 0.585, 0.545),

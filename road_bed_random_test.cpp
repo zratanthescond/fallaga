@@ -62,8 +62,8 @@ int main() {
                 const float side = sideDist(rng);
                 const glm::vec3 center = glm::mix(road.splinePoints[i], road.splinePoints[i + 1], t);
                 const glm::vec3 right = glm::mix(road.rightVecs[i], road.rightVecs[i + 1], t);
-                const float hw0 = roadMeshHalfWidth(road, (int)i, false, side, road.width * 0.5f);
-                const float hw1 = roadMeshHalfWidth(road, (int)i + 1, false, side, road.width * 0.5f);
+                const float hw0 = RoadSpline::meshHalfWidth(road, (int)i, false, side, road.width * 0.5f);
+                const float hw1 = RoadSpline::meshHalfWidth(road, (int)i + 1, false, side, road.width * 0.5f);
                 const float useHw = glm::mix(hw0, hw1, t);
                 // Same cross-section equation as RoadMeshBuilder, including
                 // its inner-fold correction at sharp bends.
