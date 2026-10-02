@@ -394,15 +394,46 @@ Terrain::Terrain() {
       // smaller mask left multi-metre ungraded strips at road edges after resampling.
       const int deformW = terrainManager->getVisualGridW();
       const int deformH = terrainManager->getVisualGridH();
+
+      // FALLAGA_ROADGAP: trace the worst terrain-above-road point through the
+      // construction phases, so it is unambiguous which stage leaves the ground
+      // above the asphalt. Remove once the grading is settled.
+      auto probeVisualY = [&](float wx, float wz) -> float {
+        const int vw = terrainManager->getVisualGridW();
+        const int vh = terrainManager->getVisualGridH();
+        const std::vector<float>& H = terrainManager->getVisualHeightsData();
+        if (vw < 2 || vh < 2 || H.empty()) return 0.0f;
+        const float wx0 = terrainManager->getWorldMinX(), wx1 = terrainManager->getWorldMaxX();
+        const float wz0 = terrainManager->getWorldMinZ(), wz1 = terrainManager->getWorldMaxZ();
+        const float u = glm::clamp((wx - wx0) / (wx1 - wx0) * (vw - 1), 0.0f, (float)(vw - 1));
+        const float v = glm::clamp((wz - wz0) / (wz1 - wz0) * (vh - 1), 0.0f, (float)(vh - 1));
+        const int x0 = (int)u, z0 = (int)v;
+        const int x1 = std::min(x0 + 1, vw - 1), z1 = std::min(z0 + 1, vh - 1);
+        const float tx = u - x0, tz = v - z0;
+        return H[(size_t)z0 * vw + x0] * (1 - tx) * (1 - tz) +
+               H[(size_t)z0 * vw + x1] * tx * (1 - tz) +
+               H[(size_t)z1 * vw + x0] * (1 - tx) * tz +
+               H[(size_t)z1 * vw + x1] * tx * tz;
+      };
+      const bool tracePhases = std::getenv("FALLAGA_ROADGAP") != nullptr;
+      if (tracePhases)
+        std::cout << "[Phase] afterSupportRibbon probeY=" << probeVisualY(4313.14f, -989.314f) << std::endl;
+
       roadDeformer->build(roadGraph->segments, roadHeightSampler, roadMapper, deformW, deformH);
       terrainManager->setRoadGeometryMask(roadDeformer->getSurfaceMaskData(), deformW, deformH);
       terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
+      if (tracePhases)
+        std::cout << "[Phase] afterRoadBed       probeY=" << probeVisualY(4313.14f, -989.314f) << std::endl;
       // Final support pass follows the built mesh itself so curved widths, end
       // caps, and junction surfaces all have terrain directly beneath them.
       terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
           roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true, 20.0f);
+      if (tracePhases)
+        std::cout << "[Phase] afterConform       probeY=" << probeVisualY(4313.14f, -989.314f) << std::endl;
       // Seat the ribbon on the graded heightfield before anything samples it again.
       snapRoadsToRenderedTerrain();
+      if (tracePhases)
+        std::cout << "[Phase] afterSnap          probeY=" << probeVisualY(4313.14f, -989.314f) << std::endl;
 
       // FALLAGA_ROADGAP: measure how far the road surface actually sits above the
       // terrain the GPU draws. The road is sampled from the native DEM grid while the
@@ -460,6 +491,7 @@ Terrain::Terrain() {
           }
           const float kStencil[2] = { 8.0f, 16.0f };
           double worstPoke = 0.0;
+          float worstPokeX = 0.0f, worstPokeZ = 0.0f, worstPokeRoadY = 0.0f;
           int probes = 0, poke025 = 0, poke1m = 0;
           for (size_t vi = 0; vi < rv.size(); ++vi) {
             for (int s = 0; s < 2; ++s) {
@@ -485,7 +517,10 @@ Terrain::Terrain() {
                 if (roadY == -std::numeric_limits<float>::infinity()) continue;
                 const float proud = sampleVisual(px, pz) - roadY;
                 ++probes;
-                if (proud > worstPoke) worstPoke = proud;
+                if (proud > worstPoke) {
+                  worstPoke = proud;
+                  worstPokeX = px; worstPokeZ = pz; worstPokeRoadY = roadY;
+                }
                 if (proud > 0.25f) ++poke025;
                 if (proud > 1.0f) ++poke1m;
               }
@@ -502,7 +537,13 @@ Terrain::Terrain() {
                     << " || probes=" << probes
                     << " poke>0.25m=" << poke025
                     << " poke>1m=" << poke1m
-                    << " worstPoke=" << worstPoke << std::endl;
+                    << " worstPoke=" << worstPoke
+                    << " at=(" << worstPokeX << "," << worstPokeZ << ")"
+                    << " terrainY=" << sampleVisual(worstPokeX, worstPokeZ)
+                    << " roadY=" << worstPokeRoadY
+                    << " worldX=[" << wMinX << "," << wMaxX << "]"
+                    << " worldZ=[" << wMinZ << "," << wMaxZ << "]"
+                    << std::endl;
         }
       }
 
@@ -2432,10 +2473,35 @@ void Terrain::saveTerrain() {
 
 void Terrain::rebuildRoadMesh() {
   if (!roadGraph || !roadMeshBuilder) return;
+  // FALLAGA_ROADGAP: trace one probe point through the rebuild phases. Prints the
+  // visual heightfield at (4313.14,-989.31) -- the worst measured terrain-above-road
+  // point -- after every stage that can move it, so it is unambiguous which stage
+  // leaves the ground above the asphalt.
+  auto probeY = [&]() -> float {
+    if (!std::getenv("FALLAGA_ROADGAP") || !terrainManager) return 0.0f;
+    const int vw = terrainManager->getVisualGridW();
+    const int vh = terrainManager->getVisualGridH();
+    const std::vector<float>& H = terrainManager->getVisualHeightsData();
+    if (vw < 2 || vh < 2) return 0.0f;
+    const float nx = (4313.14f - terrainManager->getWorldMinX()) /
+                     (terrainManager->getWorldMaxX() - terrainManager->getWorldMinX()) * (vw - 1);
+    const float nz = (-989.314f - terrainManager->getWorldMinZ()) /
+                     (terrainManager->getWorldMaxZ() - terrainManager->getWorldMinZ()) * (vh - 1);
+    const int x0 = std::max(0, std::min((int)nx, vw - 2));
+    const int z0 = std::max(0, std::min((int)nz, vh - 2));
+    const float tx = nx - x0, tz = nz - z0;
+    return H[(size_t)z0 * vw + x0] * (1 - tx) * (1 - tz) +
+           H[(size_t)z0 * vw + x0 + 1] * tx * (1 - tz) +
+           H[(size_t)(z0 + 1) * vw + x0] * (1 - tx) * tz +
+           H[(size_t)(z0 + 1) * vw + x0 + 1] * tx * tz;
+  };
+  const bool traceProbe = std::getenv("FALLAGA_ROADGAP") != nullptr;
+  if (traceProbe) std::cout << "[Phase] start        probeY=" << probeY() << std::endl;
   if (terrainManager) terrainManager->logHeightfieldSignature("rebuild/BEFORE");
   // Restore the current terrain before sampling/evaluating the edited network;
   // this prevents each rebuild from stacking another road cut into the DEM.
   if (terrainManager) terrainManager->applyRoadBedHeightfield(nullptr, 0, 0);
+  if (traceProbe) std::cout << "[Phase] afterRestore probeY=" << probeY() << std::endl;
   for (auto& seg : roadGraph->segments) {
     RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
   }
@@ -2453,11 +2519,14 @@ void Terrain::rebuildRoadMesh() {
     terrainManager->setRoadGeometryMask(roadDeformer->getSurfaceMaskData(), deformW, deformH);
   if (terrainManager)
     terrainManager->applyRoadBedHeightfield(roadDeformer->getDeformationData(), deformW, deformH);
+  if (traceProbe) std::cout << "[Phase] afterRoadBed  probeY=" << probeY() << std::endl;
   if (terrainManager && roadMeshBuilder)
     terrainManager->conformTerrainToRoadMesh(0.0f, 0.0f, 0.0f, 1.0f, 1.0f,
         roadMeshBuilder->debugVertices(), roadMeshBuilder->debugIndices(), true, 20.0f);
+  if (traceProbe) std::cout << "[Phase] afterConform  probeY=" << probeY() << std::endl;
   if (roadTileField) roadTileField->build(roadGraph->segments, roadMapper);
   snapRoadsToRenderedTerrain();
+  if (traceProbe) std::cout << "[Phase] afterSnap     probeY=" << probeY() << std::endl;
   if (terrainManager) terrainManager->logHeightfieldSignature("rebuild/AFTER");
   std::cout << "[Terrain] Road mesh rebuilt: " << roadGraph->segments.size()
             << " segments, " << roadMeshBuilder->getVertexCount() << " vertices, "
