@@ -388,4 +388,6 @@ private:
 
     GLuint m_VAO = 0, m_VBO = 0, m_EBO = 0;
     int m_indexCount = 0;
+    // Graded verge quads emitted along the carriageway edges (reporting only).
+    int m_shoulderQuads = 0;
 };
