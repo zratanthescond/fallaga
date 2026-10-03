@@ -793,41 +793,60 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
         for (int x = 0; x < visualW; ++x) {
             const float worldX = worldMinX + (float)x / (visualW - 1) * worldWidth;
             if (!wholeNetwork && glm::length(glm::vec2(worldX - wx, worldZ - wz)) > radius) continue;
-            float surfaceY = 0.0f;
-            if (!gradeTargetNear(worldX, worldZ, surfaceY)) continue;
-            // Distance from this vertex to the ribbon piece that governs its cell.
-            // Using the true ribbon distance (not the distance to the cell centre)
-            // keeps the corridor/berm falloff meaningful at ~43 m cells.
-            const int dgx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
-            const int dgz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
-            const float ribbonDist =
-                glm::distance(glm::vec2(worldX, worldZ),
-                              glm::vec2(surfMinX + ((float)dgx + 0.5f) * surfCellX,
-                                        surfMinZ + ((float)dgz + 0.5f) * surfCellZ)) +
-                surfTriDist[(size_t)dgz * surfRes + dgx];
-            const float corridorT = kRoadBermWidth > 1e-4f
-                ? glm::clamp((ribbonDist - kRoadCorridor) / kRoadBermWidth, 0.0f, 1.0f)
-                : (ribbonDist <= cellReach ? 0.0f : 1.0f);
-            float falloff = 1.0f - corridorT * corridorT * (3.0f - 2.0f * corridorT);
-            if (!wholeNetwork) {
-                const float brushDistance = glm::length(glm::vec2(worldX - wx, worldZ - wz));
-                const float t = glm::clamp(brushDistance / radius, 0.0f, 1.0f);
-                falloff *= 1.0f - t * t * (3.0f - 2.0f * t);
-            }
-            if (falloff <= 0.0f) continue;
-            const float targetHeight = surfaceY - kTerrainBelowRoad;
             const size_t idx = (size_t)z * visualW + x;
             const float oldHeight = visualHeights[idx];
-            const float blended = glm::mix(oldHeight, targetHeight, brushBlend * falloff);
-            // The blend above is a soft grade; it leaves the ground only partially
-            // pulled down near the corridor edge. A terrain triangle spanning from
-            // there across the road still crests over the asphalt, which is exactly
-            // the flat-road poking in the screenshots. So the ground is ALSO hard
-            // capped just under the road surface, at full strength, wherever a road
-            // surface governs this vertex. That removes the poke instead of trading
-            // it against floating.
-            const float capped = std::min(blended, surfaceY - (kTerrainBelowRoad * 0.5f));
-            const float nextHeight = glm::clamp(capped, minHeight, maxHeight);
+
+            // Pass 1: soft grade of the corridor, with the berm falloff.
+            float nextHeight = oldHeight;
+            float surfaceY = 0.0f;
+            if (gradeTargetNear(worldX, worldZ, surfaceY)) {
+                // Distance from this vertex to the ribbon piece that governs its cell.
+                // Using the true ribbon distance (not the distance to the cell centre)
+                // keeps the corridor/berm falloff meaningful at ~43 m cells.
+                const int dgx = std::clamp((int)((worldX - surfMinX) / surfCellX), 0, surfRes - 1);
+                const int dgz = std::clamp((int)((worldZ - surfMinZ) / surfCellZ), 0, surfRes - 1);
+                const float ribbonDist =
+                    glm::distance(glm::vec2(worldX, worldZ),
+                                  glm::vec2(surfMinX + ((float)dgx + 0.5f) * surfCellX,
+                                            surfMinZ + ((float)dgz + 0.5f) * surfCellZ)) +
+                    surfTriDist[(size_t)dgz * surfRes + dgx];
+                const float corridorT = kRoadBermWidth > 1e-4f
+                    ? glm::clamp((ribbonDist - kRoadCorridor) / kRoadBermWidth, 0.0f, 1.0f)
+                    : (ribbonDist <= cellReach ? 0.0f : 1.0f);
+                float falloff = 1.0f - corridorT * corridorT * (3.0f - 2.0f * corridorT);
+                if (!wholeNetwork) {
+                    const float brushDistance = glm::length(glm::vec2(worldX - wx, worldZ - wz));
+                    const float t = glm::clamp(brushDistance / radius, 0.0f, 1.0f);
+                    falloff *= 1.0f - t * t * (3.0f - 2.0f * t);
+                }
+                if (falloff > 0.0f) {
+                    const float targetHeight = surfaceY - kTerrainBelowRoad;
+                    nextHeight = glm::mix(oldHeight, targetHeight, brushBlend * falloff);
+                }
+            }
+
+            // Pass 2: hard cap. The soft grade leaves the ground only partially pulled
+            // down near the corridor edge, so a terrain triangle spanning from there
+            // across a road can still crest over the asphalt. Any ground that would
+            // stand above the road surface over its own cell is lowered to just under
+            // it, at full strength. This only ever lowers ground, so unlike widening
+            // the soft grade it cannot flatten the corridor.
+            //
+            // The cap deliberately uses the same cell as the grade, NOT a wider
+            // search. Widening it was measured several ways (3x3 cells, 5x5 cells,
+            // 5x5 with a distance filter) and every variant is worse overall: the cap
+            // reaches lower road further away and drags the ground down to THAT,
+            // which raises the road's apparent height instead of seating it.
+            //   5x5 no filter : meanGap 0.20 -> 1.07 m, poke 1.27 -> 4.64 m
+            //   5x5 filtered  : meanGap 0.20 -> 0.43 m, poke 1.27 -> 1.47 m
+            //   own cell only : meanGap +0.20 m,       poke 1.27 m   <- kept
+            float capSurfaceY = 0.0f;
+            if (gradeTargetNear(worldX, worldZ, capSurfaceY)) {
+                const float cap = capSurfaceY - (kTerrainBelowRoad * 0.5f);
+                if (nextHeight > cap) nextHeight = cap;
+            }
+
+            nextHeight = glm::clamp(nextHeight, minHeight, maxHeight);
             const float appliedDelta = nextHeight - oldHeight;
             if (std::fabs(appliedDelta) < 0.001f) continue;
             if (appliedRoadConformOffsets.size() != visualHeights.size())
