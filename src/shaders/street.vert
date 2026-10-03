@@ -5,12 +5,14 @@ layout (location = 2) in vec2 aUV;
 layout (location = 3) in float aType;
 layout (location = 4) in float aMarkMask;
 layout (location = 5) in float aSurfacePriority;
+layout (location = 6) in vec2 aMetricUV;
 
 out vec3 FragPos;
 out vec3 Normal;
 out vec2 TexCoords;
 out float RoadType;
 out float MarkMask;
+out vec2 MetricUV;
 
 uniform mat4 model;
 uniform mat4 view;
@@ -22,6 +24,7 @@ void main() {
     TexCoords = aUV;
     RoadType = aType;
     MarkMask = aMarkMask;
+    MetricUV = aMetricUV;
     vec4 clipPos = projection * view * vec4(FragPos, 1.0);
     // Ground roads share nearly the same height. Terrain-conform interpolation can
     // leave tiny depth differences between overlapping ribbons, so draw order alone

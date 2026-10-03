@@ -633,6 +633,15 @@ Terrain::Terrain() {
   normalMap2    = loadWaterTex("assets/terrain/water/normal2.png", proceduralNorm2);
   foamTex       = loadWaterTex("assets/terrain/water/foam.png",    proceduralFoam);
 
+  // Tarred gravel for the road surface. sRGB, because it is colour not data, so the
+  // GPU linearises it before the lighting maths. Missing file leaves this at 0 and
+  // street.frag falls back to its procedural asphalt.
+  roadSurfaceTex = TextureEngine::Instance().loadTexture(
+      "assets/terrain/tarred_gravel_2k/textures/tarred_gravel_diff_2k.jpg", true);
+  std::cout << "[Terrain] Road surface texture: "
+            << (roadSurfaceTex ? "tarred gravel" : "MISSING - procedural fallback")
+            << std::endl;
+
   // Initialize dynamic waterMapTex (256x256 single-channel floating-point texture)
   glGenTextures(1, &waterMapTex);
   glBindTexture(GL_TEXTURE_2D, waterMapTex);
@@ -1213,6 +1222,41 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         streetShader->setMat4("model", glm::mat4(1.0f));
         streetShader->setVec3("lightDir", light);
         streetShader->setVec3("viewPos", cam);
+        // Tarred gravel surface. Unit 14 is clear of every terrain/water binding
+        // (terrain layers 0-7, water 13, scene FBOs 10-12).
+        glActiveTexture(GL_TEXTURE14);
+        glBindTexture(GL_TEXTURE_2D, roadSurfaceTex);
+        streetShader->setInt("roadSurfaceTex", 14);
+        // FALLAGA_ROAD_NOTEX forces the procedural asphalt, so the textured and
+        // untextured surfaces can be compared at the same camera without a rebuild.
+        static const bool noRoadTex = std::getenv("FALLAGA_ROAD_NOTEX") != nullptr;
+        streetShader->setInt("roadSurfaceValid",
+                             (roadSurfaceTex != 0 && !noRoadTex) ? 1 : 0);
+        // Metres per texture repeat. The source is a 2 km gravel scan, so ~6 m keeps
+        // the aggregate reading at roughly its real size on screen.
+        streetShader->setFloat("roadSurfaceScale", 6.0f);
+        // The scan is authored dark and the albedo is multiplied by ambient+NdotL
+        // below, so it needs a gain to reach the brightness the procedural asphalt
+        // had. Both are overridable from the environment so the look can be dialled
+        // in without a rebuild:
+        //   FALLAGA_ROAD_GAIN=3.0  FALLAGA_ROAD_TINT=1.05,0.98,0.88
+        static const float roadGain = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_GAIN")) {
+            const float v = std::strtof(e, nullptr);
+            if (v > 0.0f) return v;
+          }
+          return 3.2f;
+        }();
+        static const glm::vec3 roadTint = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_TINT")) {
+            float r = 0, g = 0, b = 0;
+            if (std::sscanf(e, "%f,%f,%f", &r, &g, &b) == 3)
+              return glm::vec3(r, g, b);
+          }
+          return glm::vec3(1.06f, 1.00f, 0.90f);
+        }();
+        streetShader->setFloat("roadSurfaceGain", roadGain);
+        streetShader->setVec3("roadSurfaceTint", roadTint);
         const bool dbg = roadDebugView();
         if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
         if (roadEdgeOnlyView()) streetShader->setInt("u_debugEdges", 1);

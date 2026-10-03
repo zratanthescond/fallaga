@@ -3110,10 +3110,16 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
 
         ringPositions[j] = pos;
+        // Metric texture coordinates: metres across and along the road, so the
+        // surface texture tiles at a constant size regardless of road width. The
+        // across coordinate follows the actual half-width in use at this sample,
+        // which varies around bends.
+        const float acrossMetres = off * useHw + std::max(0.0f, seg.width) * 0.5f;
+        const float alongMetres = along - seg.cumulativeDist.front();
         m_vertices.push_back(
             {pos, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec2(uc, v), rtype,
              std::max(0.0f, seg.width) * 0.1f + std::max(0.0f, 5.0f - rtype),
-             mark});
+             mark, glm::vec2(acrossMetres, alongMetres)});
       }
 
       for (int j = 0; j < kCrossCount; ++j) {
@@ -4028,6 +4034,12 @@ void RoadMeshBuilder::upload() {
   glEnableVertexAttribArray(4);
   glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(RoadVertex),
                         (void *)offsetof(RoadVertex, markMask));
+
+  // Layout 6: vec2 metricUV (metres across and along the road) for the surface
+  // texture. Location 5 stays the overlap priority for the depth bias in street.vert.
+  glEnableVertexAttribArray(6);
+  glVertexAttribPointer(6, 2, GL_FLOAT, GL_FALSE, sizeof(RoadVertex),
+                        (void *)offsetof(RoadVertex, metricUV));
 
   glBindVertexArray(0);
 

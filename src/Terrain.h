@@ -198,6 +198,10 @@ private:
     unsigned int normalMap2 = 0;
     unsigned int foamTex    = 0;
     unsigned int mapTexture      = 0;  // 1899 Sousse map projected onto terrain
+    // Tarred gravel surface for the road ribbon, bound for the road pass only. The
+    // street shader samples it with the metric UV so the aggregate keeps a constant
+    // physical size. 0 falls back to the procedural asphalt in street.frag.
+    unsigned int roadSurfaceTex  = 0;
 
 
     // Wall geometry

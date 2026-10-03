@@ -6,9 +6,22 @@ in vec3 Normal;
 in vec2 TexCoords;
 in float RoadType;
 in float MarkMask;   // 1 = paint markings, 0 = bare asphalt (junction pad / merged road)
+in vec2 MetricUV;    // metres across and along the road, for the surface texture
 
 uniform vec3 lightDir;
 uniform vec3 viewPos;
+
+// Tarred gravel surface. Sampled with MetricUV so the aggregate keeps a constant
+// physical size instead of stretching with the road width the way TexCoords would.
+uniform sampler2D roadSurfaceTex;
+uniform int  roadSurfaceValid;  // 0 = texture unavailable, fall back to procedural
+uniform float roadSurfaceScale; // metres per texture repeat
+// The tarred gravel scan is authored dark (mean sRGB ~0.23, i.e. ~0.047 linear), and
+// the albedo is multiplied by `ambient + NdotL*0.58` below, so used raw it renders
+// almost black. Gain brings it back to the brightness the procedural asphalt had
+// (linear ~0.15); the tint keeps it from reading as flat grey.
+uniform float roadSurfaceGain;
+uniform vec3  roadSurfaceTint;
 
 uniform int u_debugUV;   // FALLAGA_DEBUGVIEW: 1 = checker grid on the UVs
 uniform int u_debugEdges; // FALLAGA_EDGEONLY: 1 = road edges only, no surface
@@ -126,8 +139,12 @@ void main() {
     float gloss = 0.0;
 
     if (paved) {
-        // ---------------- ASPHALT (GTA dark blue-grey tarmac) -------------
-        vec3 cTar    = vec3(0.147, 0.156, 0.172);   // core asphalt
+        // ---------------- PAVED: tarred gravel surface texture -------------
+        // The saved surface is tar over gravel, so the texture carries the colour and
+        // the aggregate. The procedural layers above are kept for wear, rutting,
+        // patches and dust, so the road still reads as used rather than tiled. The
+        // old flat asphalt colours survive only as the fallback for a missing texture.
+        vec3 cTar    = vec3(0.147, 0.156, 0.172);   // fallback core asphalt
         vec3 cWorn   = vec3(0.190, 0.184, 0.174);   // polished wheel paths
         vec3 cPatch  = vec3(0.100, 0.108, 0.122);   // tar repair patches
         vec3 cGrit   = vec3(0.212, 0.205, 0.195);   // exposed chippings
@@ -138,11 +155,25 @@ void main() {
         float patch = smoothstep(0.68, 0.92, nMacro);
         float grit  = nFine * 0.6 + nRust * 0.4;
 
-        albedo = mix(cTar, cWorn, rut * 0.55);
-        albedo = mix(albedo, cPatch, patch * 0.45);
-        albedo = mix(albedo, cGrit, (grit - 0.5) * 0.05);
-        albedo = mix(albedo, cGrime, dust * 0.35);
-        gloss = 0.25;
+        if (roadSurfaceValid != 0) {
+            // Isotropic tiling: MetricUV is metres on both axes, so one repeat spans
+            // roadSurfaceScale metres in every direction.
+            vec3 tex = texture(roadSurfaceTex, MetricUV / roadSurfaceScale).rgb;
+            albedo = tex * roadSurfaceGain * roadSurfaceTint;
+            // Wheel-path polish, tar patches and blown dust on top of the texture.
+            albedo = mix(albedo, albedo * 1.18, rut * 0.55);
+            albedo = mix(albedo, albedo * 0.72, patch * 0.45);
+            albedo = mix(albedo, albedo * mix(1.25, 0.85, grit), dust * 0.30);
+            albedo = mix(albedo, cGrime, dust * 0.12);
+            gloss = 0.12;
+        } else {
+            // ---------------- ASPHALT fallback (no texture bound) -----------
+            albedo = mix(cTar, cWorn, rut * 0.55);
+            albedo = mix(albedo, cPatch, patch * 0.45);
+            albedo = mix(albedo, cGrit, (grit - 0.5) * 0.05);
+            albedo = mix(albedo, cGrime, dust * 0.35);
+            gloss = 0.25;
+        }
 
         // solid white edge lines (inside ribs at u ~0.067..0.103)
         float edgeLineAA = 0.007;

@@ -332,6 +332,12 @@ struct RoadVertex {
     // markings fade out over one ring instead of snapping, and never smear sideways
     // the way collapsing the whole cross-section to a single u did.
     float markMask;
+    // Metres across and along the road, for the surface texture. `uv` above is
+    // normalised across the width (so the marking bands sit at fixed u) and its v
+    // is rescaled per segment for the dash cycle, so neither axis is a usable
+    // texture coordinate: sampling a texture with them stretches it with the road
+    // width. u = [0, width], v = metres from the start of the segment.
+    glm::vec2 metricUV;
 };
 
 struct RoadJoinShaderStroke {
