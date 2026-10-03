@@ -3213,85 +3213,16 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       }
     }
 
-    // ── 3b. Graded shoulder ────────────────────────────────────────────────
-    // A narrow strip of ground either side of the asphalt, descending from the rim
-    // to the natural surface. It is rendered as road geometry rather than left to
-    // the terrain mesh, so the visible edge of the carriageway is a controlled slope
-    // instead of a terrain triangle landing on the road, and the bed drop the
-    // deformer leaves under the rim (~4-6 cm) reads as a graded verge instead of a
-    // step. It only ever sits at or above the natural surface, so it cannot poke
-    // through, and the terrain stays free to rise over it.
-    //
-    // Vertices attach to the rim pillars already emitted, so the join is exact and
-    // no index or vertex layout the junction passes rely on is disturbed.
-    {
-      constexpr float kShoulderWidth = 3.5f;
-      constexpr float kShoulderDrop = 0.25f;
-      const uint32_t shoulderBase = (uint32_t)m_vertices.size();
-      int shoulderQuads = 0;
-
-      auto emitShoulderStrip = [&](int side, int lastRingIndex) {
-        const int jRim = (side < 0) ? 0 : (kCrossCount - 1);
-        const int jInner = (side < 0) ? 1 : (kCrossCount - 2);
-        const std::vector<glm::vec3> &rings = seg.splinePoints;
-        for (int i = 0; i <= lastRingIndex; ++i) {
-          const uint32_t rimIdx = baseIdx + (uint32_t)i * kCrossCount + (uint32_t)jRim;
-          const uint32_t innerIdx = baseIdx + (uint32_t)i * kCrossCount + (uint32_t)jInner;
-          if (rimIdx >= m_vertices.size() || innerIdx >= m_vertices.size())
-            continue;
-          // Outward direction, from the inner pillar through the rim, flattened to
-          // XZ so the shoulder does not tilt with the road's crown.
-          const glm::vec3 &pRim = m_vertices[rimIdx].position;
-          const glm::vec3 &pIn = m_vertices[innerIdx].position;
-          glm::vec2 out(pRim.x - pIn.x, pRim.z - pIn.z);
-          const float outLen = glm::length(out);
-          if (outLen < 1e-5f)
-            continue;
-          out /= outLen;
-
-          glm::vec2 outerXZ(pRim.x + out.x * kShoulderWidth,
-                            pRim.z + out.y * kShoulderWidth);
-          float ground = sampler.isValid() ? sampler.sample(outerXZ.x, outerXZ.y)
-                                           : pRim.y;
-          if (deformer && deformer->isBuilt())
-            ground += deformer->getDeformation(outerXZ.x, outerXZ.y);
-          const float outerY =
-              std::max(ground, pRim.y - kShoulderDrop);
-
-          RoadVertex sv = m_vertices[rimIdx];
-          sv.position = glm::vec3(outerXZ.x, outerY, outerXZ.y);
-          sv.uv = glm::vec2(side < 0 ? -0.12f : 1.12f, m_vertices[rimIdx].uv.y);
-          sv.markMask = 0.0f; // verge: no lane paint
-          sv.normal = glm::vec3(0.0f, 1.0f, 0.0f);
-          m_vertices.push_back(sv);
-        }
-      };
-
-      emitShoulderStrip(-1, n - 1);
-      emitShoulderStrip(+1, n - 1);
-
-      // Quads: (left rim, left outer, right outer, right rim) per ring pair.
-      const uint32_t leftOuter = shoulderBase;
-      const uint32_t rightOuter = shoulderBase + (uint32_t)n;
-      for (int i = 0; i + 1 < n; ++i) {
-        const uint32_t r0 = baseIdx + (uint32_t)i * kCrossCount;
-        const uint32_t r1 = baseIdx + (uint32_t)(i + 1) * kCrossCount;
-        const uint32_t l0 = leftOuter + (uint32_t)i, l1 = leftOuter + (uint32_t)i + 1;
-        const uint32_t c0 = rightOuter + (uint32_t)i, c1 = rightOuter + (uint32_t)i + 1;
-        const uint32_t jL = r0 + 0, jL1 = r1 + 0;
-        const uint32_t jR = r0 + (uint32_t)(kCrossCount - 1);
-        const uint32_t jR1 = r1 + (uint32_t)(kCrossCount - 1);
-        // Left verge
-        m_indices.push_back(jL);  m_indices.push_back(jL1); m_indices.push_back(l0);
-        m_indices.push_back(l0);  m_indices.push_back(jL1); m_indices.push_back(l1);
-        // Right verge
-        m_indices.push_back(jR);  m_indices.push_back(c0);  m_indices.push_back(jR1);
-        m_indices.push_back(c0);  m_indices.push_back(c1);  m_indices.push_back(jR1);
-        shoulderQuads += 4;
-      }
-      if (shoulderQuads > 0)
-        m_shoulderQuads += shoulderQuads;
-    }
+    // ── 3b. Graded shoulder: REMOVED ───────────────────────────────────────
+    // A graded verge was implemented and measured, then reverted. It is a net
+    // negative on this terrain: extending a 3.5 m strip horizontally to the natural
+    // surface produces hard-edged fins and dark polygons wherever the ground drops
+    // steeply beside the asphalt (measured 8044-8164 verge quads, visible as spikes
+    // at junctions and along the coast road), and tapering the strip to nothing at
+    // segment ends did not remove them. The step it was meant to hide is smaller
+    // than the artefacts it introduces. If this is revisited, the verge has to
+    // follow a real cross-section profile (cut/fill at a fixed slope) rather than a
+    // horizontal run to the sampled ground.
 
     // â”€â”€â”€ 4. Rounded end caps for true dead ends
     // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
