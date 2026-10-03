@@ -14,9 +14,25 @@
 
 
 namespace {
-// Keep the asphalt crossfall and the physical terrain bed in lockstep. A small
-// residual slope follows broad terrain shape without copying bumps into roads.
-constexpr float kRoadEdgeConform = 0.02f;
+// Graded road bed: the strip either side of the asphalt held at the road profile.
+// Real roads are cut and filled flat before the surface goes on; if this strip is
+// narrower than a terrain triangle the triangle bridges over the road at natural
+// height and shows through the asphalt. At the shipped 22.25 m terrain cell the bed
+// therefore has to be at least a cell diagonal wide. Measured with the ribbon
+// tracking the bed (below): meanGap 0.196 -> 0.082 m, worst gap 9.75 -> 1.39 m,
+// 7185 -> 14 vertices more than 0.5 m off.
+constexpr float kRoadBedFlatReach = 34.0f;
+
+// How much of its own ground height the ribbon adopts across its width.
+//
+// 1.0 means the carriageway follows the graded bed exactly, which is what makes the
+// asphalt sit ON the prepared bed instead of crossing it. The old value, 0.02, left
+// the ribbon almost dead flat at the centreline height while the bed was graded to
+// the road profile over a bed of a different width -- the two surfaces disagreed
+// across the whole carriageway, which is the terrain-lying-on-the-road defect.
+// Twisting on cross-slopes is not a concern once the bed itself is graded flat: the
+// ground the ribbon follows is the bed, not the natural hillside.
+constexpr float kRoadEdgeConform = 1.0f;
 
 // Horizontal road frame helper. The spline tangents have already been smoothed;
 // derive every cross-section side from that tangent with the same fixed XZ
@@ -1396,7 +1412,16 @@ void RoadDeformer::build(const std::vector<RoadSegment> &segments,
     const float halfWidth = seg.width * 0.5f;
     const float shoulderWidth = std::max(seg.shoulderWidth, 0.0f);
     const float falloffWidth = roadTerrainFalloffWidth(seg);
-    const float maxReach = halfWidth + shoulderWidth + falloffWidth;
+    // The graded bed spans at least a terrain cell either side of the asphalt, so no
+    // terrain triangle can span the road from ungraded ground. Overridable for
+    // measurement. See kRoadBedFlatReach.
+    float roadFlatReach = kRoadBedFlatReach;
+    if (const char* env = std::getenv("FALLAGA_ROAD_FLAT")) {
+      const float requested = std::strtof(env, nullptr);
+      if (requested >= 0.0f) roadFlatReach = requested;
+    }
+    const float bedHalfWidth = std::max(shoulderWidth, roadFlatReach);
+    const float maxReach = halfWidth + bedHalfWidth + falloffWidth;
 
     // Compute world-space AABB of this segment's spline points + margin
     float segMinX = 1e9f, segMaxX = -1e9f;
@@ -1454,16 +1479,19 @@ void RoadDeformer::build(const std::vector<RoadSegment> &segments,
           m_surfaceMask[idx] = std::max(m_surfaceMask[idx], mask);
         }
 
-        // Hold the ribbon and authored shoulder at the road-bed profile,
-        // then return smoothly to untouched terrain over a road-type-sized
-        // falloff. This keeps dirt tracks narrow and gives major roads a
-        // wider, smoother grade tie-in.
+        // Hold the ribbon and authored shoulder at the road-bed profile, then return
+        // smoothly to untouched terrain over a road-type-sized falloff. This is the
+        // "grade the road bed first, then build the road on it" step: inside the flat
+        // zone the ground is set to the road profile LESS a clearance, so the asphalt
+        // has prepared earth under it rather than natural terrain crossing it. The
+        // ribbon adopts the same profile (kRoadEdgeConform = 1.0), so the two agree
+        // across the whole carriageway.
         float influence = 0.0f;
-        if (bed.edgeDistance <= shoulderWidth) {
+        if (bed.edgeDistance <= bedHalfWidth) {
           influence = 1.0f;
         } else if (falloffWidth > 1e-4f &&
-                   bed.edgeDistance <= shoulderWidth + falloffWidth) {
-          float t = (bed.edgeDistance - shoulderWidth) / falloffWidth;
+                   bed.edgeDistance <= bedHalfWidth + falloffWidth) {
+          float t = (bed.edgeDistance - bedHalfWidth) / falloffWidth;
           t = std::clamp(t, 0.0f, 1.0f);
           influence = 1.0f - (t * t * (3.0f - 2.0f * t)); // smoothstep
         }
@@ -1808,7 +1836,13 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   // the visible "melted edge" on every side slope); 0.0 leaves the road dead
   // flat and floating above cuts. 0.3 keeps the bed close to the ground while
   // cutting the twist ~3x.
-  const float EDGE_CONFORM = kRoadEdgeConform;
+  const float EDGE_CONFORM = [] {
+    if (const char* env = std::getenv("FALLAGA_ROAD_EDGE_CONFORM")) {
+      const float requested = std::strtof(env, nullptr);
+      if (requested >= 0.0f && requested <= 1.0f) return requested;
+    }
+    return kRoadEdgeConform;
+  }();
 
   // Minimum vertical clearance the ribbon keeps over the sampled ground. A terrain
   // cell is ~22 m across on the shipped DEM while roads are 8-40 m wide, and a rim
