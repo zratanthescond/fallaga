@@ -956,6 +956,88 @@ void TerrainManager::conformTerrainToRoadMesh(float wx, float wz, float radius, 
     }
 }
 
+// ── Added geometry ("Add Geometry" sculpt tool) ───────────────────────────────
+//
+// The visual grid is ~22 m per cell, so a smooth brush on it can only move whole
+// 22 m quads: there are no vertices between them, and a "smoother" result is not
+// possible by weighting alone. This lets the brush subdivide cells and then sculpt
+// the resulting fine vertices.
+//
+// Two rules keep it safe:
+//   * Subdivision is grid-aligned. A refined vertex sits at an exact fraction of a
+//     visual cell, so its global position is unambiguous and two chunks sharing a
+//     boundary compute the same height for it. There is nothing to stitch.
+//   * A fine vertex starts on the bilinear surface of the base grid, which is
+//     precisely the surface the uniform mesh already draws. So enabling subdivision
+//     cannot change the silhouette on its own -- only sculpting the fine vertices
+//     does, which is what makes the change safe to apply anywhere.
+
+int TerrainManager::addGeometry(float wx, float wz, float radius, int level) {
+    if (visualW <= 1 || visualH <= 1 || radius <= 0.0f) return 0;
+    if (refinement.empty())
+        refinement.init(visualW - 1, visualH - 1);
+
+    int minX = 0, maxX = -1, minZ = 0, maxZ = -1;
+    const int gained = refinement.add(wx, wz, radius, worldMinX, worldMaxX,
+                                      worldMinZ, worldMaxZ, visualHeights, visualW,
+                                      visualH, level, &minX, &maxX, &minZ, &maxZ);
+    if (gained > 0) {
+        ++heightRevision;
+        logHeightfieldSignature("addGeometry");
+        rebuildChunksInBox(minX, maxX, minZ, maxZ);
+    }
+    return gained;
+}
+
+void TerrainManager::rebuildChunksInBox(int minCellX, int maxCellX,
+                                        int minCellZ, int maxCellZ) {
+    if (chunks.empty()) return; // headless: the height maths is already done
+    if (maxCellX < minCellX || maxCellZ < minCellZ) return;
+    const std::function<int(int, int)> levelFn = refineLevelLookup();
+    const TerrainChunk::HeightFn heightFn = refinedHeightLookup();
+    for (TerrainChunk* chunk : chunks) {
+        const int cMinX = chunk->gridX * (chunk->size - 1);
+        const int cMaxX = cMinX + chunk->size - 1;
+        const int cMinZ = chunk->gridZ * (chunk->size - 1);
+        const int cMaxZ = cMinZ + chunk->size - 1;
+        if (maxCellX < cMinX || minCellX > cMaxX ||
+            maxCellZ < cMinZ || minCellZ > cMaxZ) continue;
+        chunk->generateMesh(visualHeights, visualW, visualH, worldMinX, worldMaxX,
+                            worldMinZ, worldMaxZ,
+                            hasRoadMask ? &roadMaskData : nullptr, roadW, roadH,
+                            &levelFn, heightFn);
+    }
+}
+
+void TerrainManager::smoothFine(float wx, float wz, float radius, float strength, float dt) {
+    if (visualW <= 1 || visualH <= 1 || radius <= 0.0f) return;
+    if (refinement.empty() || !refinement.any()) {
+        // No added geometry anywhere: fall back to the ordinary grid smooth so the
+        // brush still does something sensible.
+        sculpt(wx, wz, radius, strength, 3, dt, 0.0f, 0.0f);
+        return;
+    }
+
+    const int S = TerrainRefinement::kScale;
+    const float ux = std::clamp((wx - worldMinX) / (worldMaxX - worldMinX), 0.0f, 1.0f);
+    const float uz = std::clamp((wz - worldMinZ) / (worldMaxZ - worldMinZ), 0.0f, 1.0f);
+    const int fcx = (int)(ux * (float)(visualW - 1) * S);
+    const int fcz = (int)(uz * (float)(visualH - 1) * S);
+    const int frx = (int)((radius / (worldMaxX - worldMinX)) * (float)(visualW - 1) * S) + 1;
+    const int frz = (int)((radius / (worldMaxZ - worldMinZ)) * (float)(visualH - 1) * S) + 1;
+    const int fr = std::max(frx, frz);
+
+    refinement.smooth(wx, wz, radius, worldMinX, worldMaxX, worldMinZ, worldMaxZ,
+                      strength, dt);
+    // The smoothed fine surface becomes authoritative where it lands on grid
+    // samples, so height queries, physics and road conformance agree with the mesh.
+    refinement.mirrorIntoBase(visualHeights, visualW, visualH,
+                              fcx - fr, fcx + fr, fcz - fr, fcz + fr);
+    ++heightRevision;
+
+    rebuildChunksInBox(std::max(0, (fcx - fr) / S), (fcx + fr) / S,
+                       std::max(0, (fcz - fr) / S), (fcz + fr) / S);
+}
 void TerrainManager::sculpt(float wx, float wz, float radius, float speed, int mode, float dt,
                             float directionDegrees, float gradeDegrees) {
     // Mode: 1=Raise, 2=Lower, 3=Smooth, 4=Erode, 5=Angle Slope

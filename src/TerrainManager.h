@@ -4,6 +4,7 @@
 #include <GL/glew.h>
 #include <glm/glm.hpp>
 #include "TerrainChunk.h"
+#include "TerrainRefinement.h"
 #include "Shader.h"
 #include "RoadSystem.h"
 
@@ -65,6 +66,40 @@ public:
     // instead to see the surface the GPU actually draws.
     const std::vector<float>& getVisualHeightsData() const { return visualHeights; }
 
+    // ── Sculpt "Add Geometry" tool ─────────────────────────────────────────────
+    // Adds mesh resolution inside the brush footprint so smoothing has vertices to
+    // work with. `level` is the subdivision exponent for the visual-grid cells the
+    // brush touches (1 = each ~22 m cell becomes 4, 2 = 16). Raises the level and
+    // seeds the new fine vertices on the existing surface; never lowers a cell below
+    // the level it already has. Returns the number of cells that gained geometry.
+    int addGeometry(float wx, float wz, float radius, int level);
+    // Smooths using the fine grid, so a refined area actually gains a smoother
+    // surface rather than being limited by the base grid. Falls back to the normal
+    // grid smooth anywhere without added geometry.
+    void smoothFine(float wx, float wz, float radius, float strength, float dt);
+    // True once any cell has added geometry (for the editor readout).
+    bool hasAddedGeometry() const { return refinement.any(); }
+    // Refined-surface access, exposed so the behaviour can be tested without a GL
+    // context (the mesh rebuild itself needs one, this does not).
+    static constexpr int kRefineScale = TerrainRefinement::kScale; // fine samples per cell
+    float refinedHeightAt(int fgx, int fgz, float fallback) const {
+        return refinement.heightAt(fgx, fgz, fallback);
+    }
+    int getRefineLevel(int cellX, int cellZ) const { return refinement.levelAt(cellX, cellZ); }
+    int getRefinedDim() const { return refinement.dim(); }
+    // Refinement level lookup in the shape TerrainChunk wants.
+    std::function<int(int, int)> refineLevelLookup() const {
+        return [this](int gx, int gz) { return refinement.levelAt(gx, gz); };
+    }
+    TerrainChunk::HeightFn refinedHeightLookup() const {
+        return [this](int fgx, int fgz, float fallback) {
+            return refinement.heightAt(fgx, fgz, fallback);
+        };
+    }
+    // Rebuilds only the chunks overlapping a visual-grid box. Needs a GL context;
+    // the height maths above does not.
+    void rebuildChunksInBox(int minCellX, int maxCellX, int minCellZ, int maxCellZ);
+
 private:
     void loadHeightmap(const std::string& path);
     // Pending dirty rectangle of the heightmap texture, in native grid pixels.
@@ -82,6 +117,30 @@ private:
     std::vector<float> appliedRoadConformOffsets;
     std::vector<unsigned char> roadMaskData;
     bool hasRoadGeometryMask = false;
+
+    // Subdivision and its fine height field. Free of OpenGL so the logic is testable
+    // without a context; see TerrainRefinement.h for why subdivision alone cannot
+    // change the surface.
+    TerrainRefinement refinement;
+
+    // ── Added geometry (sculpt "Add Geometry" tool) ────────────────────────────
+    // Subdivision is grid-aligned rather than per-cell, so a refined vertex has an
+    // unambiguous global position and neighbouring chunks agree on it without any
+    // cross-chunk stitching. refineLevel is one byte per visual-grid CELL (0 = no
+    // added geometry). refinedHeights/Vertices hold the fine vertices inside
+    // subdivided cells, keyed densely by fine-grid position; they start on the
+    // bilinear surface, so turning subdivision on cannot change the silhouette --
+    // only sculpting the fine vertices does.
+    // nothing to stitch.
+    std::vector<unsigned char> refineLevel;  // (visualW-1) x (visualH-1)
+    std::vector<float> refinedHeights;       // (visualW-1)*4+1 square, kNaN = use base
+    std::vector<unsigned char> refinedPresent;
+    int refinedDim = 0;
+    float refinedSample(int fgx, int fgz, float fallback) const;
+    void setRefinedSample(int fgx, int fgz, float value);
+    bool anyRefinement() const;
+    int refineLevelAt(int cellX, int cellZ) const;
+
     int gridW=0, gridH=0;
     int visualW=0, visualH=0;
     int roadW=0, roadH=0;

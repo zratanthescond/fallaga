@@ -127,5 +127,14 @@ if(BUILD_TESTING)
     target_include_directories(road_bed_random_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GLEW_INCLUDE_DIRS})
     target_link_libraries(road_bed_random_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
     add_test(NAME road_bed_random_test COMMAND road_bed_random_test)
+
+    # Heights only, no GL context: covers the sculpt "Add Geometry" brush maths.
+    # stb_image's implementation is compiled into the test itself, so stb_impl.cpp
+    # is deliberately not linked here.
+    add_executable(sculpt_refine_test sculpt_refine_test.cpp)
+    target_include_directories(sculpt_refine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GLEW_INCLUDE_DIRS})
+    target_link_libraries(sculpt_refine_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
+    add_test(NAME sculpt_refine_test COMMAND sculpt_refine_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 

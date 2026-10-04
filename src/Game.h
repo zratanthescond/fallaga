@@ -26,7 +26,10 @@ public:
     int activeTextureLayer = 0; // 0 = Layer 1, 1 = Layer 2
     float previewScale = 1.0f;
     float previewAngle = 0.0f;
-    int editorBrushMode = 0; // 0=Select; 1-5 sculpt; 6=Paint Road; 7=Paint River; 8=Paint Erase
+    int editorBrushMode = 0; // 0=Select; 1-5 sculpt; 6=Fit to road; 7=Add geometry; 8-10 paint
+    // Subdivision exponent used by the Add Geometry brush: 1 makes each 22 m cell
+    // four, 2 makes it sixteen. Exposed so it can be dialled with the brush.
+    int addGeomLevel = 1;
     float brushRadius = 30.0f;
     float brushStrength = 5.0f;
     float sculptAngleDegrees = 20.0f;

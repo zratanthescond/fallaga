@@ -321,7 +321,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         for (int i = 0; i < 3; ++i) {
                             float btnY = lpY + 45 + i * 25;
                             if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 20) {
-                                editorBrushMode = 7 + i; // 7 = Paint Road, 8 = Paint River, 9 = Erase
+                                editorBrushMode = 8 + i; // 8 = Paint Road, 9 = Paint River, 10 = Erase
                                 std::cout << "[Editor UI] Paint tool: " << editorBrushMode << "\n";
                             }
                         }
@@ -1152,9 +1152,26 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             terrain->snapRoadsToRenderedTerrain();
                         }
                     }
-                    else if (activeEditorMode == 3 && editorBrushMode >= 7 && editorBrushMode <= 9) { // Paint modes
+                    else if (activeEditorMode == 2 && editorBrushMode == 7) { // Add geometry, then smooth it
                         if (leftMouseDown && terrain->terrainManager) {
-                            int paintIdx = (editorBrushMode == 7) ? 1 : ((editorBrushMode == 8) ? 2 : 0);
+                            // Adds resolution inside the footprint, then smooths the new
+                            // vertices on the same stroke. Seeded vertices sit exactly on
+                            // the existing surface, so nothing moves until the smooth has
+                            // fine neighbours to average -- which is the point: the brush
+                            // makes a place smoothable instead of only moving the coarse
+                            // grid, where whole 22 m quads shift and nothing gets smoother.
+                            terrain->terrainManager->addGeometry(
+                                lastRayHitPos.x, lastRayHitPos.z, brushRadius, addGeomLevel);
+                            terrain->terrainManager->smoothFine(
+                                lastRayHitPos.x, lastRayHitPos.z, brushRadius,
+                                brushStrength, static_cast<float>(deltaTime));
+                            waterSim.updateTerrainArea(terrain->terrainManager, lastRayHitPos.x, lastRayHitPos.z, brushRadius);
+                            terrain->updateWaterMapTexture(waterSim.getTextureData());
+                        }
+                    }
+                    else if (activeEditorMode == 3 && editorBrushMode >= 8 && editorBrushMode <= 10) { // Paint modes
+                        if (leftMouseDown && terrain->terrainManager) {
+                            int paintIdx = (editorBrushMode == 8) ? 1 : ((editorBrushMode == 9) ? 2 : 0);
                             terrain->terrainManager->paint(lastRayHitPos.x, lastRayHitPos.z, brushRadius, brushStrength, paintIdx, static_cast<float>(deltaTime));
                         }
                     }
@@ -2240,8 +2257,8 @@ void Game::render() {
             drawStr(lpX + 15, lpY + 19, "TERRAIN SCULPTING", 0.9f, 0.5f, 0.1f);
             
             drawStr(lpX + 15, lpY + 40, "ACTIVE SCULPT TOOL", 0.9f, 0.5f, 0.1f);
-            std::string toolNames[] = { "Raise Terrain (LMB)", "Lower Terrain (LMB)", "Smooth Terrain (LMB)", "Erode Terrain (LMB)", "Angle Slope (LMB)", "Fit To Curved Road Mesh (LMB)" };
-            for (int i = 0; i < 6; ++i) {
+            std::string toolNames[] = { "Raise Terrain (LMB)", "Lower Terrain (LMB)", "Smooth Terrain (LMB)", "Erode Terrain (LMB)", "Angle Slope (LMB)", "Fit To Curved Road Mesh (LMB)", "Add Geometry + Smooth (LMB)" };
+            for (int i = 0; i < 7; ++i) {
                 float btnY = lpY + 45 + i * 22;
                 bool isCurrent = (editorBrushMode == 1 + i);
                 if (isCurrent) {
@@ -2282,8 +2299,25 @@ void Game::render() {
             drawRectOutline(lpX + 15, sliderStartY + 131, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
             drawRect(lpX + 15 + gNorm * (lpW - 40), sliderStartY + 128, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
 
+            // Subdivision detail for the Add Geometry brush. Level 1 makes each 22 m
+            // cell four, level 2 makes it sixteen.
+            drawStr(lpX + 15, sliderStartY + 145, "Detail: " + std::to_string(addGeomLevel) +
+                    "x" + std::to_string(1 << addGeomLevel) + " per cell"
+                    + (terrain->terrainManager && terrain->terrainManager->hasAddedGeometry()
+                           ? " (added geometry present)" : ""),
+                    0.8f, 0.8f, 0.8f);
+            for (int lv = 1; lv <= 2; ++lv) {
+                const bool on = (addGeomLevel == lv);
+                drawRect(lpX + 15 + (lv - 1) * 45, sliderStartY + 149, 40, 14,
+                         on ? 0.89f : 0.16f, on ? 0.36f : 0.16f, on ? 0.13f : 0.16f,
+                         on ? 0.9f : 0.6f);
+                drawStr(lpX + 26 + (lv - 1) * 45, sliderStartY + 160,
+                        "L" + std::to_string(lv), 0.75f, 0.75f, 0.75f);
+            }
+            drawRectOutline(lpX + 15, sliderStartY + 149, 85, 14, 0.25f, 0.25f, 0.25f);
+
             // Global Actions Section
-            float globalStartY = sliderStartY + 150;
+            float globalStartY = sliderStartY + 170;
             drawStr(lpX + 15, globalStartY + 10, "GLOBAL ACTIONS", 0.9f, 0.5f, 0.1f);
             
             // Button - highlight on hover could be cool, but standard UE orange button is great!
@@ -2298,7 +2332,7 @@ void Game::render() {
             std::string toolNames[] = { "Paint Road (Gravel)", "Paint River (Wet Mud)", "Erase Road/River" };
             for (int i = 0; i < 3; ++i) {
                 float btnY = lpY + 45 + i * 25;
-                bool isCurrent = (editorBrushMode == 7 + i);
+                bool isCurrent = (editorBrushMode == 8 + i);
                 if (isCurrent) {
                     drawRect(lpX + 8, btnY - 2, lpW - 16, 20, 0.89f, 0.36f, 0.13f, 0.9f);
                     drawStr(lpX + 18, btnY + 12, toolNames[i], 1.0f, 1.0f, 1.0f);
@@ -3498,10 +3532,10 @@ void Game::keyDown(int key) {
         }
 
         if (key == GLFW_KEY_B) {
-            editorBrushMode = (editorBrushMode + 1) % 10;
+            editorBrushMode = (editorBrushMode + 1) % 11;
             std::string modeNames[] = {
                 "Select / Move", "Sculpt Raise", "Sculpt Lower", "Sculpt Smooth", "Sculpt Erode (Hydraulic)", "Sculpt Angle Slope",
-                "Fit Terrain Under Roads", "Paint Road (Gravel)", "Paint River (Wet Mud)", "Paint Erase"
+                "Fit Terrain Under Roads", "Add Geometry + Smooth", "Paint Road (Gravel)", "Paint River (Wet Mud)", "Paint Erase"
             };
             std::cout << "[Brush] Mode changed to: " << modeNames[editorBrushMode] << "\n";
             return;
