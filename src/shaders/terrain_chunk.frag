@@ -18,6 +18,11 @@ uniform bool hasRoadMask;
 uniform bool hasSplineRoadMask;
 uniform float waterLevel;
 uniform int activePaintLayerIdx;
+// Distance beyond which one of the three base ground layers is dropped. It is a
+// 0.90-1.15-scale variant of the lush grass, so the difference only reads at close
+// range; dropping it saves 2 of the 6 base fetches over most of the screen.
+// Overridable at runtime so the cost/quality point can be measured, not guessed.
+uniform float u_farLodDistance;
 
 // --- UTILITIES ---
 // Non-periodic Dave Hoskins hash (clean, no repeating lattice)
@@ -36,12 +41,19 @@ float noise(vec2 p) {
                mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), f.x), f.y);
 }
 
-// Sample a terrain layer with triplanar mapping (for steep cliff walls)
+// Sample a terrain layer with triplanar mapping (for steep cliff walls).
+//
+// Only the axes that actually contribute are sampled. On flat ground the blend
+// weights collapse to the Y term, so the X and Z fetches are pure waste -- and the
+// cliff and harbour branches call this four times per fragment (colour and normal for
+// two layers), which is 12 array fetches even where a single projection would do.
+// The 0.05 test is well below the smallest weight that changes a visible result.
 vec3 sampleTriplanar(sampler2DArray tex, vec3 worldPos, float layer, vec3 blendW, float scale) {
-    vec3 cX = texture(tex, vec3(worldPos.yz * scale, layer)).rgb;
     vec3 cY = texture(tex, vec3(worldPos.xz * scale, layer)).rgb;
-    vec3 cZ = texture(tex, vec3(worldPos.xy * scale, layer)).rgb;
-    return cX * blendW.x + cY * blendW.y + cZ * blendW.z;
+    vec3 acc = cY * blendW.y;
+    if (blendW.x > 0.05) acc += texture(tex, vec3(worldPos.yz * scale, layer)).rgb * blendW.x;
+    if (blendW.z > 0.05) acc += texture(tex, vec3(worldPos.xy * scale, layer)).rgb * blendW.z;
+    return acc;
 }
 
 void main()
@@ -79,9 +91,15 @@ void main()
     vec3 colClumpyGrass = texture(terrainTex, vec3(baseUV, 1.0)).rgb;
     vec3 nrmClumpyGrass = texture(terrainNormal, vec3(baseUV, 1.0)).rgb * 2.0 - 1.0;
 
-    // Layer 2: Lush Prairie Grass (hea_grass_lush_je_02)
-    vec3 colLushGrass   = texture(terrainTex, vec3(baseUV * 1.15, 2.0)).rgb;
-    vec3 nrmLushGrass   = texture(terrainNormal, vec3(baseUV * 1.15, 2.0)).rgb * 2.0 - 1.0;
+    // Layer 2: Lush Prairie Grass (hea_grass_lush_je_02). Cheap distance LOD: beyond
+    // u_farLodDistance this layer is a near-duplicate of layer 1 at a slightly
+    // different scale, so it is not sampled at all and its weight folds into layer 1.
+    bool nearEnoughForSecondLayer = dist < u_farLodDistance;
+    vec3 colLushGrass = vec3(0.0), nrmLushGrass = vec3(0.0, 0.0, 1.0);
+    if (nearEnoughForSecondLayer) {
+        colLushGrass = texture(terrainTex, vec3(baseUV * 1.15, 2.0)).rgb;
+        nrmLushGrass = texture(terrainNormal, vec3(baseUV * 1.15, 2.0)).rgb * 2.0 - 1.0;
+    }
 
     // Layer 3: Warm Loam Soil (hen_mud_soil_01)
     vec3 colLoamSoil    = texture(terrainTex, vec3(baseUV * 0.90, 3.0)).rgb;
@@ -96,6 +114,13 @@ void main()
     // Rolling hills are dominated by vibrant olive-green grass (Layer 2) with clumpy tufts (Layer 1)
     // and exposed warm loam soil (Layer 3) in depressions and drier knolls
     float lushWeight = smoothstep(0.30, 0.70, biomeNoise);
+    if (!nearEnoughForSecondLayer) {
+        // Fold the dropped layer's weight into layer 1 instead of mixing toward the
+        // black that an unsampled fetch leaves behind -- otherwise distant terrain
+        // would darken rather than just lose a near-duplicate detail layer.
+        colLushGrass = colClumpyGrass;
+        nrmLushGrass = nrmClumpyGrass;
+    }
     vec3 colGrass = mix(colLushGrass, colClumpyGrass, (1.0 - lushWeight) * 0.40);
     vec3 nrmGrass = mix(nrmLushGrass, nrmClumpyGrass, (1.0 - lushWeight) * 0.40);
 

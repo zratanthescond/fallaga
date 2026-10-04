@@ -377,6 +377,17 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
     terrainShader->setFloat("sunTilt", lightDir.y);
     terrainShader->setFloat("waterLevel", waterLevel);
     terrainShader->setFloat("time", (float)glfwGetTime());
+    // Distance beyond which the second base ground layer is dropped in the shader.
+    // Overridable so the cost/quality point is measured rather than guessed:
+    // FALLAGA_LOD_DIST=600 (0 disables the LOD and always samples every layer).
+    static const float farLodDistance = [] {
+        if (const char* e = std::getenv("FALLAGA_LOD_DIST")) {
+            const float v = std::strtof(e, nullptr);
+            if (v >= 0.0f) return v;
+        }
+        return 600.0f;
+    }();
+    terrainShader->setFloat("u_farLodDistance", farLodDistance);
     terrainShader->setVec4("clipPlane", clipPlane);
     
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D_ARRAY, terrainLayerArray); terrainShader->setInt("terrainTex", 0);
