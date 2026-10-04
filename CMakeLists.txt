@@ -136,5 +136,11 @@ if(BUILD_TESTING)
     target_link_libraries(sculpt_refine_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
     add_test(NAME sculpt_refine_test COMMAND sculpt_refine_test
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Tile-based road builder, phase 1: the grid data layer. No GL, no engine.
+    add_executable(roadgrid_test roadgrid_test.cpp src/RoadGrid.cpp)
+    target_include_directories(roadgrid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME roadgrid_test COMMAND roadgrid_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
