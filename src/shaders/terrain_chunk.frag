@@ -23,6 +23,10 @@ uniform int activePaintLayerIdx;
 // range; dropping it saves 2 of the 6 base fetches over most of the screen.
 // Overridable at runtime so the cost/quality point can be measured, not guessed.
 uniform float u_farLodDistance;
+// Brightness applied to the roadbed texture on the terrain, so the graded roadbed
+// matches the road ribbon drawn over it instead of forming a dark outline round it.
+// The gravel scan is authored dark (mean sRGB ~0.25), so this multiplies UP.
+uniform float u_roadArmGain;
 
 // --- UTILITIES ---
 // Non-periodic Dave Hoskins hash (clean, no repeating lattice)
@@ -322,28 +326,35 @@ void main()
                 float roadSpec;
 
                 if (isUrban) {
-                    // ── TYPE A: URBAN COLONIAL MACADAM / TARRED GRAVEL ──
+                    // ── TYPE A: URBAN TARRED MACADAM ──
+                    // Same gravel scan the road ribbon uses (layer 10), at a comparable
+                    // brightness. This used to be deliberately darkened --
+                    // colTar * (0.72,0.70,0.68) for the bed and * 0.78 for the shoulder --
+                    // which made terrain roadbed visibly BLACKER than the ribbon drawn
+                    // over it, so an urban street showed the ribbon as a lighter strip
+                    // inside a dark outline. The gravel scan is already dark (mean sRGB
+                    // ~0.25), so it needs a gain here, not a cut.
                     vec2 roadTexUV = WorldPos.xz * 0.18;
                     vec3 colTar = texture(terrainTex, vec3(roadTexUV, 10.0)).rgb;
                     vec3 nrmTar = texture(terrainNormal, vec3(roadTexUV, 10.0)).rgb * 2.0 - 1.0;
-
-                    // Authentic dark tarred macadam (aged bitumen binder with exposed crushed stone)
-                    vec3 colBitumen = colTar * vec3(0.72, 0.70, 0.68);
-
-                    // Polished, compacted wheel tracks (deeper charcoal sheen)
-                    vec3 colRut = colBitumen * vec3(0.78, 0.77, 0.75);
-                    vec3 nrmRut = nrmTar * vec3(0.70, 0.70, 1.0);
 
                     // Fine Mediterranean dust on crown
                     vec3 colDust = texture(terrainTex, vec3(WorldPos.xz * 0.15, 6.0)).rgb;
                     colDust = mix(colDust, vec3(0.65, 0.58, 0.48), 0.40);
 
-                    // Urban curbs/shoulders: authentic crushed cobblestone aggregate (Layer 12)
-                    vec3 colCobbleShoulder = texture(terrainTex, vec3(WorldPos.xz * 0.22, 12.0)).rgb * vec3(0.78, 0.76, 0.73);
+                    // Urban curbs/shoulders: crushed cobblestone aggregate (Layer 12)
+                    vec3 colCobbleShoulder = texture(terrainTex, vec3(WorldPos.xz * 0.22, 12.0)).rgb;
+
+                    vec3 colBitumen = colTar * u_roadArmGain;
+                    // Polished, compacted wheel tracks: kept as a modest darkening from
+                    // the bed, not a second hard cut to near-black.
+                    vec3 colRut = colBitumen * vec3(0.86, 0.85, 0.83);
+                    vec3 nrmRut = nrmTar * vec3(0.70, 0.70, 1.0);
 
                     vec3 colUrbanRoad = mix(colBitumen, colRut, rutFactor * 0.65);
                     colUrbanRoad = mix(colUrbanRoad, colDust * 0.85, centerFactor * 0.25);
-                    colUrbanRoad = mix(colUrbanRoad, colCobbleShoulder, shoulderFactor * 0.45);
+                    colUrbanRoad = mix(colUrbanRoad, colCobbleShoulder * u_roadArmGain,
+                                       shoulderFactor * 0.45);
 
                     finalRoadCol = colUrbanRoad;
                     finalRoadNorm = mix(nrmTar, nrmRut, rutFactor * 0.60);

@@ -392,6 +392,19 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
         return 0.0f;
     }();
     terrainShader->setFloat("u_farLodDistance", farLodDistance);
+    // Roadbed brightness on the terrain. The gravel scan is authored dark (mean sRGB
+    // ~0.25), and the road ribbon multiplies it by its own gain before lighting, so
+    // the terrain arm needs a comparable boost or the ribbon reads as a lighter strip
+    // inside a black outline. Overridable so the match can be dialled without a build:
+    // FALLAGA_ROAD_ARM_GAIN=1.9
+    static const float roadArmGain = [] {
+        if (const char* e = std::getenv("FALLAGA_ROAD_ARM_GAIN")) {
+            const float v = std::strtof(e, nullptr);
+            if (v > 0.0f) return v;
+        }
+        return 1.9f;
+    }();
+    terrainShader->setFloat("u_roadArmGain", roadArmGain);
     terrainShader->setVec4("clipPlane", clipPlane);
     
     glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D_ARRAY, terrainLayerArray); terrainShader->setInt("terrainTex", 0);
