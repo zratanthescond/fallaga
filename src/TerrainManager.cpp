@@ -29,15 +29,14 @@ TerrainManager::TerrainManager(const std::string& hmPath, const std::string& pmP
     std::cout << "[TerrainManager] Loading Heightmap: " << hmPath << std::endl;
     loadHeightmap(hmPath); 
 
-    // Tile-road seed for development. The tile system is not yet driven by an editor
-    // tool or by the saved roads, so this lays down a known set of shapes near the city
-    // -- straights, a corner, a T, a cross and a plaza -- so the tiling, curbs and
-    // junction openings can be looked at. Both types are included.
-    // FALLAGA_TILE_SEED=0 disables it.
+    // Tile-road seed for development. OFF BY DEFAULT: the tile system has no road
+    // materials yet, so seeding it puts flat dark splotches into the world. It exists
+    // only so the grid and geometry can be inspected while phase 4 is built.
+    // FALLAGA_TILE_SEED=1 enables it.
     {
         static const bool seedEnabled = [] {
             const char* e = std::getenv("FALLAGA_TILE_SEED");
-            return e == nullptr || std::atoi(e) != 0;
+            return e != nullptr && std::atoi(e) != 0;
         }();
         if (seedEnabled) {
             // Tile coordinates near the old town (world ~4275,-835).

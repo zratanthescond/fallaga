@@ -1278,13 +1278,15 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     }
     if (!isReflectionPass) {
       // ── Tile road builder (Caesar IV style) ────────────────────────────────
-      // Drawn before the spline ribbons. It shares the street shader because the tile
-      // mesh uses RoadMeshBuilder's exact vertex layout. The tile system is being
-      // brought up alongside the splines, so both draw for now and can be compared;
-      // FALLAGA_TILE_ROADS=0 hides the tile layer without a rebuild.
+      // OFF BY DEFAULT, deliberately. The tile system has correct grid and geometry
+      // layers but no materials yet: drawn on its own it is flat dark splotches with no
+      // cobble, no curb you can see and jagged tile edges, which is worse than the
+      // spline roads it would sit next to. It stays behind an explicit opt-in until
+      // phase 4 gives it road materials and a look that stands on its own.
+      //   FALLAGA_TILE_ROADS=1  draw the tile layer
       static const bool tileRoadsEnabled = [] {
         const char* e = std::getenv("FALLAGA_TILE_ROADS");
-        return e == nullptr || std::atoi(e) != 0;
+        return e != nullptr && std::atoi(e) != 0;
       }();
       if (tileRoadsEnabled && streetShader) {
         roadgrid::TileRoadRenderer& tr = terrainManager->tileRoadRenderer();
