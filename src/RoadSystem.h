@@ -18,6 +18,7 @@
 #include <glm/glm.hpp>
 #include "Shader.h"
 #include "RoadTileMask.h"
+#include "RoadGrid.h"
 
 // ──────────────────────── COORDINATE SYSTEM ─────────────────────────────────
 
@@ -369,6 +370,10 @@ public:
                const RoadDeformer* deformer = nullptr,
                float snapMargin = 1.5f,
                bool addCrown = true);
+
+    // Caesar IV-style grid mesh generation from RoadGrid
+    void buildFromGrid(const roadgrid::RoadGrid& grid,
+                       const HeightSampler& sampler);
 
     // Upload to GPU
     void upload();

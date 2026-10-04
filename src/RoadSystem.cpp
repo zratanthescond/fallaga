@@ -1802,10 +1802,434 @@ void RoadMeshBuilder::destroy() {
   m_indices.clear();
 }
 
+void RoadMeshBuilder::buildFromGrid(const roadgrid::RoadGrid &grid,
+                                    const HeightSampler &sampler) {
+  destroy();
+  m_vertices.clear();
+  m_indices.clear();
+  m_joinShaderStrokes.clear();
+  m_joinShaderContacts.clear();
+  m_shoulderQuads = 0;
+
+  if (grid.empty()) return;
+
+  const float h = roadgrid::kTileSize * 0.5f;   // 2.0 m
+  const float cW = 0.35f;                        // 35 cm curb width
+  const float kRoadLift = 0.035f;                // 3.5 cm above terrain
+  const float kCurbLift = 0.085f;                // 8.5 cm above terrain (5 cm curb riser)
+
+  auto getY = [&](float x, float z, float lift) -> float {
+    if (sampler.isValid()) {
+      return sampler.sample(x, z) + lift;
+    }
+    return lift;
+  };
+
+  auto makeV = [&](float x, float z, float lift, float edgeDist, float ao,
+                   glm::vec3 norm, uint8_t rType) -> RoadVertex {
+    RoadVertex v;
+    v.position = glm::vec3(x, getY(x, z, lift), z);
+    v.normal = norm;
+    v.uv = glm::vec2(edgeDist, ao);
+    v.roadType = (float)rType;
+    v.surfacePriority = 1.0f;
+    v.markMask = ao;
+    v.metricUV = glm::vec2(x, z);
+    return v;
+  };
+
+  auto emitQuad = [&](const RoadVertex &v00, const RoadVertex &v10,
+                      const RoadVertex &v11, const RoadVertex &v01) {
+    uint32_t bIdx = (uint32_t)m_vertices.size();
+    m_vertices.push_back(v00);
+    m_vertices.push_back(v10);
+    m_vertices.push_back(v11);
+    m_vertices.push_back(v01);
+    m_indices.push_back(bIdx + 0);
+    m_indices.push_back(bIdx + 1);
+    m_indices.push_back(bIdx + 2);
+    m_indices.push_back(bIdx + 0);
+    m_indices.push_back(bIdx + 2);
+    m_indices.push_back(bIdx + 3);
+  };
+
+  for (int cy = 0; cy < roadgrid::kChunksY; ++cy) {
+    for (int cx = 0; cx < roadgrid::kChunksX; ++cx) {
+      const int startX = cx * roadgrid::kChunkSize;
+      const int startY = cy * roadgrid::kChunkSize;
+      bool chunkHasRoad = false;
+      for (int y = startY; y < startY + roadgrid::kChunkSize; ++y) {
+        for (int x = startX; x < startX + roadgrid::kChunkSize; ++x) {
+          if (grid.isRoad(x, y)) {
+            chunkHasRoad = true;
+            break;
+          }
+        }
+        if (chunkHasRoad) break;
+      }
+      if (!chunkHasRoad) continue;
+
+      for (int ty = startY; ty < startY + roadgrid::kChunkSize; ++ty) {
+        for (int tx = startX; tx < startX + roadgrid::kChunkSize; ++tx) {
+          const std::uint8_t T = grid.get(tx, ty);
+          if (T == roadgrid::kNone) continue;
+
+          const float cellCenterX = roadgrid::RoadGrid::tileCenterX(tx);
+          const float cellCenterZ = roadgrid::RoadGrid::tileCenterZ(ty);
+
+          const float x0 = cellCenterX - h;
+          const float x1 = cellCenterX - h + cW;
+          const float x2 = cellCenterX + h - cW;
+          const float x3 = cellCenterX + h;
+
+          const float z0 = cellCenterZ - h;
+          const float z1 = cellCenterZ - h + cW;
+          const float z2 = cellCenterZ + h - cW;
+          const float z3 = cellCenterZ + h;
+
+          const int mask = grid.neighbourMask(tx, ty);
+          const bool hasN = (mask & 1) != 0;
+          const bool hasE = (mask & 2) != 0;
+          const bool hasS = (mask & 4) != 0;
+          const bool hasW = (mask & 8) != 0;
+
+          const glm::vec3 up(0.0f, 1.0f, 0.0f);
+
+          // 1. Center Quad
+          emitQuad(
+              makeV(x1, z1, kRoadLift, 1.0f, 1.0f, up, T),
+              makeV(x2, z1, kRoadLift, 1.0f, 1.0f, up, T),
+              makeV(x2, z2, kRoadLift, 1.0f, 1.0f, up, T),
+              makeV(x1, z2, kRoadLift, 1.0f, 1.0f, up, T));
+
+          // 2. North
+          if (hasN) {
+            emitQuad(
+                makeV(x1, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z3, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z3, kRoadLift, 1.0f, 1.0f, up, T));
+          } else {
+            emitQuad(
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x2, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nSouth(0.0f, 0.0f, -1.0f);
+            emitQuad(
+                makeV(x1, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x2, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nSouth, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nSouth, T));
+          }
+
+          // 3. South
+          if (hasS) {
+            emitQuad(
+                makeV(x1, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z1, kRoadLift, 1.0f, 1.0f, up, T));
+          } else {
+            emitQuad(
+                makeV(x1, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nNorth(0.0f, 0.0f, 1.0f);
+            emitQuad(
+                makeV(x2, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x1, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nNorth, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nNorth, T));
+          }
+
+          // 4. West
+          if (hasW) {
+            emitQuad(
+                makeV(x0, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x0, z2, kRoadLift, 1.0f, 1.0f, up, T));
+          } else {
+            emitQuad(
+                makeV(x0, z1, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x0, z2, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nEast(1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x1, z2, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z1, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nEast, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nEast, T));
+          }
+
+          // 5. East
+          if (hasE) {
+            emitQuad(
+                makeV(x2, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z2, kRoadLift, 1.0f, 1.0f, up, T));
+          } else {
+            emitQuad(
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x3, z1, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z2, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nWest(-1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x2, z1, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z2, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nWest, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nWest, T));
+          }
+
+          // 6. Corner NE
+          if (!hasN && !hasE) {
+            emitQuad(
+                makeV(x2, z2, kCurbLift, 0.15f, 0.80f, up, T),
+                makeV(x3, z2, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nSouth(0.0f, 0.0f, -1.0f);
+            emitQuad(
+                makeV(x2, z2, kRoadLift, 0.15f, 0.45f, nSouth, T),
+                makeV(x3, z2, kRoadLift, 0.15f, 0.45f, nSouth, T),
+                makeV(x3, z2, kCurbLift, 0.15f, 0.85f, nSouth, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nSouth, T));
+            glm::vec3 nWest(-1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x2, z2, kRoadLift, 0.15f, 0.45f, nWest, T),
+                makeV(x2, z3, kRoadLift, 0.15f, 0.45f, nWest, T),
+                makeV(x2, z3, kCurbLift, 0.15f, 0.85f, nWest, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nWest, T));
+          } else if (!hasN && hasE) {
+            emitQuad(
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x3, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x3, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nSouth(0.0f, 0.0f, -1.0f);
+            emitQuad(
+                makeV(x2, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x3, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x3, z2, kCurbLift, 0.15f, 0.85f, nSouth, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nSouth, T));
+          } else if (hasN && !hasE) {
+            emitQuad(
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x3, z2, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z3, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nWest(-1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x2, z2, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z3, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z3, kCurbLift, 0.15f, 0.85f, nWest, T),
+                makeV(x2, z2, kCurbLift, 0.15f, 0.85f, nWest, T));
+          } else {
+            emitQuad(
+                makeV(x2, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z3, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z3, kRoadLift, 1.0f, 1.0f, up, T));
+          }
+
+          // 7. Corner NW
+          if (!hasN && !hasW) {
+            emitQuad(
+                makeV(x0, z2, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.80f, up, T),
+                makeV(x1, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x0, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nSouth(0.0f, 0.0f, -1.0f);
+            emitQuad(
+                makeV(x0, z2, kRoadLift, 0.15f, 0.45f, nSouth, T),
+                makeV(x1, z2, kRoadLift, 0.15f, 0.45f, nSouth, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nSouth, T),
+                makeV(x0, z2, kCurbLift, 0.15f, 0.85f, nSouth, T));
+            glm::vec3 nEast(1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x1, z3, kRoadLift, 0.15f, 0.45f, nEast, T),
+                makeV(x1, z2, kRoadLift, 0.15f, 0.45f, nEast, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nEast, T),
+                makeV(x1, z3, kCurbLift, 0.15f, 0.85f, nEast, T));
+          } else if (!hasN && hasW) {
+            emitQuad(
+                makeV(x0, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z3, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x0, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nSouth(0.0f, 0.0f, -1.0f);
+            emitQuad(
+                makeV(x0, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x1, z2, kRoadLift, 0.15f, 0.50f, nSouth, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nSouth, T),
+                makeV(x0, z2, kCurbLift, 0.15f, 0.85f, nSouth, T));
+          } else if (hasN && !hasW) {
+            emitQuad(
+                makeV(x0, z2, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z3, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x0, z3, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nEast(1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x1, z3, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z2, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z2, kCurbLift, 0.15f, 0.85f, nEast, T),
+                makeV(x1, z3, kCurbLift, 0.15f, 0.85f, nEast, T));
+          } else {
+            emitQuad(
+                makeV(x0, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z2, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z3, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x0, z3, kRoadLift, 1.0f, 1.0f, up, T));
+          }
+
+          // 8. Corner SW
+          if (!hasS && !hasW) {
+            emitQuad(
+                makeV(x0, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.80f, up, T),
+                makeV(x0, z1, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nNorth(0.0f, 0.0f, 1.0f);
+            emitQuad(
+                makeV(x1, z1, kRoadLift, 0.15f, 0.45f, nNorth, T),
+                makeV(x0, z1, kRoadLift, 0.15f, 0.45f, nNorth, T),
+                makeV(x0, z1, kCurbLift, 0.15f, 0.85f, nNorth, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nNorth, T));
+            glm::vec3 nEast(1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x1, z1, kRoadLift, 0.15f, 0.45f, nEast, T),
+                makeV(x1, z0, kRoadLift, 0.15f, 0.45f, nEast, T),
+                makeV(x1, z0, kCurbLift, 0.15f, 0.85f, nEast, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nEast, T));
+          } else if (!hasS && hasW) {
+            emitQuad(
+                makeV(x0, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x0, z1, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nNorth(0.0f, 0.0f, 1.0f);
+            emitQuad(
+                makeV(x1, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x0, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x0, z1, kCurbLift, 0.15f, 0.85f, nNorth, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nNorth, T));
+          } else if (hasS && !hasW) {
+            emitQuad(
+                makeV(x0, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x1, z0, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x0, z1, kCurbLift, 0.00f, 0.95f, up, T));
+            glm::vec3 nEast(1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x1, z1, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z0, kRoadLift, 0.15f, 0.50f, nEast, T),
+                makeV(x1, z0, kCurbLift, 0.15f, 0.85f, nEast, T),
+                makeV(x1, z1, kCurbLift, 0.15f, 0.85f, nEast, T));
+          } else {
+            emitQuad(
+                makeV(x0, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x1, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x0, z1, kRoadLift, 1.0f, 1.0f, up, T));
+          }
+
+          // 9. Corner SE
+          if (!hasS && !hasE) {
+            emitQuad(
+                makeV(x2, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z1, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.80f, up, T));
+            glm::vec3 nNorth(0.0f, 0.0f, 1.0f);
+            emitQuad(
+                makeV(x3, z1, kRoadLift, 0.15f, 0.45f, nNorth, T),
+                makeV(x2, z1, kRoadLift, 0.15f, 0.45f, nNorth, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nNorth, T),
+                makeV(x3, z1, kCurbLift, 0.15f, 0.85f, nNorth, T));
+            glm::vec3 nWest(-1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x2, z0, kRoadLift, 0.15f, 0.45f, nWest, T),
+                makeV(x2, z1, kRoadLift, 0.15f, 0.45f, nWest, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nWest, T),
+                makeV(x2, z0, kCurbLift, 0.15f, 0.85f, nWest, T));
+          } else if (!hasS && hasE) {
+            emitQuad(
+                makeV(x2, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z1, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nNorth(0.0f, 0.0f, 1.0f);
+            emitQuad(
+                makeV(x3, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x2, z1, kRoadLift, 0.15f, 0.50f, nNorth, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nNorth, T),
+                makeV(x3, z1, kCurbLift, 0.15f, 0.85f, nNorth, T));
+          } else if (hasS && !hasE) {
+            emitQuad(
+                makeV(x2, z0, kCurbLift, 0.15f, 0.85f, up, T),
+                makeV(x3, z0, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x3, z1, kCurbLift, 0.00f, 0.95f, up, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, up, T));
+            glm::vec3 nWest(-1.0f, 0.0f, 0.0f);
+            emitQuad(
+                makeV(x2, z0, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z1, kRoadLift, 0.15f, 0.50f, nWest, T),
+                makeV(x2, z1, kCurbLift, 0.15f, 0.85f, nWest, T),
+                makeV(x2, z0, kCurbLift, 0.15f, 0.85f, nWest, T));
+          } else {
+            emitQuad(
+                makeV(x2, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z0, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x3, z1, kRoadLift, 1.0f, 1.0f, up, T),
+                makeV(x2, z1, kRoadLift, 1.0f, 1.0f, up, T));
+          }
+        }
+      }
+    }
+  }
+
+  stampMetricUV();
+  m_indexCount = (int)m_indices.size();
+  std::cout << "[RoadMeshBuilder] Caesar IV Grid Mesh: " << m_vertices.size()
+            << " vertices, " << (m_indexCount / 3) << " triangles generated from RoadGrid.\n";
+}
+
 void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
                             const HeightSampler &sampler,
                             const RoadDeformer *deformer, float snapMargin,
                             bool addCrown) {
+  roadgrid::RoadGrid grid;
+  for (const auto& seg : segments) {
+    if (seg.controlPoints.size() < 2) continue;
+    uint8_t rType = (seg.type == RoadType::CountryDirt) ? roadgrid::kDirt : roadgrid::kPaved;
+    int radius = (int)std::max(0.0f, std::round((seg.width - 4.0f) / 8.0f));
+    if (!seg.splinePoints.empty()) {
+      for (size_t i = 0; i + 1 < seg.splinePoints.size(); ++i) {
+        int x0 = roadgrid::RoadGrid::worldToTileX(seg.splinePoints[i].x);
+        int y0 = roadgrid::RoadGrid::worldToTileZ(seg.splinePoints[i].z);
+        int x1 = roadgrid::RoadGrid::worldToTileX(seg.splinePoints[i+1].x);
+        int y1 = roadgrid::RoadGrid::worldToTileZ(seg.splinePoints[i+1].z);
+        grid.paintLine(x0, y0, x1, y1, rType, radius);
+      }
+    } else {
+      for (size_t i = 0; i + 1 < seg.controlPoints.size(); ++i) {
+        int x0 = roadgrid::RoadGrid::worldToTileX(seg.controlPoints[i].pos.x);
+        int y0 = roadgrid::RoadGrid::worldToTileZ(seg.controlPoints[i].pos.y);
+        int x1 = roadgrid::RoadGrid::worldToTileX(seg.controlPoints[i+1].pos.x);
+        int y1 = roadgrid::RoadGrid::worldToTileZ(seg.controlPoints[i+1].pos.y);
+        grid.paintLine(x0, y0, x1, y1, rType, radius);
+      }
+    }
+  }
+  buildFromGrid(grid, sampler);
+  return;
+
   m_vertices.clear();
   m_indices.clear();
   m_joinShaderStrokes.clear();

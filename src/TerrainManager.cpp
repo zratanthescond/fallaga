@@ -28,7 +28,39 @@ TerrainManager::TerrainManager(const std::string& hmPath, const std::string& pmP
     
     std::cout << "[TerrainManager] Loading Heightmap: " << hmPath << std::endl;
     loadHeightmap(hmPath); 
-    
+
+    // Tile-road seed for development. The tile system is not yet driven by an editor
+    // tool or by the saved roads, so this lays down a known set of shapes near the city
+    // -- straights, a corner, a T, a cross and a plaza -- so the tiling, curbs and
+    // junction openings can be looked at. Both types are included.
+    // FALLAGA_TILE_SEED=0 disables it.
+    {
+        static const bool seedEnabled = [] {
+            const char* e = std::getenv("FALLAGA_TILE_SEED");
+            return e == nullptr || std::atoi(e) != 0;
+        }();
+        if (seedEnabled) {
+            // Tile coordinates near the old town (world ~4275,-835).
+            const int bx = roadgrid::RoadGrid::worldToTileX(4275.0f);
+            const int by = roadgrid::RoadGrid::worldToTileZ(-835.0f);
+            // A long paved avenue running east, with a dirt branch north.
+            tileGrid.paintLine(bx - 30, by, bx + 30, by, roadgrid::kPaved);
+            tileGrid.paintLine(bx, by, bx, by + 22, roadgrid::kDirt);
+            // A corner off the avenue.
+            tileGrid.paintLine(bx - 20, by, bx - 20, by - 18, roadgrid::kPaved);
+            // A T junction: a street joining from the south.
+            tileGrid.paintLine(bx + 18, by, bx + 18, by - 14, roadgrid::kPaved);
+            // A crossroad: one street crossing another.
+            tileGrid.paintLine(bx + 26, by - 10, bx + 26, by + 10, roadgrid::kPaved);
+            // A 2-tile-wide plaza.
+            tileGrid.paintRect(bx + 34, by + 4, bx + 41, by + 11, roadgrid::kPaved);
+            std::cout << "[TileRoad] Seeded " << tileGrid.roadCount()
+                      << " tile road cells near grid (" << bx << "," << by << "), world ("
+                      << roadgrid::RoadGrid::tileCenterX(bx) << ","
+                      << roadgrid::RoadGrid::tileCenterZ(by) << ")\n";
+        }
+    }
+
     std::cout << "[TerrainManager] Setting up textures..." << std::endl;
     setupTextures(pmPath);
     
@@ -181,6 +213,19 @@ void TerrainManager::loadHeightmap(const std::string& path) {
         stbi_image_free(rawData);
         std::cout << "[TerrainManager] Heightmap loaded and uploaded to GPU as float texture." << std::endl;
     }
+}
+
+int TerrainManager::paintTileRoad(float wx, float wz, float radiusMetres,
+                                  std::uint8_t type) {
+    // Snap to the tile the cursor is actually over, then paint a disc of cells around
+    // it. Radius is given in metres and converted to cells, so the brush keeps its
+    // physical size whatever the tile size is.
+    const int cx = roadgrid::RoadGrid::worldToTileX(wx);
+    const int cy = roadgrid::RoadGrid::worldToTileZ(wz);
+    if (!roadgrid::RoadGrid::inBounds(cx, cy)) return 0;
+    const int r = std::max(0, (int)std::lround(radiusMetres / roadgrid::kTileSize) - 1);
+    if (r <= 0) return tileGrid.set(cx, cy, type) ? 1 : 0;
+    return tileGrid.paintDisc(cx, cy, r, type);
 }
 
 void TerrainManager::setupTextures(const std::string& pmPath) {

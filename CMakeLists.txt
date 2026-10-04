@@ -37,6 +37,9 @@ add_executable(RDR2_Prototype
     src/TerrainManager.cpp
     src/TerrainChunk.cpp
     src/TerrainTextureLayer.cpp
+    src/RoadGrid.cpp
+    src/RoadTileMesh.cpp
+    src/TileRoadRenderer.cpp
     src/TextureEngine.cpp
     src/stb_impl.cpp
     src/AudioSystem.cpp
