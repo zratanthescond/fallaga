@@ -378,14 +378,18 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
     terrainShader->setFloat("waterLevel", waterLevel);
     terrainShader->setFloat("time", (float)glfwGetTime());
     // Distance beyond which the second base ground layer is dropped in the shader.
-    // Overridable so the cost/quality point is measured rather than guessed:
-    // FALLAGA_LOD_DIST=600 (0 disables the LOD and always samples every layer).
+    // Defaults to disabled (0). Enabling it is a real saving in principle, but the
+    // GPU cost of this scene cannot be measured reliably enough here to choose a
+    // distance: with an identical configuration and camera, terrain GPU time swings
+    // from ~20 ms to ~70 ms BETWEEN runs while staying tight within a run. Any
+    // threshold picked from those numbers would be fitted to noise. Set
+    // FALLAGA_LOD_DIST explicitly once a steadier harness exists.
     static const float farLodDistance = [] {
         if (const char* e = std::getenv("FALLAGA_LOD_DIST")) {
             const float v = std::strtof(e, nullptr);
             if (v >= 0.0f) return v;
         }
-        return 600.0f;
+        return 0.0f;
     }();
     terrainShader->setFloat("u_farLodDistance", farLodDistance);
     terrainShader->setVec4("clipPlane", clipPlane);
