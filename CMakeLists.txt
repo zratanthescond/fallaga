@@ -142,5 +142,11 @@ if(BUILD_TESTING)
     target_include_directories(roadgrid_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME roadgrid_test COMMAND roadgrid_test
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Tile-based road builder, phase 3: mesh generation. No GL, no engine.
+    add_executable(roadtile_test roadtile_test.cpp src/RoadGrid.cpp src/RoadTileMesh.cpp)
+    target_include_directories(roadtile_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME roadtile_test COMMAND roadtile_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
