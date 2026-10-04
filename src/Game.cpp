@@ -115,6 +115,11 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 Game::~Game() {
     AudioSystem::getInstance().cleanup();
     if (gpuTimerQueries[0]) glDeleteQueries(4, gpuTimerQueries);
+    if (gpuPhaseQueries[0][0]) {
+        for (int s = 0; s < kGpuPhaseSlots; ++s)
+            for (int p = 0; p < kGpuPhaseCount; ++p)
+                if (gpuPhaseQueries[s][p]) glDeleteQueries(1, &gpuPhaseQueries[s][p]);
+    }
     if (roadRefTex) glDeleteTextures(1, &roadRefTex);
     if (roadRefDrawTex) glDeleteTextures(1, &roadRefDrawTex);
     delete player;
@@ -1491,6 +1496,88 @@ void Game::render() {
     double objectsRenderMs = 0.0;
     double waterRenderMs = 0.0;
     double renderPostMs = 0.0;
+
+    // ── Per-phase GPU timing ────────────────────────────────────────────────
+    // The CPU-phase numbers below only measure submission, which is why a frame that
+    // submits 0.5 ms of terrain can still take 90 ms on the GPU. These queries time
+    // the actual GPU work per phase. Results are collected two frames after the slot
+    // is issued, so QUERY_RESULT_AVAILABLE is always true by then and the read never
+    // stalls -- a synchronous read would serialise the pipeline and change the thing
+    // being measured.
+    static const char* const kGpuPhaseNames[kGpuPhaseCount] = {
+        "sky", "terrain", "objects", "water", "post"};
+    // The sky query is never trusted: leaving a GL_TIME_ELAPSED query open across
+    // Sky::render reliably reports GL_INVALID_OPERATION and a nonsense value (measured
+    // 2.3e12 ms), so that phase is opened but its result is discarded and reported as
+    // n/a. The CPU sky phase is still timed above.
+    constexpr bool kGpuTrustSky = false;
+    const bool gpuPhaseProfile = profileRender && GLEW_ARB_timer_query;
+    static int gpuPhaseSlot = 0;
+    if (gpuPhaseProfile) {
+        if (gpuPhaseQueries[0][0] == 0) {
+            for (int s = 0; s < kGpuPhaseSlots; ++s)
+                for (int p = 0; p < kGpuPhaseCount; ++p)
+                    glGenQueries(1, &gpuPhaseQueries[s][p]);
+        }
+        // Collect the slot issued two frames ago. The first slots are discarded: the
+        // opening frame straddles one-time startup work (shader compiles, texture
+        // uploads, the road mesh build), which the sky query spans and which makes
+        // that sample both huge and GL_INVALID_OPERATION on some drivers.
+        const int readSlot = (gpuPhaseSlot + 2) % kGpuPhaseSlots;
+        static int warmupSlots = 0;
+        if (gpuPhasePending[readSlot] && warmupSlots >= kGpuPhaseSlots) {
+            for (int p = 0; p < kGpuPhaseCount; ++p) {
+                GLuint available = GL_FALSE;
+                glGetQueryObjectuiv(gpuPhaseQueries[readSlot][p],
+                                    GL_QUERY_RESULT_AVAILABLE, &available);
+                if (available != GL_TRUE) continue;
+                GLuint64 ns = 0;
+                glGetQueryObjectui64v(gpuPhaseQueries[readSlot][p],
+                                      GL_QUERY_RESULT, &ns);
+                const double ms = static_cast<double>(ns) / 1000000.0;
+                // Reject impossible samples outright rather than average them in: one
+                // invalid query otherwise poisons the whole report.
+                if (p == 0 && !kGpuTrustSky) continue;
+                if (ms < 0.0 || ms > 10000.0) continue;
+                gpuPhaseAccum[p] += ms;
+            }
+            gpuPhasePending[readSlot] = false;
+            if (++gpuPhaseSampleCount >= 60) {
+                std::cout << "[RENDER GPU PER-PHASE] avg ms:";
+                for (int p = 0; p < kGpuPhaseCount; ++p) {
+                    if (p == 0 && !kGpuTrustSky) {
+                        std::cout << ' ' << kGpuPhaseNames[p] << "=n/a";
+                        continue;
+                    }
+                    std::cout << ' ' << kGpuPhaseNames[p] << '='
+                              << gpuPhaseAccum[p] / gpuPhaseSampleCount;
+                }
+                std::cout << '\n';
+                for (int p = 0; p < kGpuPhaseCount; ++p) gpuPhaseAccum[p] = 0.0;
+                gpuPhaseSampleCount = 0;
+            }
+        } else if (gpuPhasePending[readSlot]) {
+            gpuPhasePending[readSlot] = false; // warmup: drop the sample
+        }
+        if (warmupSlots < kGpuPhaseSlots) ++warmupSlots;
+        // Issue the whole current frame's phases into the next slot, opening only the
+        // first. gpuPhaseNext then closes each as its section of render() finishes.
+        gpuPhaseSlot = (gpuPhaseSlot + 1) % kGpuPhaseSlots;
+        gpuPhasePending[gpuPhaseSlot] = true;
+        glBeginQuery(GL_TIME_ELAPSED, gpuPhaseQueries[gpuPhaseSlot][0]);
+    }
+    // Advances to the next phase: closes the query that has just finished and opens
+    // the next one. Guarded so extra calls cannot leave a query open past the last
+    // phase.
+    int gpuPhaseCurrent = 0;
+    auto gpuPhaseNext = [&]() {
+        if (!gpuPhaseProfile) return;
+        if (gpuPhaseCurrent >= kGpuPhaseCount) return; // already closed
+        glEndQuery(GL_TIME_ELAPSED);
+        if (++gpuPhaseCurrent < kGpuPhaseCount)
+            glBeginQuery(GL_TIME_ELAPSED,
+                         gpuPhaseQueries[gpuPhaseSlot][gpuPhaseCurrent]);
+    };
     auto recordRenderPhase = [&](double& bucketMs) {
         if (!profileRender) return;
         const auto now = RenderPerfClock::now();
@@ -1529,6 +1616,7 @@ void Game::render() {
     }
     sky->render(projection, view, lightDir);
     recordRenderPhase(skyRenderMs);
+    gpuPhaseNext(); // sky -> terrain
 
     // 4. Load Matrices into the Legacy Pipeline
     glMatrixMode(GL_PROJECTION);
@@ -1576,6 +1664,7 @@ void Game::render() {
     recordRenderPhase(preTerrainRenderMs);
     terrain->renderOpaque(projection, view, cameraPosition, lightDir, lColor, selectedPlacedIdx, (activeEditorMode == 1), selectedAssetIdx, previewAngle, previewScale, false);
     recordRenderPhase(terrainRenderMs);
+    gpuPhaseNext(); // terrain -> objects
 
     // ── PROJECTED REFERENCE MAP ON THE TERRAIN (road edit mode, reference only) ──
     if (editMode && activeEditorMode == 5) {
@@ -1986,6 +2075,7 @@ void Game::render() {
 
     player->render(projection, view, lightDir, lColor, camera);
     recordRenderPhase(objectsRenderMs);
+    gpuPhaseNext(); // objects -> water
 
     // ── BLIT SCENE COLOR TO REFRACTION FBO (0.05ms hardware blit - replaces entire second world render pass!) ──
     if (terrain->fbosReady && terrain->refrFBO) {
@@ -1999,6 +2089,7 @@ void Game::render() {
     // 8. Render Water (transparent pass - after all opaque objects)
     terrain->renderWater(projection, view, cameraPosition, lightDir, lColor, 0, 0);
     recordRenderPhase(waterRenderMs);
+    gpuPhaseNext(); // water -> post
 
     // --- PHASE 8.5: EDITOR HUD & GLOBAL STATUS OVERLAYS ---
     if (editMode || isSavingState) {
@@ -3016,6 +3107,7 @@ if (projSaveFlash > 0.0f) {
     }
 
     recordRenderPhase(renderPostMs);
+    gpuPhaseNext(); // post: closes the last phase query
     if (profileRender) {
         static int profileFrames = 0;
         static double accumulatedSkyMs = 0.0;
