@@ -960,56 +960,6 @@ bool roadEdgeOnlyView() {
     static const bool on = (std::getenv("FALLAGA_EDGEONLY") != nullptr);
     return on;
 }
-
-// Every uniform the road surface texture, its brightness and its normal map need.
-//
-// Shared by the spline ribbon and the tile grid, because both draw through the same
-// street shader. It is a function rather than duplicated code because getting it wrong
-// is silent and total: the tile path originally set only roadSurfaceValid, leaving
-// roadSurfaceGain at its default 0, so every tile road rendered pure black.
-void setRoadSurfaceUniforms(Shader& shader, unsigned int surfaceTex, unsigned int normalTex,
-                            bool noRoadTex) {
-    shader.setInt("roadSurfaceTex", 14);
-    shader.setInt("roadSurfaceValid", (surfaceTex != 0 && !noRoadTex) ? 1 : 0);
-    // Metres per texture repeat. The source is a 2 km gravel scan, so ~6 m keeps the
-    // aggregate reading at roughly its real size on screen.
-    shader.setFloat("roadSurfaceScale", 6.0f);
-    // The scan is authored dark and the albedo is multiplied by ambient+NdotL, so it
-    // needs a gain to reach a usable brightness. Overridable from the environment so
-    // the look can be dialled without a rebuild:
-    //   FALLAGA_ROAD_GAIN=3.0  FALLAGA_ROAD_TINT=1.05,0.98,0.88
-    static const float roadGain = [] {
-        if (const char* e = std::getenv("FALLAGA_ROAD_GAIN")) {
-            const float v = std::strtof(e, nullptr);
-            if (v > 0.0f) return v;
-        }
-        return 3.2f;
-    }();
-    static const glm::vec3 roadTint = [] {
-        if (const char* e = std::getenv("FALLAGA_ROAD_TINT")) {
-            float r = 0, g = 0, b = 0;
-            if (std::sscanf(e, "%f,%f,%f", &r, &g, &b) == 3)
-                return glm::vec3(r, g, b);
-        }
-        return glm::vec3(1.06f, 1.00f, 0.90f);
-    }();
-    shader.setFloat("roadSurfaceGain", roadGain);
-    shader.setVec3("roadSurfaceTint", roadTint);
-    // Gravel relief, on the next unit up. Strength is overridable so the relief can be
-    // turned down if it reads as noise at driving height.
-    glActiveTexture(GL_TEXTURE15);
-    glBindTexture(GL_TEXTURE_2D, normalTex);
-    shader.setInt("roadNormalTex", 15);
-    shader.setInt("roadNormalValid", (normalTex != 0 && !noRoadTex) ? 1 : 0);
-    static const float roadNormalStrength = [] {
-        if (const char* e = std::getenv("FALLAGA_ROAD_NORMAL")) {
-            const float v = std::strtof(e, nullptr);
-            if (v >= 0.0f) return v;
-        }
-        return 0.85f;
-    }();
-    shader.setFloat("roadNormalStrength", roadNormalStrength);
-}
 }  // namespace
 
 void Terrain::renderStreets(const glm::mat4& proj, const glm::mat4& view,
@@ -1277,39 +1227,6 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
       terrainManager->render(proj, view, cam, light, lightColor, waterLevelRuntime, glm::vec4(0.0f, -1.0f, 0.0f, 100000.0f), effectiveDrawDist);
     }
     if (!isReflectionPass) {
-      // ── Tile road builder (Caesar IV style) ────────────────────────────────
-      // OFF BY DEFAULT, deliberately. The tile system has correct grid and geometry
-      // layers but no materials yet: drawn on its own it is flat dark splotches with no
-      // cobble, no curb you can see and jagged tile edges, which is worse than the
-      // spline roads it would sit next to. It stays behind an explicit opt-in until
-      // phase 4 gives it road materials and a look that stands on its own.
-      //   FALLAGA_TILE_ROADS=1  draw the tile layer
-      static const bool tileRoadsEnabled = [] {
-        const char* e = std::getenv("FALLAGA_TILE_ROADS");
-        return e != nullptr && std::atoi(e) != 0;
-      }();
-      if (tileRoadsEnabled && streetShader) {
-        roadgrid::TileRoadRenderer& tr = terrainManager->tileRoadRenderer();
-        tr.update(terrainManager->tileRoadGrid());
-        if (!tr.empty()) {
-          streetShader->use();
-          streetShader->setMat4("projection", proj);
-          streetShader->setMat4("view", view);
-          streetShader->setMat4("model", glm::mat4(1.0f));
-          streetShader->setVec3("lightDir", light);
-          streetShader->setVec3("viewPos", cam);
-          glActiveTexture(GL_TEXTURE14);
-          glBindTexture(GL_TEXTURE_2D, roadSurfaceTex);
-          // Identical surface setup to the spline path. Setting roadSurfaceValid alone
-          // left roadSurfaceGain at its default 0, which multiplied the albedo to black.
-          setRoadSurfaceUniforms(*streetShader, roadSurfaceTex, roadNormalTex,
-                                 std::getenv("FALLAGA_ROAD_NOTEX") != nullptr);
-          // The tile path shades its surface from the world position, which for the
-          // tile mesh is also what keeps the stones continuous between cells.
-          tr.render(*streetShader);
-        }
-      }
-
       if (roadMeshBuilder && roadMeshBuilder->getTriangleCount() > 0 && streetShader) {
         streetShader->use();
         streetShader->setMat4("projection", proj);
@@ -1321,11 +1238,52 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         // (terrain layers 0-7, water 13, scene FBOs 10-12).
         glActiveTexture(GL_TEXTURE14);
         glBindTexture(GL_TEXTURE_2D, roadSurfaceTex);
+        streetShader->setInt("roadSurfaceTex", 14);
         // FALLAGA_ROAD_NOTEX forces the procedural asphalt, so the textured and
         // untextured surfaces can be compared at the same camera without a rebuild.
-        static const bool noRoadTexShared = std::getenv("FALLAGA_ROAD_NOTEX") != nullptr;
-        setRoadSurfaceUniforms(*streetShader, roadSurfaceTex, roadNormalTex,
-                               noRoadTexShared);
+        static const bool noRoadTex = std::getenv("FALLAGA_ROAD_NOTEX") != nullptr;
+        streetShader->setInt("roadSurfaceValid",
+                             (roadSurfaceTex != 0 && !noRoadTex) ? 1 : 0);
+        // Metres per texture repeat. The source is a 2 km gravel scan, so ~6 m keeps
+        // the aggregate reading at roughly its real size on screen.
+        streetShader->setFloat("roadSurfaceScale", 6.0f);
+        // The scan is authored dark and the albedo is multiplied by ambient+NdotL
+        // below, so it needs a gain to reach the brightness the procedural asphalt
+        // had. Both are overridable from the environment so the look can be dialled
+        // in without a rebuild:
+        //   FALLAGA_ROAD_GAIN=3.0  FALLAGA_ROAD_TINT=1.05,0.98,0.88
+        static const float roadGain = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_GAIN")) {
+            const float v = std::strtof(e, nullptr);
+            if (v > 0.0f) return v;
+          }
+          return 3.2f;
+        }();
+        static const glm::vec3 roadTint = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_TINT")) {
+            float r = 0, g = 0, b = 0;
+            if (std::sscanf(e, "%f,%f,%f", &r, &g, &b) == 3)
+              return glm::vec3(r, g, b);
+          }
+          return glm::vec3(1.06f, 1.00f, 0.90f);
+        }();
+        streetShader->setFloat("roadSurfaceGain", roadGain);
+        streetShader->setVec3("roadSurfaceTint", roadTint);
+        // Gravel relief, on the next unit up. Strength is overridable so the relief
+        // can be turned down if it reads as noise at driving height.
+        glActiveTexture(GL_TEXTURE15);
+        glBindTexture(GL_TEXTURE_2D, roadNormalTex);
+        streetShader->setInt("roadNormalTex", 15);
+        streetShader->setInt("roadNormalValid",
+                             (roadNormalTex != 0 && !noRoadTex) ? 1 : 0);
+        static const float roadNormalStrength = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_NORMAL")) {
+            const float v = std::strtof(e, nullptr);
+            if (v >= 0.0f) return v;
+          }
+          return 0.85f;
+        }();
+        streetShader->setFloat("roadNormalStrength", roadNormalStrength);
         const bool dbg = roadDebugView();
         if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
         if (roadEdgeOnlyView()) streetShader->setInt("u_debugEdges", 1);

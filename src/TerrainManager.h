@@ -7,8 +7,6 @@
 #include "TerrainRefinement.h"
 #include "Shader.h"
 #include "RoadSystem.h"
-#include "RoadGrid.h"
-#include "TileRoadRenderer.h"
 
 class TerrainManager {
 public:
@@ -102,23 +100,6 @@ public:
     // the height maths above does not.
     void rebuildChunksInBox(int minCellX, int maxCellX, int minCellZ, int maxCellZ);
 
-    // ── Tile road builder (Caesar IV style) ───────────────────────────────────
-    // The grid is the source of truth for the tile road system. It coexists with the
-    // spline network for now: the splines are still what the game loads and draws, and
-    // the tile system is being brought up alongside them so the two can be compared
-    // before it replaces them.
-    //
-    // Paints or erases tile cells under a world position with a radius in metres.
-    // Returns the number of cells changed. Used by the editor's tile paint tool.
-    int paintTileRoad(float wx, float wz, float radiusMetres, std::uint8_t type);
-    // Begins/ends a tile stroke so a whole drag is one undo step.
-    void beginTileStroke() { tileGrid.beginStroke(); }
-    void endTileStroke() { tileGrid.endStroke(); }
-    bool hasTileRoads() const { return !tileGrid.empty(); }
-    // Access for the render pass, which updates and draws the tile mesh.
-    roadgrid::TileRoadRenderer& tileRoadRenderer() { return tileRoad; }
-    const roadgrid::RoadGrid& tileRoadGrid() const { return tileGrid; }
-
 private:
     void loadHeightmap(const std::string& path);
     // Pending dirty rectangle of the heightmap texture, in native grid pixels.
@@ -161,9 +142,6 @@ private:
     int refineLevelAt(int cellX, int cellZ) const;
 
     int gridW=0, gridH=0;
-    // Tile road system state. Public methods above are the API; these are the storage.
-    roadgrid::RoadGrid tileGrid;
-    roadgrid::TileRoadRenderer tileRoad;
     int visualW=0, visualH=0;
     int roadW=0, roadH=0;
     float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
