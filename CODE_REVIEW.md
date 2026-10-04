@@ -185,7 +185,26 @@ A 7-state scripted test harness lives inside `Game::update()` (`Game.cpp:1180-13
 
 **P8. Immediate-mode OpenGL is still the primary geometry path for UI and editor overlays** — **184** `glBegin`/`glVertex3f`/`glMatrixMode`/`glRasterPos` call sites, concentrated in `Game.cpp:1691-1897, 1947-1998, 2859-2900`, `Terrain.cpp:1770-1879` and `ObjectModel.cpp:429-666`. This forces `GLFW_OPENGL_COMPAT_PROFILE` (`main.cpp:106`), which caps the engine at OpenGL 3.3 compatibility with no path to core profile.
 
-**P9. The performance numbers in the log cannot be trusted.** `game_output.log` (stale, 2026-09-20) shows a metronomic 16.68–16.71 ms across 36 samples — that is a **vsync lock at 60 FPS**, not a measurement of headroom. It does tell you render is 14.4 ms of the 16.7 ms budget, i.e. the frame is nearly full before any feature work. The profiler also prints two always-zero fields (`waterStepMs`/`waterUploadMs` are never written, `Game.cpp:144-145, 1369-1370`).
+**P9. The performance numbers in the log cannot be trusted.** `game_output.log` (stale, 2026-09-20) shows a metronomic 16.68–16.71 ms across 36 samples — that is a **vsync lock at 60 FPS**, not a measurement of headroom. It tells you nothing about where the time goes, because a capped frame is spent in `Swp`. The profiler also prints two always-zero fields (`waterStepMs`/`waterUploadMs` are never written, `Game.cpp:144-145, 1369-1370`).
+
+### P1 and P9 corrected by measurement
+
+The claim above that terrain costs ~14 M triangles/frame with **no LOD and no culling** is **half wrong**, and the profiling numbers are misleading. Measured with the built-in GPU timer (`FALLAGA_RENDER_PERF=1`) plus the culling counter:
+
+| scenario | chunks drawn | CPU render | **GPU** |
+|---|---|---|---|
+| ground level, in the old town | **5 / 81** | 0.49 ms | **88–95 ms** |
+| 300 m up, pitched 60° down | **2 / 81** | 0.40 ms | **34–44 ms** |
+| 1200 m up, 85° down (most terrain coverage) | **2 / 81** | 0.46 ms | **32–40 ms** |
+
+- **Distance, AABB-vs-frustum and clip-plane culling are all implemented and working** (`TerrainManager.cpp:412-456`). Draw count is small in every view tested, including the most terrain-heavy one.
+- **Terrain CPU submission is under 0.5 ms**, so triangle count is not the problem at any tested camera.
+- The frame is **GPU-bound at 30–95 ms**, and the worst case is *ground level*, where the least terrain is on screen. So the cost is not terrain area at all. Likely consumers are the model/foliage passes (alpha-blended vegetation — 5 865 trees and 32 746 grass patches in the scene) and the water/reflection pass.
+
+**So the "no LOD / 14 M triangles" item was mis-diagnosed.** LOD would not fix a frame that already submits <0.5 ms of CPU work and 2–5 chunks. The correct next step is per-phase **GPU** timing to attribute the 88–95 ms, not a terrain LOD scheme.
+
+**LOD is genuinely absent**, which matters for visual density at the 2500–6000 m draw distances, but it is not the frame-time fix.
+
 
 ---
 
