@@ -3110,16 +3110,12 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
 
         ringPositions[j] = pos;
-        // Metric texture coordinates: metres across and along the road, so the
-        // surface texture tiles at a constant size regardless of road width. The
-        // across coordinate follows the actual half-width in use at this sample,
-        // which varies around bends.
-        const float acrossMetres = off * useHw + std::max(0.0f, seg.width) * 0.5f;
-        const float alongMetres = along - seg.cumulativeDist.front();
+        // metricUV is stamped centrally from world XZ after the whole mesh is built
+        // (stampMetricUV); the field here is a placeholder overwritten by that pass.
         m_vertices.push_back(
             {pos, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec2(uc, v), rtype,
              std::max(0.0f, seg.width) * 0.1f + std::max(0.0f, 5.0f - rtype),
-             mark, glm::vec2(acrossMetres, alongMetres)});
+             mark, glm::vec2(0.0f)});
       }
 
       for (int j = 0; j < kCrossCount; ++j) {
@@ -3961,6 +3957,23 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
     }
   }
 
+  // Single authoritative pass for the surface-texture coordinate.
+  //
+  // MetricUV must be the WORLD XZ position: street.frag samples the tarred gravel as
+  // texture(roadSurfaceTex, MetricUV / roadSurfaceScale) and the same for the normal
+  // map, so the parameterization has to be isotropic in world space and identical
+  // everywhere or the texture jumps across a seam.
+  //
+  // It used to be set only in the ribbon ring emitter, from a per-segment across/along
+  // pair -- and six other emissions (junction pads, end caps, both arc fans) pass a
+  // 6-field aggregate initializer to a 7-member struct, so their metricUV
+  // value-initialized to (0,0). With metricUV constant across a polygon its screen
+  // derivative is zero, so every fragment there sampled LOD 0 of ONE texel: a flat,
+  // untextured, uniformly lit polygon with hard straight edges sitting on the
+  // junction. Stamping from the position here fixes all of them at once, and cannot
+  // be regressed by a future emission forgetting the field.
+  stampMetricUV();
+
   m_indexCount = (int)m_indices.size();
   std::cout << "[RoadMeshBuilder] Generated " << m_vertices.size()
             << " vertices, " << (m_indexCount / 3) << " triangles (" << capCount
@@ -3972,6 +3985,16 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
             << " crossing pads, " << bareSamples << " bare merge samples, "
             << (m_shoulderQuads / 4) << " verge quads)"
             << std::endl;
+}
+
+// MetricUV is the world XZ position: street.frag samples the road surface and its
+// normal map as texture(..., MetricUV / roadSurfaceScale), which only reads as a
+// continuous material if the coordinate is world-space and shared by every vertex.
+// Deriving it from the position rather than carrying it through each emitter makes
+// that guarantee structural.
+void RoadMeshBuilder::stampMetricUV() {
+  for (RoadVertex &v : m_vertices)
+    v.metricUV = glm::vec2(v.position.x, v.position.z);
 }
 
 void RoadMeshBuilder::upload() {

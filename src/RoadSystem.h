@@ -387,6 +387,12 @@ public:
     const std::vector<uint32_t>& debugIndices() const { return m_indices; }
 
 private:
+    // Stamps metricUV = (world X, world Z) on every vertex. MetricUV is exactly the
+    // world XZ position -- the surface texture is sampled as MetricUV / scale and is
+    // isotropic in world space -- so deriving it from the position guarantees the
+    // whole mesh shares one continuous parameterization. See the call site for why
+    // this is done as a sweep rather than per vertex emission.
+    void stampMetricUV();
     std::vector<RoadVertex>  m_vertices;
     std::vector<uint32_t>    m_indices;
     std::vector<RoadJoinShaderStroke> m_joinShaderStrokes;
