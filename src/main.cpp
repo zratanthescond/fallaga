@@ -234,6 +234,21 @@ int main() {
                     game->car->setPosition(Vec3(cx, cy, cz));
                 }
             }
+            // Editor state, so panels and brushes can be inspected without clicking
+            // the tabs. FALLAGA_EDITOR_MODE selects the tab (1=Objects 2=Sculpt
+            // 3=Paint 4=Water 5=Roads) and FALLAGA_BRUSH the tool within it.
+            if (const char* edEnv = std::getenv("FALLAGA_EDITOR_MODE")) {
+                const int m = atoi(edEnv);
+                if (m >= 0 && m < 6) {
+                    game->activeEditorMode = m;
+                    game->editMode = (m != 0);
+                    game->editorBrushMode = (m == 2) ? 1 : (m == 3) ? 8 : 0;
+                }
+            }
+            if (const char* brEnv = std::getenv("FALLAGA_BRUSH")) {
+                const int b = atoi(brEnv);
+                if (b >= 0 && b <= 10) game->editorBrushMode = b;
+            }
             posOverridden = true;
         }
 

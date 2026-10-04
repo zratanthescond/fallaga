@@ -297,11 +297,15 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         }
                     } 
                     else if (activeEditorMode == 2) {
-                        // Sculpt Mode: Tool selection
-                        for (int i = 0; i < 6; ++i) { // includes road-bed conform
-                            float btnY = lpY + 45 + i * 22;
-                            if (leftMouseClicked && mouseY >= btnY && mouseY <= btnY + 20) {
-                                editorBrushMode = 1 + i; // sculpt brush ids 1-6
+                        // Sculpt Mode: tool selection. The loop used to stop at 6, so
+                        // the seventh tool was drawn but could never be clicked, and
+                        // the rows are now kToolRowH tall so they match the drawing.
+                        for (int i = 0; i < SculptPanel::kToolCount; ++i) {
+                            const float btnY = lpY + SculptPanel::kToolsTop +
+                                               i * SculptPanel::kToolRowH;
+                            if (leftMouseClicked && mouseY >= btnY &&
+                                mouseY <= btnY + SculptPanel::kToolRowH - 4) {
+                                editorBrushMode = 1 + i; // sculpt brush ids 1-7
                                 std::cout << "[Editor UI] Sculpt tool: " << editorBrushMode << "\n";
                             }
                         }
@@ -309,7 +313,25 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         GameEditorUtils::updateBrushSliders(mouseX, mouseY, lpX, lpY, lpW,
                             brushRadius, brushStrength, true, &sculptAngleDegrees, &sculptGradeDegrees);
 
-                        if (leftMouseClicked && mouseY >= lpY + 350 && mouseY <= lpY + 370 && mouseX >= lpX + 15 && mouseX <= lpX + lpW - 15) {
+                        // Detail level buttons for the Add Geometry tool.
+                        {
+                            const float dy = lpY + SculptPanel::kDetailTop;
+                            for (int lv = 1; lv <= 2; ++lv) {
+                                const float bx2 = lpX + 15 + (lv - 1) * 80;
+                                if (leftMouseClicked && mouseY >= dy + SculptPanel::kDetailBtnY &&
+                                    mouseY <= dy + SculptPanel::kDetailBtnY + SculptPanel::kDetailBtnH - 4 &&
+                                    mouseX >= bx2 && mouseX <= bx2 + 72) {
+                                    addGeomLevel = lv;
+                                    std::cout << "[Editor UI] Add Geometry detail: L" << lv
+                                              << " (" << (1 << lv) << " sub-cells per cell)\n";
+                                }
+                            }
+                        }
+
+                        const float globalBtnY = lpY + SculptPanel::kGlobalTop + 10.0f;
+                        if (leftMouseClicked && mouseY >= globalBtnY &&
+                            mouseY <= globalBtnY + 24 && mouseX >= lpX + 15 &&
+                            mouseX <= lpX + lpW - 15) {
                             std::cout << "[Editor UI] Triggering Global Hydraulic Erosion Pass...\n";
                             terrain->terrainManager->erodeGlobal();
                             waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f, waterLevelAdjust);
@@ -2254,76 +2276,108 @@ void Game::render() {
             drawStr(lpX + 210, pageY + 14, "Page " + std::to_string(assetPage + 1) + "/" + std::to_string(totalPages), 0.6f, 0.6f, 0.6f);
         }
         else if (activeEditorMode == 2) {
-            drawStr(lpX + 15, lpY + 19, "TERRAIN SCULPTING", 0.9f, 0.5f, 0.1f);
-            
-            drawStr(lpX + 15, lpY + 40, "ACTIVE SCULPT TOOL", 0.9f, 0.5f, 0.1f);
-            std::string toolNames[] = { "Raise Terrain (LMB)", "Lower Terrain (LMB)", "Smooth Terrain (LMB)", "Erode Terrain (LMB)", "Angle Slope (LMB)", "Fit To Curved Road Mesh (LMB)", "Add Geometry + Smooth (LMB)" };
-            for (int i = 0; i < 7; ++i) {
-                float btnY = lpY + 45 + i * 22;
-                bool isCurrent = (editorBrushMode == 1 + i);
-                if (isCurrent) {
-                    drawRect(lpX + 8, btnY - 2, lpW - 16, 20, 0.89f, 0.36f, 0.13f, 0.9f);
-                    drawStr(lpX + 18, btnY + 12, toolNames[i], 1.0f, 1.0f, 1.0f);
-                } else {
-                    drawRect(lpX + 8, btnY - 2, lpW - 16, 20, 0.16f, 0.16f, 0.16f, 0.6f);
-                    drawStr(lpX + 18, btnY + 12, toolNames[i], 0.7f, 0.7f, 0.7f);
+            // Layout constants live in SculptPanel (GameEditorUtils.h) so this drawing
+            // and the click handling in the mouse callback cannot drift apart.
+            drawStr(lpX + 15, lpY + SculptPanel::kTitleY, "TERRAIN SCULPTING", 0.9f, 0.5f, 0.1f);
+            drawStr(lpX + 15, lpY + SculptPanel::kToolsLabelY, "TOOL  (also cycle with B)", 0.9f, 0.5f, 0.1f);
+
+            struct ToolEntry { const char* name; const char* hint; };
+            static const ToolEntry kTools[SculptPanel::kToolCount] = {
+                {"1  Raise Terrain",        "drag to push ground up"},
+                {"2  Lower Terrain",        "drag to push ground down"},
+                {"3  Smooth Terrain",       "softens bumps on the base grid"},
+                {"4  Erode Terrain",        "hydraulic erosion, adds gullies"},
+                {"5  Angle Slope",          "Direction + Grade set the slope"},
+                {"6  Fit To Curved Road",   "re-grades ground under the road mesh"},
+                {"7  Add Geometry + Smooth","subdivides, then smooths the new vertices"},
+            };
+            for (int i = 0; i < SculptPanel::kToolCount; ++i) {
+                const float btnY = lpY + SculptPanel::kToolsTop + i * SculptPanel::kToolRowH;
+                const bool isCurrent = (editorBrushMode == 1 + i);
+                drawRect(lpX + 8, btnY, lpW - 16, SculptPanel::kToolRowH - 4,
+                         isCurrent ? 0.89f : 0.16f, isCurrent ? 0.36f : 0.16f,
+                         isCurrent ? 0.13f : 0.16f, isCurrent ? 0.9f : 0.6f);
+                drawRectOutline(lpX + 8, btnY, lpW - 16, SculptPanel::kToolRowH - 4, 0.25f, 0.25f, 0.25f);
+                drawStr(lpX + 16, btnY + 12, kTools[i].name,
+                        isCurrent ? 1.0f : 0.72f, isCurrent ? 1.0f : 0.72f,
+                        isCurrent ? 1.0f : 0.72f);
+                drawStr(lpX + 16, btnY + 21, kTools[i].hint, 0.62f, 0.62f, 0.62f);
+            }
+
+            // ── Brush configuration ──────────────────────────────────────────
+            drawStr(lpX + 15, lpY + SculptPanel::kSliderLabelY, "BRUSH CONFIGURATION", 0.9f, 0.5f, 0.1f);
+
+            struct SliderSpec { const char* name; float value; float lo; float hi;
+                                const char* unit; const char* help; };
+            const SliderSpec sliders[4] = {
+                {"Radius",    brushRadius,        GameEditorUtils::BrushConfig::RADIUS_MIN,   GameEditorUtils::BrushConfig::RADIUS_MAX,   "m",   "footprint of the brush"},
+                {"Strength",  brushStrength,      GameEditorUtils::BrushConfig::STRENGTH_MIN, GameEditorUtils::BrushConfig::STRENGTH_MAX, "",    "how hard it applies per frame"},
+                {"Direction", sculptAngleDegrees, 0.0f,                     360.0f,                    "deg", "Angle Slope only"},
+                {"Grade",     sculptGradeDegrees, 0.0f,                     60.0f,                     "deg", "Angle Slope only"},
+            };
+            for (int i = 0; i < 4; ++i) {
+                const float capY = lpY + SculptPanel::kSliderTop + i * SculptPanel::kSliderPitch;
+                const float trackY = capY + 6.0f;
+                const SliderSpec& s = sliders[i];
+                char buf[128];
+                std::snprintf(buf, sizeof(buf), "%s: %.0f%s   (%.0f-%.0f)   %s",
+                              s.name, s.value, s.unit, s.lo, s.hi, s.help);
+                drawStr(lpX + 15, capY, buf, 0.82f, 0.82f, 0.82f);
+                drawRect(lpX + 15, trackY, lpW - 30, SculptPanel::kSliderTrackH, 0.06f, 0.06f, 0.06f, 1.0f);
+                drawRectOutline(lpX + 15, trackY, lpW - 30, SculptPanel::kSliderTrackH, 0.2f, 0.2f, 0.2f);
+                const float norm = glm::clamp((s.value - s.lo) / (s.hi - s.lo), 0.0f, 1.0f);
+                drawRect(lpX + 15 + norm * (lpW - 40), trackY - 3, 10, SculptPanel::kSliderTrackH + 6,
+                         0.89f, 0.36f, 0.13f, 1.0f);
+            }
+
+            // ── Detail (Add Geometry only) ───────────────────────────────────
+            {
+                const float dy = lpY + SculptPanel::kDetailTop;
+                const bool applies = (editorBrushMode == 7);
+                drawStr(lpX + 15, dy, applies
+                        ? "DETAIL: added geometry per cell"
+                        : "DETAIL (tool 7 only)", 0.82f, 0.82f, 0.82f);
+                drawStr(lpX + 15, dy + SculptPanel::kDetailHelpY, "L1 = 4 sub-cells (11 m)   L2 = 16 (5.5 m)",
+                        0.62f, 0.62f, 0.62f);
+                for (int lv = 1; lv <= 2; ++lv) {
+                    const bool on = (addGeomLevel == lv);
+                    const float bx2 = lpX + 15 + (lv - 1) * 80;
+                    drawRect(bx2, dy + SculptPanel::kDetailBtnY, 72, SculptPanel::kDetailBtnH - 4,
+                             on ? 0.89f : 0.16f, on ? 0.36f : 0.16f, on ? 0.13f : 0.16f,
+                             on ? 0.95f : 0.6f);
+                    drawRectOutline(bx2, dy + SculptPanel::kDetailBtnY, 72, SculptPanel::kDetailBtnH - 4, 0.25f, 0.25f, 0.25f);
+                    char lbuf[32];
+                    std::snprintf(lbuf, sizeof(lbuf), "L%d  x%d", lv, 1 << lv);
+                    drawStr(bx2 + 18, dy + SculptPanel::kDetailBtnY + 13, lbuf, on ? 1.0f : 0.7f, on ? 1.0f : 0.7f,
+                            on ? 1.0f : 0.7f);
                 }
-                drawRectOutline(lpX + 8, btnY - 2, lpW - 16, 20, 0.25f, 0.25f, 0.25f);
             }
 
-            // Brush Settings Sliders
-            float sliderStartY = lpY + 180;
-            drawStr(lpX + 15, sliderStartY + 10, "BRUSH CONFIGURATION", 0.9f, 0.5f, 0.1f);
-            
-            float rNorm = glm::clamp((brushRadius - 5.0f) / 195.0f, 0.0f, 1.0f);
-            drawStr(lpX + 15, sliderStartY + 30, "Radius: " + std::to_string((int)brushRadius) + "m", 0.8f, 0.8f, 0.8f);
-            drawRect(lpX + 15, sliderStartY + 35, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
-            drawRectOutline(lpX + 15, sliderStartY + 35, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
-            drawRect(lpX + 15 + rNorm * (lpW - 40), sliderStartY + 32, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
-
-            float sNorm = glm::clamp((brushStrength - 0.5f) / 49.5f, 0.0f, 1.0f);
-            drawStr(lpX + 15, sliderStartY + 62, "Strength: " + std::to_string((int)brushStrength), 0.8f, 0.8f, 0.8f);
-            drawRect(lpX + 15, sliderStartY + 67, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
-            drawRectOutline(lpX + 15, sliderStartY + 67, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
-            drawRect(lpX + 15 + sNorm * (lpW - 40), sliderStartY + 64, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
-
-            float aNorm = glm::clamp(sculptAngleDegrees / 360.0f, 0.0f, 1.0f);
-            drawStr(lpX + 15, sliderStartY + 94, "Direction: " + std::to_string((int)sculptAngleDegrees) + " deg", 0.8f, 0.8f, 0.8f);
-            drawRect(lpX + 15, sliderStartY + 99, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
-            drawRectOutline(lpX + 15, sliderStartY + 99, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
-            drawRect(lpX + 15 + aNorm * (lpW - 40), sliderStartY + 96, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
-
-            float gNorm = glm::clamp(sculptGradeDegrees / 60.0f, 0.0f, 1.0f);
-            drawStr(lpX + 15, sliderStartY + 126, "Grade: " + std::to_string((int)sculptGradeDegrees) + " deg", 0.8f, 0.8f, 0.8f);
-            drawRect(lpX + 15, sliderStartY + 131, lpW - 30, 10, 0.06f, 0.06f, 0.06f, 1.0f);
-            drawRectOutline(lpX + 15, sliderStartY + 131, lpW - 30, 10, 0.2f, 0.2f, 0.2f);
-            drawRect(lpX + 15 + gNorm * (lpW - 40), sliderStartY + 128, 10, 16, 0.89f, 0.36f, 0.13f, 1.0f);
-
-            // Subdivision detail for the Add Geometry brush. Level 1 makes each 22 m
-            // cell four, level 2 makes it sixteen.
-            drawStr(lpX + 15, sliderStartY + 145, "Detail: " + std::to_string(addGeomLevel) +
-                    "x" + std::to_string(1 << addGeomLevel) + " per cell"
-                    + (terrain->terrainManager && terrain->terrainManager->hasAddedGeometry()
-                           ? " (added geometry present)" : ""),
-                    0.8f, 0.8f, 0.8f);
-            for (int lv = 1; lv <= 2; ++lv) {
-                const bool on = (addGeomLevel == lv);
-                drawRect(lpX + 15 + (lv - 1) * 45, sliderStartY + 149, 40, 14,
-                         on ? 0.89f : 0.16f, on ? 0.36f : 0.16f, on ? 0.13f : 0.16f,
-                         on ? 0.9f : 0.6f);
-                drawStr(lpX + 26 + (lv - 1) * 45, sliderStartY + 160,
-                        "L" + std::to_string(lv), 0.75f, 0.75f, 0.75f);
+            // ── Global actions ───────────────────────────────────────────────
+            {
+                const float gy = lpY + SculptPanel::kGlobalTop;
+                drawStr(lpX + 15, gy, "GLOBAL ACTIONS", 0.9f, 0.5f, 0.1f);
+                drawRect(lpX + 15, gy + 10, lpW - 30, 24, 0.89f, 0.36f, 0.13f, 1.0f);
+                drawRectOutline(lpX + 15, gy + 10, lpW - 30, 24, 0.25f, 0.25f, 0.25f);
+                drawStr(lpX + 27, gy + 26, "Run Global Erosion Pass (whole map)",
+                        1.0f, 1.0f, 1.0f);
             }
-            drawRectOutline(lpX + 15, sliderStartY + 149, 85, 14, 0.25f, 0.25f, 0.25f);
 
-            // Global Actions Section
-            float globalStartY = sliderStartY + 170;
-            drawStr(lpX + 15, globalStartY + 10, "GLOBAL ACTIONS", 0.9f, 0.5f, 0.1f);
-            
-            // Button - highlight on hover could be cool, but standard UE orange button is great!
-            drawRect(lpX + 15, globalStartY + 20, lpW - 30, 20, 0.89f, 0.36f, 0.13f, 1.0f);
-            drawStr(lpX + 35, globalStartY + 34, "Run Global Erosion Pass", 1.0f, 1.0f, 1.0f);
-            drawRectOutline(lpX + 15, globalStartY + 20, lpW - 30, 20, 0.25f, 0.25f, 0.25f);
+            // ── Status readout, so it is visible whether anything has happened ──
+            {
+                const float sy = lpY + SculptPanel::kGlobalTop + 46.0f;
+                const bool added = terrain->terrainManager &&
+                                   terrain->terrainManager->hasAddedGeometry();
+                drawStr(lpX + 15, sy, "STATUS", 0.9f, 0.5f, 0.1f);
+                drawStr(lpX + 15, sy + 14,
+                        std::string("Added geometry: ") + (added ? "YES" : "none yet"),
+                        added ? 0.5f : 0.68f, added ? 0.9f : 0.68f, added ? 0.5f : 0.68f);
+                drawStr(lpX + 15, sy + 26,
+                        "LMB in the viewport applies the tool.", 0.62f, 0.62f, 0.62f);
+                drawStr(lpX + 15, sy + 38,
+                        "Tool 7 works best where the ground is already bumpy.",
+                        0.62f, 0.62f, 0.62f);
+            }
         }
         else if (activeEditorMode == 3) {
             drawStr(lpX + 15, lpY + 19, "TERRAIN PAINTING", 0.9f, 0.5f, 0.1f);
@@ -2441,9 +2495,19 @@ void Game::render() {
                 drawStr(lpX + 15, lpY + 158, "HOLD + DRAG = draw a continuous line", 0.72f, 0.72f, 0.72f);
                 drawStr(lpX + 15, lpY + 172, "Enter/OK = commit, Esc/X = cancel, DEL PT = undo", 0.72f, 0.72f, 0.72f);
             } else if (roadToolMode != 3) {
-                drawStr(lpX + 15, lpY + 131, "TIP", 0.9f, 0.5f, 0.1f);
-                drawStr(lpX + 15, lpY + 145, "Press 4 to move/scale the projected map", 0.6f, 0.85f, 0.6f);
-                drawStr(lpX + 15, lpY + 159, "Tab hides panels   R cycles PiP", 0.6f, 0.6f, 0.6f);
+                // Measured text metrics, since every overlap in this panel came from
+                // getting them wrong: drawStr's y is a BASELINE and GLUT_BITMAP_
+                // HELVETICA_12 glyphs occupy roughly [y-9, y]. Verified against the
+                // save button (baseline saveBtnY+17 inside a button spanning
+                // saveBtnY..saveBtnY+26). So consecutive lines need >= 14 px, and a
+                // heading needs a further gap above its body.
+                //
+                // The four tool buttons span lpY+43 .. lpY+123.
+                const float tipY = lpY + 45 + 4 * 26 + 18;   // 209: clear of the buttons
+                drawStr(lpX + 15, tipY, "TIP", 0.9f, 0.5f, 0.1f);
+                drawStr(lpX + 15, tipY + 18, "Press 4 to move/scale the projected map", 0.6f, 0.85f, 0.6f);
+                drawStr(lpX + 15, tipY + 34, "Tab hides panels   R cycles PiP", 0.6f, 0.6f, 0.6f);
+                // Last TIP line occupies [tipY+25, tipY+34] = [234, 243].
             }
 
             RoadGraph* rg = terrain->getRoadGraph();
@@ -2723,10 +2787,13 @@ if (projSaveFlash > 0.0f) {
                                 0.9f, 0.9f, 0.8f);
                     }
                 } else {
-                    drawStr(lpX + 15, lpY + 210, "None - click near a road (tool 1)", 0.6f, 0.6f, 0.6f);
-                    drawStr(lpX + 15, lpY + 226, "Width +/- and delete buttons appear", 0.55f, 0.55f, 0.55f);
-                    drawStr(lpX + 15, lpY + 240, "once a road is selected in the viewport", 0.55f, 0.55f, 0.55f);
-                    drawStr(lpX + 15, lpY + 254, "also a per-road corner radius slider", 0.55f, 0.55f, 0.55f);
+                    // Below the TIP block: its last line's glyphs end at lpY+243, so
+                    // this starts at +272 to leave a clear gap under the heading.
+                    const float infoY = lpY + 45 + 4 * 26 + 81;
+                    drawStr(lpX + 15, infoY, "None - click near a road (tool 1)", 0.6f, 0.6f, 0.6f);
+                    drawStr(lpX + 15, infoY + 16, "Width +/- and delete buttons appear", 0.55f, 0.55f, 0.55f);
+                    drawStr(lpX + 15, infoY + 30, "once a road is selected in the viewport", 0.55f, 0.55f, 0.55f);
+                    drawStr(lpX + 15, infoY + 44, "also a per-road corner radius slider", 0.55f, 0.55f, 0.55f);
                 }
             }
         }
