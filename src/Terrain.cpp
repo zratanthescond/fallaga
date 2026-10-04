@@ -638,8 +638,20 @@ Terrain::Terrain() {
   // street.frag falls back to its procedural asphalt.
   roadSurfaceTex = TextureEngine::Instance().loadTexture(
       "assets/terrain/tarred_gravel_2k/textures/tarred_gravel_diff_2k.jpg", true);
+  // Normal map stays LINEAR: normals are data, not colour, so it must not go
+  // through the sRGB decode. The _gl variant is the OpenGL green-channel convention.
+  roadNormalTex = TextureEngine::Instance().loadTexture(
+      "assets/terrain/tarred_gravel_2k/textures/tarred_gravel_nor_gl_2k.exr", false);
+  if (roadNormalTex == 0) {
+    // stb_image cannot read EXR; fall back to the PNG (dx convention, green flipped
+    // in the shader would be needed -- acceptable, the relief direction is subtle on
+    // a road surface).
+    roadNormalTex = TextureEngine::Instance().loadTexture(
+        "assets/terrain/tarred_gravel_2k/textures/tarred_gravel_nor_dx_2k.png", false);
+  }
   std::cout << "[Terrain] Road surface texture: "
             << (roadSurfaceTex ? "tarred gravel" : "MISSING - procedural fallback")
+            << ", normal map: " << (roadNormalTex ? "yes" : "no")
             << std::endl;
 
   // Initialize dynamic waterMapTex (256x256 single-channel floating-point texture)
@@ -1257,6 +1269,21 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         }();
         streetShader->setFloat("roadSurfaceGain", roadGain);
         streetShader->setVec3("roadSurfaceTint", roadTint);
+        // Gravel relief, on the next unit up. Strength is overridable so the relief
+        // can be turned down if it reads as noise at driving height.
+        glActiveTexture(GL_TEXTURE15);
+        glBindTexture(GL_TEXTURE_2D, roadNormalTex);
+        streetShader->setInt("roadNormalTex", 15);
+        streetShader->setInt("roadNormalValid",
+                             (roadNormalTex != 0 && !noRoadTex) ? 1 : 0);
+        static const float roadNormalStrength = [] {
+          if (const char* e = std::getenv("FALLAGA_ROAD_NORMAL")) {
+            const float v = std::strtof(e, nullptr);
+            if (v >= 0.0f) return v;
+          }
+          return 0.85f;
+        }();
+        streetShader->setFloat("roadNormalStrength", roadNormalStrength);
         const bool dbg = roadDebugView();
         if (dbg) { streetShader->setInt("u_debugUV", 1); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); }
         if (roadEdgeOnlyView()) streetShader->setInt("u_debugEdges", 1);

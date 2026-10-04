@@ -22,6 +22,11 @@ uniform float roadSurfaceScale; // metres per texture repeat
 // (linear ~0.15); the tint keeps it from reading as flat grey.
 uniform float roadSurfaceGain;
 uniform vec3  roadSurfaceTint;
+// Gravel relief. Sampled with the same metric UV as the colour, so the stones stay
+// in step with the aggregate. OpenGL-convention map (green = +Y).
+uniform sampler2D roadNormalTex;
+uniform int   roadNormalValid;
+uniform float roadNormalStrength;
 
 uniform int u_debugUV;   // FALLAGA_DEBUGVIEW: 1 = checker grid on the UVs
 uniform int u_debugEdges; // FALLAGA_EDGEONLY: 1 = road edges only, no surface
@@ -294,6 +299,20 @@ void main() {
 
     // ---- lighting ---------------------------------------------------------
     vec3 N = normalize(Normal);
+    // Gravel relief. MetricUV is metres across/along the road, which is world XZ, so
+    // the tangent frame is just that basis flattened and orthonormalised against the
+    // vertex normal -- no tangent attribute needed. Degenerate only if the normal is
+    // exactly world-up, which the cross with (1,0,0) below cannot produce.
+    if (roadNormalValid != 0) {
+        vec2 uvN = MetricUV / roadSurfaceScale;
+        vec3 nm = texture(roadNormalTex, uvN).xyz * 2.0 - 1.0;
+        vec3 T = normalize(vec3(1.0, 0.0, 0.0) - N * N.x);
+        vec3 B = cross(N, T);
+        vec3 perturbed = normalize(T * nm.x * roadNormalStrength +
+                                   B * nm.y * roadNormalStrength +
+                                   N * max(nm.z, 0.05));
+        N = normalize(mix(N, perturbed, 0.85));
+    }
     vec3 L = normalize(lightDir);
     float NdotL = max(dot(N, L), 0.0);
     vec3 V = normalize(viewPos - FragPos);

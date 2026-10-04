@@ -202,6 +202,8 @@ private:
     // street shader samples it with the metric UV so the aggregate keeps a constant
     // physical size. 0 falls back to the procedural asphalt in street.frag.
     unsigned int roadSurfaceTex  = 0;
+    // Matching normal map, OpenGL convention, linear (normals are data not colour).
+    unsigned int roadNormalTex   = 0;
 
 
     // Wall geometry
