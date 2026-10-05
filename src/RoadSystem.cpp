@@ -1,5 +1,6 @@
 #include "RoadSystem.h"
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <climits>
 #include <cmath>
@@ -22,6 +23,10 @@ namespace {
 // tracking the bed (below): meanGap 0.196 -> 0.082 m, worst gap 9.75 -> 1.39 m,
 // 7185 -> 14 vertices more than 0.5 m off.
 constexpr float kRoadBedFlatReach = 34.0f;
+// How far back from a junction the shared arm height is blended into each road's own
+// profile, in metres. Long enough to be a gentle approach rather than a kink at the
+// mouth; short enough that it does not reshape a road.
+constexpr float kJunctionHeightBlend = 18.0f;
 
 // How much of its own ground height the ribbon adopts across its width.
 //
@@ -1832,6 +1837,115 @@ void RoadMeshBuilder::destroy() {
   m_indices.clear();
 }
 
+// Pull the ends of every road in a junction cluster to one shared height, blending back
+// to the road's own profile over a short distance.
+//
+// Why: the ribbon takes each endpoint's height from the terrain under that endpoint, and
+// junction pads, gap-splice joints and caps each compute their height independently. Two
+// roads meeting at a junction therefore arrive at whatever height the ground happens to
+// be at each of their ends. Measured on the shipped network the spread reaches 90.5 mm at
+// the 4-way junction, which is well beyond the 35 mm Z_BIAS and so shows as a step or a
+// patch at the join.
+//
+// The shared height is the HIGHEST end in the cluster rather than the mean. Nothing may
+// be lowered: the ribbon keeps a minimum clearance over the drawn terrain, so an arm
+// pulled below its neighbour would leave that neighbour's asphalt proud, and the clamp
+// would push it back up anyway. Taking the maximum makes every arm meet the highest one,
+// which is also the direction the clamp already moves.
+//
+// Road positions are untouched -- only Y is adjusted, and only within `blend` metres of
+// the shared endpoint -- so the authored layout, widths and topology are unchanged.
+void unifyJunctionHeights(std::vector<RoadSegment> &segments, float tolerance,
+                          float blend) {
+  struct End {
+    int seg;
+    bool back;
+  };
+  std::vector<End> ends;
+  for (int s = 0; s < (int)segments.size(); ++s) {
+    if (segments[s].splinePoints.size() < 2)
+      continue;
+    ends.push_back({s, false});
+    ends.push_back({s, true});
+  }
+  if (ends.empty())
+    return;
+
+  auto posOf = [&](const End &e) -> const glm::vec3 & {
+    return e.back ? segments[e.seg].splinePoints.back()
+                  : segments[e.seg].splinePoints.front();
+  };
+
+  // Cluster by proximity, the same rule the topology and the mesh already use.
+  std::vector<int> parent(ends.size());
+  for (size_t i = 0; i < parent.size(); ++i)
+    parent[i] = (int)i;
+  std::function<int(int)> find = [&](int a) {
+    while (parent[a] != a) {
+      parent[a] = parent[parent[a]];
+      a = parent[a];
+    }
+    return a;
+  };
+  for (size_t i = 0; i < ends.size(); ++i)
+    for (size_t j = i + 1; j < ends.size(); ++j) {
+      const glm::vec3 &a = posOf(ends[i]);
+      const glm::vec3 &b = posOf(ends[j]);
+      const float d = std::sqrt((a.x - b.x) * (a.x - b.x) + (a.z - b.z) * (a.z - b.z));
+      if (d <= tolerance)
+        parent[find((int)i)] = find((int)j);
+    }
+
+  // One shared height per multi-arm cluster.
+  std::vector<float> shared(ends.size(), 0.0f);
+  std::vector<char> hasShared(ends.size(), 0);
+  for (size_t i = 0; i < ends.size(); ++i) {
+    if (find((int)i) != (int)i)
+      continue;
+    float hi = -1e30f;
+    int members = 0;
+    for (size_t j = 0; j < ends.size(); ++j) {
+      if (find((int)j) != (int)i)
+        continue;
+      hi = std::max(hi, posOf(ends[j]).y);
+      ++members;
+    }
+    if (members < 2)
+      continue; // a dead end has nothing to reconcile
+    for (size_t j = 0; j < ends.size(); ++j)
+      if (find((int)j) == (int)i) {
+        shared[j] = hi;
+        hasShared[j] = 1;
+      }
+  }
+
+  // Apply, blending to the road's own profile so no kink is introduced.
+  for (size_t i = 0; i < ends.size(); ++i) {
+    if (!hasShared[i])
+      continue;
+    std::vector<glm::vec3> &pts = segments[ends[i].seg].splinePoints;
+    const int n = (int)pts.size();
+    const float delta = shared[i] - (ends[i].back ? pts.back().y : pts.front().y);
+    if (std::fabs(delta) < 1e-6f)
+      continue;
+    // Metres from this end to point k, using the segment's own cumulative distances
+    // when they are available (they are, after RoadSpline::evaluate), so the blend
+    // length is a real distance rather than a point count.
+    const std::vector<float> &cum = segments[ends[i].seg].cumulativeDist;
+    const bool haveCum = cum.size() == (size_t)n && n > 1;
+    const float endDist = ends[i].back ? (haveCum ? cum[n - 1] : 0.0f) : 0.0f;
+    for (int k = 0; k < n; ++k) {
+      const int idx = ends[i].back ? n - 1 - k : k;
+      const float metres = haveCum ? std::fabs(cum[idx] - endDist) : (float)k;
+      if (metres >= blend)
+        break;
+      const float w = 1.0f - metres / blend;           // 1 at the end, 0 at `blend`
+      const float smooth = w * w * (3.0f - 2.0f * w);  // smoothstep, no kink
+      pts[idx].y += delta * smooth;
+    }
+  }
+}
+
 void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
                             const HeightSampler &sampler,
                             const RoadDeformer *deformer, float snapMargin,
@@ -1841,6 +1955,12 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   m_joinShaderStrokes.clear();
   m_joinShaderContacts.clear();
   m_shoulderQuads = 0;
+
+  // Bring every junction's arms to one height before anything is emitted, so the ribbon,
+  // the caps, the pads and the joint bridges all read the same value. This only adjusts
+  // Y, within kJunctionHeightBlend metres of a shared endpoint; the authored layout is
+  // untouched.
+  unifyJunctionHeights(segments, kRoadJunctionTolerance, kJunctionHeightBlend);
 
   // Roads share a height at crossings, so their fragments can have identical
   // depth. With GL_LEQUAL the later ribbon owns those pixels. Draw

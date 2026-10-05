@@ -144,4 +144,11 @@ if(BUILD_TESTING)
     target_link_libraries(road_surface_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
     add_test(NAME road_surface_test COMMAND road_surface_test
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Junction invariant: the arms at a junction must arrive at the same height.
+    add_executable(road_junction_test road_junction_test.cpp)
+    target_include_directories(road_junction_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GLEW_INCLUDE_DIRS})
+    target_link_libraries(road_junction_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
+    add_test(NAME road_junction_test COMMAND road_junction_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
