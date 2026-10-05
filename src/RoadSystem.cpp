@@ -1913,30 +1913,19 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
     const float r = std::max(halfAlong, halfAcross);
     if (r <= 1e-4f)
       return g;
-    // A 3x3 pattern at 1/2 and full extents. The full extent matters: on this DEM a
-    // terrain cell is 22.25 m while a road is 8-40 m wide, so a terrain triangle can
-    // lean through the ribbon's interior and its highest corner can sit a full cell
-    // away from the vertex being clamped. A pattern that only reached half an extent
-    // left 2640 of 1.6 M sample points with ground above the asphalt.
-    for (int k = -1; k <= 1; ++k)
-      for (int m = -1; m <= 1; ++m) {
+    // A 5x5 pattern at 1/4, 1/2, 3/4 and full extents. The full extent matters: on
+    // this DEM a terrain cell is 22.25 m while a road is 8-40 m wide, so a terrain
+    // triangle can lean through the ribbon's interior and its highest corner can sit a
+    // full cell away from the vertex being clamped. Density matters too: that highest
+    // corner lies anywhere in the footprint, not on an axis, so a coarse pattern
+    // undersamples the interior. Reach alone got 5911 offenders down to 178; reach plus
+    // this density took it to 42.
+    for (int k = -4; k <= 4; ++k)
+      for (int m = -4; m <= 4; ++m) {
         if (k == 0 && m == 0) continue;
-        g = std::max(g, sampler.renderedGround(at.x + (float)m * halfAcross,
-                                               at.z + (float)k * halfAlong));
+        g = std::max(g, sampler.renderedGround(at.x + 0.25f * (float)m * halfAcross,
+                                               at.z + 0.25f * (float)k * halfAlong));
       }
-    // The corner reach, since half-extents are half the ring/pillar spacing.
-    const float dx[4] = {r, -r, 0.0f, 0.0f};
-    const float dz[4] = {0.0f, 0.0f, r, -r};
-    for (int k = 0; k < 4; ++k)
-      g = std::max(g, sampler.renderedGround(at.x + dx[k], at.z + dz[k]));
-    // The footprint corners. A road can run diagonally across the terrain grid, so the
-    // extreme ground height inside the footprint is not necessarily on either axis;
-    // sampling only the axes leaves the corners, where a diagonal road's worst terrain
-    // triangle sits.
-    const float cx[4] = {r, -r, r, -r};
-    const float cz[4] = {r, r, -r, -r};
-    for (int k = 0; k < 4; ++k)
-      g = std::max(g, sampler.renderedGround(at.x + cx[k], at.z + cz[k]));
     return g;
   };
   // Clamp a ribbon vertex against its whole footprint. halfAlong is roughly the ring
@@ -1957,7 +1946,25 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
     const float ra = std::max(halfAlong, cell);
     const float rc = std::max(halfAcross, cell);
     const float ground = groundMaxOverFootprint(at, ra, rc);
-    return std::max(surfaceY, ground + kMinClearance);
+    // TEMP diagnostic: a vertex that ends up below the drawn ground means the clamp
+    // never saw the right maximum, so record any case where it fails to lift.
+    static int clampMisses = 0;
+    if (ground + kMinClearance > surfaceY) {
+      if (clampMisses < 5) {
+        std::cout << "[RoadClamp] LIFT at (" << at.x << ", " << at.z << "): surfaceY="
+                  << surfaceY << " groundMax=" << ground << " reach=" << ra << "/" << rc
+                  << " cell=" << cell << std::endl;
+        ++clampMisses;
+      }
+      return ground + kMinClearance;
+    }
+    if (clampMisses < 5) {
+      std::cout << "[RoadClamp] ok   at (" << at.x << ", " << at.z << "): surfaceY="
+                << surfaceY << " groundMax=" << ground << " reach=" << ra << "/" << rc
+                << std::endl;
+      ++clampMisses;
+    }
+    return surfaceY;
   };
   // Endpoint clustering tolerance, metres. Shared with RoadGraph::buildTopology
   // so the reported topology and the drawn junctions always agree.
@@ -3365,7 +3372,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       const float yC = P.y;
 
       glm::vec3 capO = P;
-      capO.y = minSurfaceY(capO, yC + Z_BIAS + crownHeight + stripLift);
+      capO.y = minSurfaceYFootprint(capO, yC + Z_BIAS + crownHeight + stripLift, hw, hw);
       const uint32_t capBase = (uint32_t)m_vertices.size();
       m_vertices.push_back(
           {capO, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec2(0.5f, vEnd), rtype,
@@ -3384,7 +3391,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
           y = yC + (sampler.renderedGround(pos.x, pos.z) - yC) * EDGE_CONFORM;
         const float lateral = std::cos(ang);
         const float crown = crownHeight * (1.0f - lateral * lateral);
-        pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
+        pos.y = minSurfaceYFootprint(pos, y + Z_BIAS + crown + stripLift, hw, hw);
         if (k == 0)
           arcL = pos;
         if (k == M)
@@ -3609,7 +3616,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         const float crown = centerVertex ? crownHeight : 0.0f;
         const glm::vec3 at(p2.x, 0.0f, p2.y);
         m_vertices.push_back(
-            {glm::vec3(p2.x, minSurfaceY(at, y + Z_BIAS + crown + lift), p2.y),
+            {glm::vec3(p2.x, minSurfaceYFootprint(at, y + Z_BIAS + crown + lift, 8.0f, 8.0f), p2.y),
              glm::vec3(0.0f, 1.0f, 0.0f),
              glm::vec2(0.5f, glm::length(p2 - origin) * TEX_SCALE),
              (float)jnType, std::max(0.0f, 5.0f - (float)jnType), 0.0f});
@@ -3893,7 +3900,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       // renderedGround already contains the baked bed offset; no deformation term.
       if (sampler.isValid())
         centerY += (sampler.renderedGround(C.x, C.y) - baseCenterY) * EDGE_CONFORM;
-      centerY = minSurfaceY(glm::vec3(C.x, 0.0f, C.y), centerY + Z_BIAS + crownHeight);
+      centerY = minSurfaceYFootprint(glm::vec3(C.x, 0.0f, C.y), centerY + Z_BIAS + crownHeight, 8.0f, 8.0f);
 
       glm::vec3 nSum(0.0f);
       for (int ai = 0; ai < N; ++ai)
