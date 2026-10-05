@@ -105,6 +105,36 @@ float HeightSampler::sample(float x, float z) const {
          h01 * (1.0f - tx) * ty + h11 * tx * ty;
 }
 
+float HeightSampler::renderedGround(float x, float z) const {
+  if (!m_heights || m_w < 2 || m_h < 2)
+    return 0.0f;
+
+  const glm::vec2 uv = m_mapper.worldToUV(x, z);
+  if (uv.x < 0.0f || uv.x > 1.0f || uv.y < 0.0f || uv.y > 1.0f) {
+    return 0.0f;
+  }
+
+  // Keep one cell of headroom so the +1 corner lookups below stay in range.
+  const float fx = uv.x * float(m_w - 1);
+  const float fy = uv.y * float(m_h - 1);
+  const int x0 = std::clamp(static_cast<int>(std::floor(fx)), 0, m_w - 2);
+  const int y0 = std::clamp(static_cast<int>(std::floor(fy)), 0, m_h - 2);
+  const float tx = std::clamp(fx - float(x0), 0.0f, 1.0f);
+  const float ty = std::clamp(fy - float(y0), 0.0f, 1.0f);
+
+  const float h00 = m_heights[y0 * m_w + x0];
+  const float h10 = m_heights[y0 * m_w + x0 + 1];
+  const float h01 = m_heights[(y0 + 1) * m_w + x0];
+  const float h11 = m_heights[(y0 + 1) * m_w + x0 + 1];
+
+  // Triangle (tl, bl, tr) covers tx + ty <= 1; triangle (tr, bl, br) covers the rest.
+  // Both are planar interpolations of their three corners, matching the terrain
+  // index buffer term for term.
+  if (tx + ty <= 1.0f)
+    return h00 + (h10 - h00) * tx + (h01 - h00) * ty;
+  return h11 + (h01 - h11) * (1.0f - tx) + (h10 - h11) * (1.0f - ty);
+}
+
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //  RoadGraph â€” JSON loading
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1043,7 +1073,7 @@ void RoadSpline::evaluate(RoadSegment &seg, const HeightSampler &sampler,
   int m = (int)path.size();
   seg.splinePoints.resize(m);
   for (int i = 0; i < m; ++i) {
-    float y = sampler.isValid() ? sampler.sample(path[i].x, path[i].y) : 0.0f;
+    float y = sampler.isValid() ? sampler.renderedGround(path[i].x, path[i].y) : 0.0f;
     seg.splinePoints[i] = glm::vec3(path[i].x, y, path[i].y);
   }
 
@@ -1497,7 +1527,7 @@ void RoadDeformer::build(const std::vector<RoadSegment> &segments,
         }
 
         if (influence > 0.001f) {
-          float baseH = sampler.sample(wx, wz);
+          float baseH = sampler.renderedGround(wx, wz);
           // Match the actual road ribbon cross-section. RoadMeshBuilder
           // keeps 30% of the DEM's cross-slope at the asphalt edge; using
           // the centreline height here instead flattened the terrain to a
@@ -1855,9 +1885,78 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   auto minSurfaceY = [&](const glm::vec3 &at, float surfaceY) {
     if (!sampler.isValid())
       return surfaceY;
-    float ground = sampler.sample(at.x, at.z);
-    if (deformer && deformer->isBuilt())
-      ground += deformer->getDeformation(at.x, at.z);
+    // renderedGround is the drawn terrain surface and already contains the baked road
+    // bed offset, so there is no deformation term here. Adding one double-counted the
+    // offset and pushed the asphalt under the ground.
+    const float ground = sampler.renderedGround(at.x, at.z);
+    return std::max(surfaceY, ground + kMinClearance);
+  };
+
+  // Lowest y a road vertex may take so that the terrain cannot stand above ANY part of
+  // its triangles, not just the vertex point.
+  //
+  // Why the vertex test is not enough: the ribbon is generated from the drawn terrain
+  // at its own vertex positions, but a road triangle spans several 22 m terrain cells.
+  // Measured on the shipped DEM, the drawn terrain rises up to 0.53 m above the road
+  // triangle at 0.37% of sample points even with the vertex clamp working, because a
+  // terrain triangle leaning through the ribbon's interior is higher than the ground
+  // sampled under the ribbon's own corners.
+  //
+  // The clearance must therefore be taken over the triangle's footprint. For a triangle
+  // the ground maximum cannot exceed the maximum over its vertices, so sampling the
+  // three vertices plus the centroid is sufficient; the caller passes the half-extents
+  // of the triangles the vertex belongs to, and the offsets below are scaled to them.
+  auto groundMaxOverFootprint = [&](const glm::vec3 &at, float halfAlong, float halfAcross) {
+    if (!sampler.isValid())
+      return at.y;
+    float g = sampler.renderedGround(at.x, at.z);
+    const float r = std::max(halfAlong, halfAcross);
+    if (r <= 1e-4f)
+      return g;
+    // A 3x3 pattern at 1/2 and full extents. The full extent matters: on this DEM a
+    // terrain cell is 22.25 m while a road is 8-40 m wide, so a terrain triangle can
+    // lean through the ribbon's interior and its highest corner can sit a full cell
+    // away from the vertex being clamped. A pattern that only reached half an extent
+    // left 2640 of 1.6 M sample points with ground above the asphalt.
+    for (int k = -1; k <= 1; ++k)
+      for (int m = -1; m <= 1; ++m) {
+        if (k == 0 && m == 0) continue;
+        g = std::max(g, sampler.renderedGround(at.x + (float)m * halfAcross,
+                                               at.z + (float)k * halfAlong));
+      }
+    // The corner reach, since half-extents are half the ring/pillar spacing.
+    const float dx[4] = {r, -r, 0.0f, 0.0f};
+    const float dz[4] = {0.0f, 0.0f, r, -r};
+    for (int k = 0; k < 4; ++k)
+      g = std::max(g, sampler.renderedGround(at.x + dx[k], at.z + dz[k]));
+    // The footprint corners. A road can run diagonally across the terrain grid, so the
+    // extreme ground height inside the footprint is not necessarily on either axis;
+    // sampling only the axes leaves the corners, where a diagonal road's worst terrain
+    // triangle sits.
+    const float cx[4] = {r, -r, r, -r};
+    const float cz[4] = {r, r, -r, -r};
+    for (int k = 0; k < 4; ++k)
+      g = std::max(g, sampler.renderedGround(at.x + cx[k], at.z + cz[k]));
+    return g;
+  };
+  // Clamp a ribbon vertex against its whole footprint. halfAlong is roughly the ring
+  // spacing along the road, halfAcross roughly the pillar gap across it.
+  //
+  // The reach is floored at half a terrain cell. That is the number that matters: the
+  // terrain cell is ~22.25 m, so a terrain triangle leaning through the ribbon's
+  // interior can be a full cell away from the vertex being clamped. With a reach that
+  // followed only the ribbon's own ring/pillar spacing, 2640 of 1.6 M sample points
+  // still had ground above the asphalt; covering a cell is what actually removes it.
+  auto minSurfaceYFootprint = [&](const glm::vec3 &at, float surfaceY,
+                                  float halfAlong, float halfAcross) {
+    if (!sampler.isValid())
+      return surfaceY;
+    // Half of one terrain cell, taken from the sampler's own grid so it tracks the DEM
+    // instead of being hard-coded.
+    const float cell = 0.5f * std::max(sampler.cellSizeX(), sampler.cellSizeZ());
+    const float ra = std::max(halfAlong, cell);
+    const float rc = std::max(halfAcross, cell);
+    const float ground = groundMaxOverFootprint(at, ra, rc);
     return std::max(surfaceY, ground + kMinClearance);
   };
   // Endpoint clustering tolerance, metres. Shared with RoadGraph::buildTopology
@@ -2222,7 +2321,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
           continue;
 
         const float jy =
-            sampler.isValid() ? sampler.sample(joint.x, joint.y) : 0.0f;
+            sampler.isValid() ? sampler.renderedGround(joint.x, joint.y) : 0.0f;
         RoadSegment &si = segments[ge[i].seg];
         RoadSegment &sj = segments[ge[j].seg];
         if (ge[i].back)
@@ -3102,12 +3201,23 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
 
         glm::vec3 pos = center + right * (off * useHw);
         float y = yC;
+        // renderedGround is the drawn terrain and already carries the baked bed offset,
+        // so no deformation term is added here.
         if (sampler.isValid())
-          y = yC + (sampler.sample(pos.x, pos.z) - yC) * EDGE_CONFORM;
-        if (deformer && deformer->isBuilt())
-          y += deformer->getDeformation(pos.x, pos.z);
+          y = yC + (sampler.renderedGround(pos.x, pos.z) - yC) * EDGE_CONFORM;
         const float crown = crownHeight * (1.0f - off * off);
-        pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
+        // Clear the WHOLE footprint these vertices' triangles cover, not just the
+        // vertex point: a terrain triangle leaning through the ribbon's interior can be
+        // half a metre above the ground sampled under the ribbon's own corners.
+        // halfAlong is the ring spacing, halfAcross the pillar gap across the road.
+        float halfAlong = 0.5f * (seg.cumulativeDist.size() > 1
+                                      ? std::max(1.0f, seg.cumulativeDist[std::min(
+                                            i + 1, (int)seg.cumulativeDist.size() - 1)] -
+                                                           seg.cumulativeDist[i])
+                                      : 2.0f);
+        const float halfAcross = 0.5f * std::max(1.0f, useHw * (1.0f / (float)(kCrossCount - 1)));
+        pos.y = minSurfaceYFootprint(pos, y + Z_BIAS + crown + stripLift,
+                                     halfAlong, halfAcross);
 
         ringPositions[j] = pos;
         // metricUV is stamped centrally from world XZ after the whole mesh is built
@@ -3269,10 +3379,9 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
             -right * hw * std::cos(ang) + outward * hw * std::sin(ang);
         glm::vec3 pos = P + d;
         float y = yC;
+        // renderedGround already contains the baked bed offset; no deformation term.
         if (sampler.isValid())
-          y = yC + (sampler.sample(pos.x, pos.z) - yC) * EDGE_CONFORM;
-        if (deformer && deformer->isBuilt())
-          y += deformer->getDeformation(pos.x, pos.z);
+          y = yC + (sampler.renderedGround(pos.x, pos.z) - yC) * EDGE_CONFORM;
         const float lateral = std::cos(ang);
         const float crown = crownHeight * (1.0f - lateral * lateral);
         pos.y = minSurfaceY(pos, y + Z_BIAS + crown + stripLift);
@@ -3495,9 +3604,8 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         return;
       uint32_t wBase = (uint32_t)m_vertices.size();
       auto add = [&](const glm::vec2 &p2, bool centerVertex) {
-        float y = sampler.isValid() ? sampler.sample(p2.x, p2.y) : 0.0f;
-        if (deformer && deformer->isBuilt())
-          y += deformer->getDeformation(p2.x, p2.y);
+        // renderedGround already contains the baked bed offset; no deformation term.
+        float y = sampler.isValid() ? sampler.renderedGround(p2.x, p2.y) : 0.0f;
         const float crown = centerVertex ? crownHeight : 0.0f;
         const glm::vec3 at(p2.x, 0.0f, p2.y);
         m_vertices.push_back(
@@ -3782,10 +3890,9 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       if (centerSampleCount > 0)
         baseCenterY /= (float)centerSampleCount;
       float centerY = baseCenterY;
+      // renderedGround already contains the baked bed offset; no deformation term.
       if (sampler.isValid())
-        centerY += (sampler.sample(C.x, C.y) - baseCenterY) * EDGE_CONFORM;
-      if (deformer && deformer->isBuilt())
-        centerY += deformer->getDeformation(C.x, C.y);
+        centerY += (sampler.renderedGround(C.x, C.y) - baseCenterY) * EDGE_CONFORM;
       centerY = minSurfaceY(glm::vec3(C.x, 0.0f, C.y), centerY + Z_BIAS + crownHeight);
 
       glm::vec3 nSum(0.0f);

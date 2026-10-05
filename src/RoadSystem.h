@@ -77,6 +77,36 @@ public:
     // Bilinear height at world (x, z)
     float sample(float x, float z) const;
 
+    // EXACTLY the surface the terrain draws at world (x, z).
+    //
+    // The terrain chunks are meshed from this same grid, but they emit two PLANAR
+    // triangles per cell while sample() interpolates bilinearly over all four corners.
+    // The two surfaces differ by up to |h00 - h10 - h01 + h11| / 4 -- decimetres on a
+    // 22 m hillside, against the ribbon's 2 cm clearance and 3.5 cm bias. Anything
+    // deciding whether the asphalt stays visible must use THIS, or it is protecting
+    // against a surface that is not on screen.
+    //
+    // The split matches TerrainChunk's index buffer exactly: it emits (tl,bl,tr) then
+    // (tr,bl,br) over a r*size+c grid with row -> Z, and mapper.pixelToWorld maps row 0
+    // to minZ with flipHeightmapZ false, so no flip is needed here.
+    //
+    // NO deformation term: applyRoadBedHeightfield bakes the bed offset straight into
+    // the array this samples, so the drawn terrain already contains it. Adding
+    // getDeformation() on top applies the offset twice -- that double-count is what
+    // sinks the asphalt under the ground.
+    float renderedGround(float x, float z) const;
+
+    // Size of one terrain cell in metres, across and along. Exposed because the
+    // footprint clearance has to reach at least half a cell: a terrain triangle can
+    // lean through the ribbon's interior from up to a full cell away, and this is the
+    // number that decides how far the ground maximum must be searched.
+    float cellSizeX() const {
+        return (m_w > 1) ? (m_mapper.bounds.maxX - m_mapper.bounds.minX) / float(m_w - 1) : 0.0f;
+    }
+    float cellSizeZ() const {
+        return (m_h > 1) ? (m_mapper.bounds.maxZ - m_mapper.bounds.minZ) / float(m_h - 1) : 0.0f;
+    }
+
     bool isValid() const { return m_heights != nullptr; }
 
 private:
