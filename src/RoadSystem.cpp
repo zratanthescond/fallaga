@@ -1542,7 +1542,24 @@ void RoadDeformer::build(const std::vector<RoadSegment> &segments,
           // angles, which shows up as terrain crawling over the road.
           // RoadMeshBuilder adds a 1 cm depth-safe surface bias. Keep
           // the terrain bed at the matching unsurfaced road profile.
-          constexpr float kRoadBedClearance = 0.04f;
+          // How far the graded road bed is held below the asphalt. This is the lever
+          // that lets a road sit on the ground WITHOUT floating: raising it cuts the bed
+          // deeper, so terrain triangles stop leaning through the ribbon, and the road
+          // can then be laid on a surface that is genuinely clear of the ground.
+          //
+          // At 4 cm it was far too small for a 22 m terrain cell. Enlarging the ribbon's
+          // clearance clamp instead is what produced floating roads (a mean of 1.17 m,
+          // up to 9.95 m), because the clamp lifts each vertex to the highest ground
+          // within its reach. Cutting the bed is the correct direction: it removes the
+          // ground that would poke through rather than standing the road on stilts.
+          //   FALLAGA_ROAD_BED_CLEARANCE=<metres>
+          static const float kRoadBedClearance = [] {
+            if (const char* e = std::getenv("FALLAGA_ROAD_BED_CLEARANCE")) {
+              const float v = std::strtof(e, nullptr);
+              if (v >= 0.0f) return v;
+            }
+            return 0.04f;
+          }();
           const float roadBedH = bed.elevation +
                                  (baseH - bed.elevation) * kRoadEdgeConform -
                                  kRoadBedClearance;
@@ -2060,31 +2077,21 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
                                   float halfAlong, float halfAcross) {
     if (!sampler.isValid())
       return surfaceY;
-    // Half of one terrain cell, taken from the sampler's own grid so it tracks the DEM
-    // instead of being hard-coded.
-    const float cell = 0.5f * std::max(sampler.cellSizeX(), sampler.cellSizeZ());
-    const float ra = std::max(halfAlong, cell);
-    const float rc = std::max(halfAcross, cell);
-    const float ground = groundMaxOverFootprint(at, ra, rc);
-    // TEMP diagnostic: a vertex that ends up below the drawn ground means the clamp
-    // never saw the right maximum, so record any case where it fails to lift.
-    static int clampMisses = 0;
-    if (ground + kMinClearance > surfaceY) {
-      if (clampMisses < 5) {
-        std::cout << "[RoadClamp] LIFT at (" << at.x << ", " << at.z << "): surfaceY="
-                  << surfaceY << " groundMax=" << ground << " reach=" << ra << "/" << rc
-                  << " cell=" << cell << std::endl;
-        ++clampMisses;
-      }
-      return ground + kMinClearance;
-    }
-    if (clampMisses < 5) {
-      std::cout << "[RoadClamp] ok   at (" << at.x << ", " << at.z << "): surfaceY="
-                << surfaceY << " groundMax=" << ground << " reach=" << ra << "/" << rc
-                << std::endl;
-      ++clampMisses;
-    }
-    return surfaceY;
+    // The search reach trades two opposite failure modes against each other, so it is
+    // the one number that decides whether roads look buried or look like they float:
+    //   too small -> a terrain triangle leaning through the ribbon's interior stands
+    //                above the asphalt ("terrain over the road");
+    //   too large -> the vertex is raised to the highest ground within the reach, so a
+    //                road on a slope is lifted onto a plane above its surroundings and
+    //                visibly hovers.
+    //
+    // A reach of half a terrain cell (11 m) is far too large: measured on the shipped
+    // network it lifted the ribbon by a mean of 1.17 m and up to 9.95 m, which is the
+    // floating road. The ribbon's own triangle extent is the ring step along the road and
+    // the pillar step across it, so that is the honest search distance -- extending
+    // beyond the triangles a vertex belongs to raises it for terrain it never covers.
+    const float ground = groundMaxOverFootprint(at, halfAlong, halfAcross);
+    return std::max(surfaceY, ground + kMinClearance);
   };
   // Endpoint clustering tolerance, metres. Shared with RoadGraph::buildTopology
   // so the reported topology and the drawn junctions always agree.
