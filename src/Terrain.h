@@ -31,6 +31,7 @@ public:
     Shader* terrainShader = nullptr;
     Shader* modelShader   = nullptr;
     Shader* streetShader  = nullptr;
+    Shader* wetWaterShader = nullptr;
 
     static bool isFlatMode;
 
@@ -153,6 +154,8 @@ private:
     RoadNavigationGraph roadNavigationGraph;
     HeightSampler    roadHeightSampler;
     RiverNetwork     riverNetwork;
+    WetWaterNetwork  wetWaterNetwork;
+    WetWaterMeshBuilder wetWaterMeshBuilder;
     TerrainCoordinateMapper roadMapper;   // plan→world transform shared by the road pipeline
     ObjModel* trainStationModel = nullptr;
     ObjModel* cityWallModel = nullptr;

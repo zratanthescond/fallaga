@@ -358,6 +358,7 @@ Terrain::Terrain() {
   }
 
   oceanShader = new Shader("src/shaders/ocean.vert", "src/shaders/ocean.frag");
+  wetWaterShader = new Shader("src/shaders/wet_water.vert", "src/shaders/wet_water.frag");
   streetShader =
       new Shader("src/shaders/street.vert", "src/shaders/street.frag");
   modelShader = new Shader("src/shaders/model.vert", "src/shaders/model.frag");
@@ -374,6 +375,14 @@ Terrain::Terrain() {
               << " channels for future bed/wet-ground work; coarse water elevations disabled.\n";
   } else {
     std::cerr << "[Terrain] River network unavailable: " << riverLoadError << "\n";
+  }
+
+  std::string wetWaterLoadError;
+  if (wetWaterNetwork.loadFromJSON("assets/hydrology/rivers_wet.json", &wetWaterLoadError)) {
+    std::cout << "[Terrain] Wet-water sources loaded: " << wetWaterNetwork.pools().size()
+              << " pools, " << wetWaterNetwork.trickles().size() << " trickles.\n";
+  } else {
+    std::cerr << "[Terrain] Wet-water source network unavailable: " << wetWaterLoadError << "\n";
   }
 
   // â”€â”€ GEOMETRY-BASED ROAD SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -709,6 +718,17 @@ Terrain::Terrain() {
   assetCache["assets/Tree_02/Tree.obj"] = new ObjModel("assets/Tree_02/Tree.obj");
   assetCache["assets/terrain/grass_medium_01_2k.fbx"] = new ObjModel("assets/terrain/grass_medium_01_2k.fbx");
 
+  // Place water against the completed rendered/physics heightfield, after roads
+  // have been snapped and conformed. This samples terrain but never changes it.
+  if (terrainManager && (!wetWaterNetwork.pools().empty() ||
+                         !wetWaterNetwork.trickles().empty())) {
+    wetWaterMeshBuilder.build(wetWaterNetwork, *terrainManager);
+    wetWaterMeshBuilder.upload();
+    std::cout << "[Terrain] Wet-water geometry built: " << wetWaterMeshBuilder.poolCount()
+              << " pools, " << wetWaterMeshBuilder.trickleCount() << " trickles, "
+              << wetWaterMeshBuilder.triangleCount() << " triangles.\n";
+  }
+
   std::cout << "[Terrain] Initialization done." << std::endl;
 }
 
@@ -743,6 +763,7 @@ Terrain::~Terrain() {
   delete terrainManager;
   delete terrainShader;
   delete oceanShader;
+  delete wetWaterShader;
   delete streetShader;
   delete modelShader;
   delete cityWallModel;
@@ -2264,6 +2285,49 @@ void Terrain::renderWater(const glm::mat4 &proj, const glm::mat4 &view,
   glBindVertexArray(waterVAO);
   glDrawElements(GL_TRIANGLES, waterIndexCount, GL_UNSIGNED_INT, nullptr);
   glBindVertexArray(0);
+
+  // Freshwater features are separate surfaces fitted to the final terrain.
+  // Their shader clips against the final terrain heightfield and both road masks, so the
+  // water mesh cannot hide the road surface or change terrain elevations.
+  if (terrainManager && wetWaterShader && wetWaterShader->isValid() &&
+      wetWaterMeshBuilder.getTerrainHeightTexture() != 0) {
+    wetWaterShader->use();
+    wetWaterShader->setMat4("projection", proj);
+    wetWaterShader->setMat4("view", view);
+    wetWaterShader->setFloat("time", static_cast<float>(glfwGetTime()));
+    wetWaterShader->setVec3("cameraPos", cam);
+    wetWaterShader->setVec3("lightDir", light);
+    wetWaterShader->setFloat("worldMinX", terrainManager->getWorldMinX());
+    wetWaterShader->setFloat("worldMaxX", terrainManager->getWorldMaxX());
+    wetWaterShader->setFloat("worldMinZ", terrainManager->getWorldMinZ());
+    wetWaterShader->setFloat("worldMaxZ", terrainManager->getWorldMaxZ());
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, wetWaterMeshBuilder.getTerrainHeightTexture());
+    wetWaterShader->setInt("terrainHeightTex", 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, terrainManager->getRoadMask());
+    wetWaterShader->setInt("paintedRoadMask", 1);
+    wetWaterShader->setInt("usePaintedRoadMask", terrainManager->getRoadMask() != 0 ? 1 : 0);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, terrainManager->getRoadGeometryMask());
+    wetWaterShader->setInt("vectorRoadMask", 2);
+    wetWaterShader->setInt("useVectorRoadMask", terrainManager->getRoadGeometryMask() != 0 ? 1 : 0);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, normalMap1 ? normalMap1 : flatNormalTex);
+    wetWaterShader->setInt("normalMap1", 3);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, normalMap2 ? normalMap2 : flatNormalTex);
+    wetWaterShader->setInt("normalMap2", 4);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, foamTex ? foamTex : flatNormalTex);
+    wetWaterShader->setInt("foamTexture", 5);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, sceneColorTex);
+    wetWaterShader->setInt("sceneColorTex", 6);
+    wetWaterShader->setInt("useSceneColor", sceneColorTex != 0 ? 1 : 0);
+    wetWaterMeshBuilder.render();
+  }
 
   glDepthMask(GL_TRUE);
   glDisable(GL_BLEND);
