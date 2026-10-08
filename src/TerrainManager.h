@@ -53,6 +53,7 @@ public:
     // getHeightsData() (e.g. Terrain's HeightSampler) must re-init when this
     // changes; otherwise their pointer is left dangling by the reallocation.
     unsigned int getHeightRevision() const { return heightRevision; }
+    unsigned int getHeightmapRevision() const { return heightmapRevision; }
     int getVisualGridW() const { return visualW; }
     int getVisualGridH() const { return visualH; }
     float getWorldMinX() const { return worldMinX; }
@@ -113,6 +114,7 @@ private:
     std::vector<float> visualHeights;
     std::vector<float> physicsVisualHeights; // authoritative for height queries (visual grid res)
     unsigned int heightRevision = 0;         // see getHeightRevision()
+    unsigned int heightmapRevision = 0;      // increments only when heightmap.png is reloaded
     std::vector<float> appliedRoadOffsets;
     std::vector<float> appliedRoadConformOffsets;
     std::vector<unsigned char> roadMaskData;
@@ -146,7 +148,7 @@ private:
     int roadW=0, roadH=0;
     float worldMinX, worldMaxX, worldMinZ, worldMaxZ, minHeight, maxHeight;
     std::vector<TerrainChunk*> chunks;
-    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, roadGeometryMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0;
+    GLuint terrainLayerArray=0, terrainNormalArray=0, terrainDispArray=0, terrainRoughArray=0, portMask=0, roadMask=0, roadGeometryMask=0, heightmapTexID=0, albedoTex=0, splatmap2Tex=0, terrainSplatTex=0;
     bool hasRoadMask = false;
     int activePaintLayerIdx = 2;
     Shader* terrainShader = nullptr;

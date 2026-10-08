@@ -647,6 +647,29 @@ static bool parseRoadObject(JsonReader &json, RoadSegment &seg) {
         return false;
       if (!(seg.cornerRadius >= 0.0f) || seg.cornerRadius > 1000.0f)
         return json.fail("\"corner\" must be between 0 and 1000 metres");
+    } else if (key == "lanesPerDirection") {
+      double value = 0.0;
+      if (!json.readNumber(value))
+        return false;
+      if (value < 0.0 || value > 8.0 || value != std::floor(value))
+        return json.fail("\"lanesPerDirection\" must be an integer from 0 to 8");
+      seg.lanesPerDirection = (uint8_t)value;
+    } else if (key == "oneWay") {
+      if (!json.readBool(seg.oneWay))
+        return false;
+    } else if (key == "speedLimitMps") {
+      if (!json.readFloat(seg.speedLimitMps))
+        return false;
+      if (!(seg.speedLimitMps >= 0.0f) || seg.speedLimitMps > 120.0f)
+        return json.fail("\"speedLimitMps\" must be between 0 and 120 metres per second");
+    } else if (key == "sidewalks") {
+      if (!json.readBool(seg.sidewalksEnabled))
+        return false;
+    } else if (key == "sidewalkWidth") {
+      if (!json.readFloat(seg.sidewalkWidth))
+        return false;
+      if (!(seg.sidewalkWidth >= 0.0f) || seg.sidewalkWidth > 50.0f)
+        return json.fail("\"sidewalkWidth\" must be between 0 and 50 metres");
     } else if (key == "closed") {
       if (!json.readBool(seg.closed))
         return false;
@@ -787,6 +810,16 @@ bool RoadGraph::saveToJSON(const std::string &path) const {
       file << "      \"corner\": " << seg.cornerRadius << ",\n";
     if (seg.closed)
       file << "      \"closed\": true,\n";
+    if (seg.lanesPerDirection > 0)
+      file << "      \"lanesPerDirection\": " << (int)seg.lanesPerDirection << ",\n";
+    if (seg.oneWay)
+      file << "      \"oneWay\": true,\n";
+    if (seg.speedLimitMps > 0.0f)
+      file << "      \"speedLimitMps\": " << seg.speedLimitMps << ",\n";
+    if (!seg.sidewalksEnabled)
+      file << "      \"sidewalks\": false,\n";
+    if (seg.sidewalkWidth > 0.0f)
+      file << "      \"sidewalkWidth\": " << seg.sidewalkWidth << ",\n";
     file << "      \"points\": [\n";
     for (size_t j = 0; j < seg.controlPoints.size(); ++j) {
       file << "        {\"x\": " << seg.controlPoints[j].pos.x
@@ -811,6 +844,11 @@ bool RoadGraph::saveToJSON(const std::string &path) const {
 
 void RoadGraph::buildTopology(float snapTolerance) {
   nodes.clear();
+
+  for (RoadSegment &seg : segments) {
+    seg.startNodeId = kInvalidRoadNodeId;
+    seg.endNodeId = kInvalidRoadNodeId;
+  }
 
   // Collect all endpoints
   struct EndpointRef {
@@ -858,6 +896,11 @@ void RoadGraph::buildTopology(float snapTolerance) {
     clusterSum[c] += endpoints[i].pos;
     clusterCount[c]++;
     nodes[c].connectedSegments.push_back(endpoints[i].segIdx);
+    RoadSegment &seg = segments[endpoints[i].segIdx];
+    if (endpoints[i].isEnd)
+      seg.endNodeId = (uint32_t)c;
+    else
+      seg.startNodeId = (uint32_t)c;
   }
 
   for (int i = 0; i < nextCluster; ++i) {
@@ -880,6 +923,731 @@ void RoadGraph::buildTopology(float snapTolerance) {
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 //  RoadSpline â€” Catmull-Rom evaluation
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+namespace {
+struct RoadNavigationDefaults {
+  int lanesPerDirection = 1;
+  float speedLimit = 8.3f;
+  float sidewalkWidth = 1.8f;
+  int priority = 1;
+  bool sidewalksEnabled = true;
+};
+
+RoadNavigationDefaults roadNavigationDefaults(const RoadSegment &seg) {
+  RoadNavigationDefaults d;
+  d.lanesPerDirection = std::clamp((int)(seg.width / 6.0f), 1, 4);
+  switch (seg.type) {
+  case RoadType::ColonialAvenue:
+    d.speedLimit = 13.9f;
+    d.sidewalkWidth = 2.4f;
+    d.priority = 5;
+    break;
+  case RoadType::UrbanStreet:
+    d.speedLimit = 11.1f;
+    d.sidewalkWidth = 2.0f;
+    d.priority = 4;
+    break;
+  case RoadType::CountryHighway:
+    d.speedLimit = 16.7f;
+    d.sidewalkWidth = 1.8f;
+    d.priority = 3;
+    break;
+  case RoadType::CountryDirt:
+    d.speedLimit = 8.3f;
+    d.sidewalkWidth = 1.4f;
+    d.priority = 1;
+    break;
+  case RoadType::Port:
+    d.speedLimit = 5.6f;
+    d.sidewalkWidth = 2.2f;
+    d.priority = 2;
+    break;
+  case RoadType::Medina:
+    d.speedLimit = 5.6f;
+    d.sidewalkWidth = 1.2f;
+    d.priority = 1;
+    break;
+  }
+  if (seg.lanesPerDirection > 0)
+    d.lanesPerDirection = seg.lanesPerDirection;
+  if (seg.speedLimitMps > 0.0f)
+    d.speedLimit = seg.speedLimitMps;
+  if (seg.sidewalkWidth > 0.0f)
+    d.sidewalkWidth = seg.sidewalkWidth;
+  d.sidewalksEnabled = seg.sidewalksEnabled;
+  return d;
+}
+
+float navCross2(const glm::vec2 &a, const glm::vec2 &b) {
+  return a.x * b.y - a.y * b.x;
+}
+
+bool navSegmentsCross(const glm::vec2 &a, const glm::vec2 &b,
+                      const glm::vec2 &c, const glm::vec2 &d) {
+  const glm::vec2 r = b - a, s = d - c;
+  const float denom = navCross2(r, s);
+  if (std::fabs(denom) < 1e-5f)
+    return false;
+  const float t = navCross2(c - a, s) / denom;
+  const float u = navCross2(c - a, r) / denom;
+  return t > 0.03f && t < 0.97f && u > 0.03f && u < 0.97f;
+}
+
+bool navSegmentIntersection(const glm::vec2 &a, const glm::vec2 &b,
+                            const glm::vec2 &c, const glm::vec2 &d,
+                            float &t, float &u) {
+  const glm::vec2 r = b - a, s = d - c;
+  const float denom = navCross2(r, s);
+  if (std::fabs(denom) < 1e-5f)
+    return false;
+  t = navCross2(c - a, s) / denom;
+  u = navCross2(c - a, r) / denom;
+  return t > 0.02f && t < 0.98f && u > 0.02f && u < 0.98f;
+}
+
+RoadNavigationSample navSample(float distance, const glm::vec2 &position,
+                               const glm::vec2 &direction,
+                               float curvature = 0.0f) {
+  RoadNavigationSample sample;
+  sample.distance = distance;
+  sample.position = position;
+  const float length = glm::length(direction);
+  sample.direction = length > 1e-5f ? direction / length : glm::vec2(1, 0);
+  sample.curvature = curvature;
+  return sample;
+}
+
+std::vector<RoadNavigationSample>
+finalizeNavPolyline(const std::vector<glm::vec2> &positions, bool closeLoop = false) {
+  std::vector<RoadNavigationSample> samples;
+  if (positions.size() < 2)
+    return samples;
+
+  std::vector<float> arcLength(positions.size(), 0.0f);
+  for (size_t i = 1; i < positions.size(); ++i)
+    arcLength[i] = arcLength[i - 1] +
+                   glm::length(positions[i] - positions[i - 1]);
+  const float closingLength = closeLoop
+      ? glm::length(positions.front() - positions.back()) : 0.0f;
+
+  samples.reserve(positions.size() + (closeLoop ? 1u : 0u));
+  for (size_t i = 0; i < positions.size(); ++i) {
+    const size_t previous = closeLoop
+        ? (i + positions.size() - 1) % positions.size()
+        : (i > 0 ? i - 1 : i);
+    const size_t next = closeLoop
+        ? (i + 1) % positions.size()
+        : std::min(i + 1, positions.size() - 1);
+    glm::vec2 direction = positions[next] - positions[previous];
+    if (glm::length(direction) < 1e-5f) {
+      direction = i + 1 < positions.size()
+          ? positions[i + 1] - positions[i]
+          : positions[i] - positions[i - 1];
+    }
+
+    float curvature = 0.0f;
+    if (positions.size() >= 3) {
+      // Use the nearest valid triple at open endpoints, and a wrapped triple
+      // for closed paths. This gives lanes and Bézier connectors the same
+      // signed discrete-curvature convention.
+      const size_t center = closeLoop
+          ? i
+          : std::clamp(i, size_t(1), positions.size() - 2);
+      const size_t before = closeLoop
+          ? (center + positions.size() - 1) % positions.size() : center - 1;
+      const size_t after = closeLoop
+          ? (center + 1) % positions.size() : center + 1;
+      const glm::vec2 a = positions[center] - positions[before];
+      const glm::vec2 b = positions[after] - positions[center];
+      const float denominator = glm::length(a) * glm::length(b) *
+                                glm::length(positions[after] - positions[before]);
+      if (denominator > 1e-5f)
+        curvature = 2.0f * navCross2(a, b) / denominator;
+    }
+    samples.push_back(navSample(arcLength[i], positions[i], direction,
+                                curvature));
+  }
+
+  if (closeLoop) {
+    const RoadNavigationSample &first = samples.front();
+    samples.push_back(navSample(arcLength.back() + closingLength,
+                                first.position, first.direction,
+                                first.curvature));
+  }
+  return samples;
+}
+
+std::vector<RoadNavigationSample> navBezier(const glm::vec2 &p0,
+                                            const glm::vec2 &p1,
+                                            const glm::vec2 &p2,
+                                            const glm::vec2 &p3,
+                                            int minimumCount) {
+  const float controlLength = glm::length(p1 - p0) +
+                               glm::length(p2 - p1) +
+                               glm::length(p3 - p2);
+  // Parameter-space steps are not arc-length steps, but using the control
+  // polygon length gives a stable ~1 m density for the short road curves.
+  const int adaptiveCount = (int)std::ceil(controlLength / 1.0f) + 1;
+  const int count = std::clamp(std::max(minimumCount, adaptiveCount), 2, 4097);
+  std::vector<glm::vec2> positions;
+  positions.reserve((size_t)count);
+  for (int i = 0; i < count; ++i) {
+    const float t = float(i) / float(count - 1), u = 1.0f - t;
+    const glm::vec2 p = u * u * u * p0 + 3.0f * u * u * t * p1 +
+                        3.0f * u * t * t * p2 + t * t * t * p3;
+    positions.push_back(p);
+  }
+  return finalizeNavPolyline(positions);
+}
+} // namespace
+
+void RoadNavigationGraph::clear() {
+  m_lanes.clear();
+  m_laneConnectors.clear();
+  m_sidewalks.clear();
+  m_walkConnectors.clear();
+  m_nodes.clear();
+  m_built = false;
+}
+
+void RoadNavigationGraph::build(const RoadGraph &roads) {
+  clear();
+
+  struct SegmentAnchor {
+    float distance;
+    uint32_t nodeId;
+  };
+  struct CrossingCandidate {
+    uint32_t segmentA, segmentB;
+    float distanceA, distanceB;
+    glm::vec2 position;
+  };
+  std::vector<std::vector<SegmentAnchor>> anchors(roads.segments.size());
+  std::vector<float> centerlineLengths(roads.segments.size(), 0.0f);
+  for (uint32_t i = 0; i < roads.nodes.size(); ++i) {
+    const RoadNode &node = roads.nodes[i];
+    m_nodes.push_back({node.id, glm::vec2(node.position.x, node.position.z), false});
+  }
+  for (uint32_t i = 0; i < roads.segments.size(); ++i) {
+    const RoadSegment &seg = roads.segments[i];
+    const size_t n = seg.splinePoints.size();
+    if (n < 2 || seg.cumulativeDist.size() != n)
+      continue;
+    centerlineLengths[i] = seg.cumulativeDist.back();
+    if (!seg.closed) {
+      anchors[i].push_back({0.0f, seg.startNodeId});
+      anchors[i].push_back({centerlineLengths[i], seg.endNodeId});
+    }
+  }
+
+  // A branch often terminates at the edge of a host road, so its endpoint is
+  // not close enough to the host's centerline to be found by endpoint clustering.
+  // Project transverse endpoints onto the nearest interior spline and reuse the
+  // branch endpoint node ID on both roads.
+  int endpointToInteriorLinks = 0;
+  for (uint32_t branchIndex = 0; branchIndex < roads.segments.size(); ++branchIndex) {
+    const RoadSegment &branch = roads.segments[branchIndex];
+    if (branch.closed || branch.splinePoints.size() < 2 || branch.tangents.size() < 2)
+      continue;
+    for (int endpointIndex = 0; endpointIndex < 2; ++endpointIndex) {
+      const bool atStart = endpointIndex == 0;
+      const uint32_t nodeId = atStart ? branch.startNodeId : branch.endNodeId;
+      if (nodeId == kInvalidRoadNodeId)
+        continue;
+      const size_t branchSample = atStart ? 0 : branch.splinePoints.size() - 1;
+      const glm::vec2 branchPos(branch.splinePoints[branchSample].x,
+                                branch.splinePoints[branchSample].z);
+      const glm::vec2 rawBranchDir(branch.tangents[branchSample].x,
+                                   branch.tangents[branchSample].z);
+      const float branchDirLen = glm::length(rawBranchDir);
+      if (branchDirLen < 1e-5f)
+        continue;
+      const glm::vec2 branchDir = rawBranchDir / branchDirLen;
+      float bestDistance = std::numeric_limits<float>::infinity();
+      uint32_t bestHost = kInvalidRoadNodeId;
+      float bestHostDistance = 0.0f;
+
+      for (uint32_t hostIndex = 0; hostIndex < roads.segments.size(); ++hostIndex) {
+        if (hostIndex == branchIndex)
+          continue;
+        const RoadSegment &host = roads.segments[hostIndex];
+        const size_t hostCount = host.splinePoints.size();
+        if (host.closed || hostCount < 2 || host.tangents.size() != hostCount ||
+            host.cumulativeDist.size() != hostCount)
+          continue;
+        const float hostLength = centerlineLengths[hostIndex];
+        const float clearance = std::max(4.0f,
+            std::min(host.width * 0.5f, 15.0f));
+        const float maxDistance = glm::clamp(
+            host.width * 0.5f + branch.width * 0.25f + 1.0f, 5.0f, 24.0f);
+        for (size_t k = 0; k + 1 < hostCount; ++k) {
+          const glm::vec2 a(host.splinePoints[k].x, host.splinePoints[k].z);
+          const glm::vec2 b(host.splinePoints[k + 1].x, host.splinePoints[k + 1].z);
+          const glm::vec2 edge = b - a;
+          const float edgeLen2 = glm::dot(edge, edge);
+          if (edgeLen2 < 1e-8f)
+            continue;
+          const float t = glm::clamp(glm::dot(branchPos - a, edge) / edgeLen2,
+                                     0.0f, 1.0f);
+          const glm::vec2 projected = a + edge * t;
+          const float gap = glm::length(branchPos - projected);
+          if (gap >= bestDistance || gap > maxDistance)
+            continue;
+          const float s = glm::mix(host.cumulativeDist[k],
+                                   host.cumulativeDist[k + 1], t);
+          if (s <= clearance || hostLength - s <= clearance)
+            continue;
+          glm::vec2 tangent = glm::mix(
+              glm::vec2(host.tangents[k].x, host.tangents[k].z),
+              glm::vec2(host.tangents[k + 1].x, host.tangents[k + 1].z), t);
+          const float tangentLen = glm::length(tangent);
+          if (tangentLen < 1e-5f)
+            continue;
+          tangent /= tangentLen;
+          if (std::fabs(glm::dot(branchDir, tangent)) > kRoadJunctionApproachCos)
+            continue;
+          bestDistance = gap;
+          bestHost = hostIndex;
+          bestHostDistance = s;
+        }
+      }
+      if (bestHost != kInvalidRoadNodeId) {
+        anchors[bestHost].push_back({bestHostDistance, nodeId});
+        ++endpointToInteriorLinks;
+      }
+    }
+  }
+
+  // Detect centerline crossings where neither road ends. Adjacent spline samples
+  // are clustered into one navigation junction; existing endpoint nodes are
+  // reused when a crossing lands close to one.
+  std::vector<CrossingCandidate> interiorCrossings;
+  for (uint32_t aIndex = 0; aIndex < roads.segments.size(); ++aIndex) {
+    const RoadSegment &aRoad = roads.segments[aIndex];
+    if (aRoad.closed || aRoad.splinePoints.size() < 2 ||
+        aRoad.cumulativeDist.size() != aRoad.splinePoints.size())
+      continue;
+    for (uint32_t bIndex = aIndex + 1; bIndex < roads.segments.size(); ++bIndex) {
+      const RoadSegment &bRoad = roads.segments[bIndex];
+      if (bRoad.closed || bRoad.splinePoints.size() < 2 ||
+          bRoad.cumulativeDist.size() != bRoad.splinePoints.size())
+        continue;
+      for (size_t ai = 0; ai + 1 < aRoad.splinePoints.size(); ++ai) {
+        const glm::vec2 a0(aRoad.splinePoints[ai].x, aRoad.splinePoints[ai].z);
+        const glm::vec2 a1(aRoad.splinePoints[ai + 1].x, aRoad.splinePoints[ai + 1].z);
+        for (size_t bi = 0; bi + 1 < bRoad.splinePoints.size(); ++bi) {
+          const glm::vec2 b0(bRoad.splinePoints[bi].x, bRoad.splinePoints[bi].z);
+          const glm::vec2 b1(bRoad.splinePoints[bi + 1].x, bRoad.splinePoints[bi + 1].z);
+          float ta = 0.0f, tb = 0.0f;
+          if (!navSegmentIntersection(a0, a1, b0, b1, ta, tb))
+            continue;
+          glm::vec2 dirA = a1 - a0, dirB = b1 - b0;
+          const float lenA = glm::length(dirA), lenB = glm::length(dirB);
+          if (lenA < 1e-5f || lenB < 1e-5f)
+            continue;
+          dirA /= lenA;
+          dirB /= lenB;
+          if (std::fabs(glm::dot(dirA, dirB)) > kRoadJunctionApproachCos)
+            continue;
+          const float sA = glm::mix(aRoad.cumulativeDist[ai],
+                                    aRoad.cumulativeDist[ai + 1], ta);
+          const float sB = glm::mix(bRoad.cumulativeDist[bi],
+                                    bRoad.cumulativeDist[bi + 1], tb);
+          const float clearA = std::max(2.0f, std::min(aRoad.width * 0.25f, 10.0f));
+          const float clearB = std::max(2.0f, std::min(bRoad.width * 0.25f, 10.0f));
+          if (sA <= clearA || centerlineLengths[aIndex] - sA <= clearA ||
+              sB <= clearB || centerlineLengths[bIndex] - sB <= clearB)
+            continue;
+          const glm::vec2 position = a0 + (a1 - a0) * ta;
+          uint32_t existingNode = kInvalidRoadNodeId;
+          float nearestNodeDistance = kRoadJunctionTolerance;
+          for (const RoadNode &node : roads.nodes) {
+            const float d = glm::length(position - glm::vec2(node.position.x, node.position.z));
+            if (d < nearestNodeDistance) {
+              nearestNodeDistance = d;
+              existingNode = node.id;
+            }
+          }
+          if (existingNode != kInvalidRoadNodeId) {
+            anchors[aIndex].push_back({sA, existingNode});
+            anchors[bIndex].push_back({sB, existingNode});
+          } else {
+            interiorCrossings.push_back({aIndex, bIndex, sA, sB, position});
+          }
+        }
+      }
+    }
+  }
+
+  struct CrossingCluster {
+    glm::vec2 sum{0.0f};
+    uint32_t count = 0;
+    std::vector<CrossingCandidate> candidates;
+  };
+  std::vector<CrossingCluster> crossingClusters;
+  for (const CrossingCandidate &candidate : interiorCrossings) {
+    size_t clusterIndex = crossingClusters.size();
+    for (size_t i = 0; i < crossingClusters.size(); ++i) {
+      const glm::vec2 center = crossingClusters[i].sum /
+                               float(crossingClusters[i].count);
+      if (glm::length(candidate.position - center) <= kRoadJunctionTolerance) {
+        clusterIndex = i;
+        break;
+      }
+    }
+    if (clusterIndex == crossingClusters.size())
+      crossingClusters.emplace_back();
+    CrossingCluster &cluster = crossingClusters[clusterIndex];
+    cluster.sum += candidate.position;
+    ++cluster.count;
+    cluster.candidates.push_back(candidate);
+  }
+  for (CrossingCluster &cluster : crossingClusters) {
+    const uint32_t nodeId = (uint32_t)m_nodes.size();
+    m_nodes.push_back({nodeId, cluster.sum / float(cluster.count), true});
+    for (const CrossingCandidate &candidate : cluster.candidates) {
+      anchors[candidate.segmentA].push_back({candidate.distanceA, nodeId});
+      anchors[candidate.segmentB].push_back({candidate.distanceB, nodeId});
+    }
+  }
+
+  for (auto &segmentAnchors : anchors) {
+    std::stable_sort(segmentAnchors.begin(), segmentAnchors.end(),
+        [](const SegmentAnchor &a, const SegmentAnchor &b) {
+          return a.distance < b.distance;
+        });
+    std::vector<SegmentAnchor> unique;
+    for (const SegmentAnchor &anchor : segmentAnchors) {
+      if (!unique.empty() && std::fabs(unique.back().distance - anchor.distance) < 0.5f) {
+        if (unique.back().nodeId == kInvalidRoadNodeId)
+          unique.back().nodeId = anchor.nodeId;
+        continue;
+      }
+      unique.push_back(anchor);
+    }
+    segmentAnchors.swap(unique);
+  }
+
+  struct RawRoadSample {
+    glm::vec3 center;
+    glm::vec3 right;
+    glm::vec3 tangent;
+    float curvature;
+  };
+  auto sourceAt = [](const RoadSegment &seg, float distance) {
+    const size_t n = seg.splinePoints.size();
+    auto upper = std::upper_bound(seg.cumulativeDist.begin(),
+                                  seg.cumulativeDist.end(), distance);
+    size_t i1 = upper == seg.cumulativeDist.end()
+                    ? n - 1 : (size_t)(upper - seg.cumulativeDist.begin());
+    size_t i0 = i1 > 0 ? i1 - 1 : 0;
+    float span = seg.cumulativeDist[i1] - seg.cumulativeDist[i0];
+    float t = span > 1e-6f
+                  ? glm::clamp((distance - seg.cumulativeDist[i0]) / span, 0.0f, 1.0f)
+                  : 0.0f;
+    RawRoadSample raw;
+    raw.center = glm::mix(seg.splinePoints[i0], seg.splinePoints[i1], t);
+    raw.right = glm::mix(seg.rightVecs[i0], seg.rightVecs[i1], t);
+    raw.tangent = glm::mix(seg.tangents[i0], seg.tangents[i1], t);
+    raw.curvature = i0 < seg.curvature.size() && i1 < seg.curvature.size()
+                        ? glm::mix(seg.curvature[i0], seg.curvature[i1], t) : 0.0f;
+    const float rightLength = glm::length(glm::vec2(raw.right.x, raw.right.z));
+    if (rightLength > 1e-5f) raw.right /= rightLength;
+    const float tangentLength = glm::length(glm::vec2(raw.tangent.x, raw.tangent.z));
+    if (tangentLength > 1e-5f) raw.tangent /= tangentLength;
+    return raw;
+  };
+  auto makeOffsetPath = [&](const RoadSegment &seg, float startDistance,
+                            float endDistance, float lateralOffset,
+                            bool reverse, bool closeLoop) {
+    std::vector<float> distances;
+    distances.push_back(startDistance);
+    // Navigation paths need a finer arc-length table than the road mesh. Keep
+    // every evaluated spline sample and add 1 m stations between them so the
+    // offset curves do not inherit the mesh's coarser straight-line spacing.
+    for (float d = startDistance + 1.0f; d < endDistance - 1e-4f; d += 1.0f)
+      distances.push_back(d);
+    auto firstInterior = std::upper_bound(seg.cumulativeDist.begin(),
+        seg.cumulativeDist.end(), startDistance + 1e-4f);
+    auto endInterior = std::lower_bound(seg.cumulativeDist.begin(),
+        seg.cumulativeDist.end(), endDistance - 1e-4f);
+    for (auto it = firstInterior; it != endInterior; ++it)
+      distances.push_back(*it);
+    distances.push_back(endDistance);
+    std::sort(distances.begin(), distances.end());
+    distances.erase(std::unique(distances.begin(), distances.end(),
+        [](float a, float b) { return std::fabs(a - b) < 0.05f; }),
+        distances.end());
+    if (reverse)
+      std::reverse(distances.begin(), distances.end());
+
+    std::vector<glm::vec2> positions;
+    positions.reserve(distances.size());
+    for (float distance : distances) {
+      RawRoadSample raw = sourceAt(seg, distance);
+      const glm::vec2 pos(raw.center.x + raw.right.x * lateralOffset,
+                          raw.center.z + raw.right.z * lateralOffset);
+      if (!positions.empty() && glm::length(pos - positions.back()) < 0.05f)
+        continue;
+      // A tight inner offset can fold back on itself even when the centreline
+      // remains smooth. Remove the cusp sample (and retry the same candidate)
+      // until consecutive offset edges no longer reverse direction.
+      while (positions.size() >= 2) {
+        const glm::vec2 incoming = positions.back() - positions[positions.size() - 2];
+        const glm::vec2 outgoing = pos - positions.back();
+        if (glm::dot(incoming, outgoing) >= 0.0f)
+          break;
+        positions.pop_back();
+      }
+      if (positions.empty() || glm::length(pos - positions.back()) >= 0.05f)
+        positions.push_back(pos);
+    }
+    if (positions.size() < 2)
+      return std::vector<RoadNavigationSample>{};
+
+    return finalizeNavPolyline(positions, closeLoop);
+  };
+
+  for (uint32_t segmentIndex = 0; segmentIndex < roads.segments.size(); ++segmentIndex) {
+    const RoadSegment &seg = roads.segments[segmentIndex];
+    const size_t count = seg.splinePoints.size();
+    if (count < 2 || seg.tangents.size() != count || seg.rightVecs.size() != count ||
+        seg.cumulativeDist.size() != count)
+      continue;
+    const RoadNavigationDefaults defaults = roadNavigationDefaults(seg);
+    const float roadWidth = std::max(seg.width, 2.0f);
+    const int lanesPerDirection = std::clamp(defaults.lanesPerDirection, 1, 8);
+    const int directionCount = seg.oneWay ? 1 : 2;
+    const float laneWidth = roadWidth / float(lanesPerDirection * directionCount);
+    const float fullLength = centerlineLengths[segmentIndex];
+
+    std::vector<std::pair<SegmentAnchor, SegmentAnchor>> sections;
+    if (seg.closed) {
+      sections.push_back({{0.0f, kInvalidRoadNodeId},
+                          {fullLength, kInvalidRoadNodeId}});
+    } else {
+      const auto &segmentAnchors = anchors[segmentIndex];
+      for (size_t i = 1; i < segmentAnchors.size(); ++i) {
+        if (segmentAnchors[i].distance - segmentAnchors[i - 1].distance > 0.25f)
+          sections.push_back({segmentAnchors[i - 1], segmentAnchors[i]});
+      }
+    }
+
+    for (uint32_t sectionIndex = 0; sectionIndex < sections.size(); ++sectionIndex) {
+      const SegmentAnchor &low = sections[sectionIndex].first;
+      const SegmentAnchor &high = sections[sectionIndex].second;
+      for (int directionIndex = 0; directionIndex < directionCount; ++directionIndex) {
+        const bool forward = directionIndex == 0;
+        for (int laneIndex = 0; laneIndex < lanesPerDirection; ++laneIndex) {
+          const float lateralOffset = seg.oneWay
+              ? (-roadWidth * 0.5f + (float(laneIndex) + 0.5f) * laneWidth)
+              : (float(laneIndex) + 0.5f) * laneWidth * (forward ? 1.0f : -1.0f);
+          RoadLane lane;
+          lane.id = (uint32_t)m_lanes.size();
+          lane.segmentIndex = segmentIndex;
+          lane.sectionIndex = sectionIndex;
+          lane.startNodeId = seg.closed ? kInvalidRoadNodeId
+              : (forward ? low.nodeId : high.nodeId);
+          lane.endNodeId = seg.closed ? kInvalidRoadNodeId
+              : (forward ? high.nodeId : low.nodeId);
+          lane.laneIndex = (uint8_t)laneIndex;
+          lane.forward = forward;
+          lane.closed = seg.closed;
+          lane.speedLimit = defaults.speedLimit;
+          lane.samples = makeOffsetPath(seg, low.distance, high.distance,
+                                        lateralOffset, !forward, seg.closed);
+          if (lane.samples.size() >= 2) {
+            lane.length = lane.samples.back().distance;
+            m_lanes.push_back(std::move(lane));
+          }
+        }
+      }
+
+      if (!defaults.sidewalksEnabled)
+        continue;
+      for (int side : {-1, 1}) {
+        RoadSidewalk walk;
+        walk.id = (uint32_t)m_sidewalks.size();
+        walk.segmentIndex = segmentIndex;
+        walk.sectionIndex = sectionIndex;
+        walk.closed = seg.closed;
+        walk.startNodeId = seg.closed ? kInvalidRoadNodeId : low.nodeId;
+        walk.endNodeId = seg.closed ? kInvalidRoadNodeId : high.nodeId;
+        walk.side = (int8_t)side;
+        const float offset = float(side) * (roadWidth * 0.5f +
+            std::max(seg.shoulderWidth, 0.0f) + defaults.sidewalkWidth * 0.5f);
+        walk.samples = makeOffsetPath(seg, low.distance, high.distance,
+                                      offset, false, seg.closed);
+        if (walk.samples.size() >= 2) {
+          walk.length = walk.samples.back().distance;
+          m_sidewalks.push_back(std::move(walk));
+        }
+      }
+    }
+  }
+
+  // Smooth directed connectors between lane sections at endpoint and
+  // mid-segment junctions.
+  std::unordered_map<uint32_t, std::vector<uint32_t>> incomingLanes;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> outgoingLanes;
+  for (const RoadLane &lane : m_lanes) {
+    if (lane.closed)
+      continue;
+    if (lane.startNodeId != kInvalidRoadNodeId)
+      outgoingLanes[lane.startNodeId].push_back(lane.id);
+    if (lane.endNodeId != kInvalidRoadNodeId)
+      incomingLanes[lane.endNodeId].push_back(lane.id);
+  }
+  for (const RoadNavigationNode &node : m_nodes) {
+    const auto incomingIt = incomingLanes.find(node.id);
+    const auto outgoingIt = outgoingLanes.find(node.id);
+    if (incomingIt == incomingLanes.end() || outgoingIt == outgoingLanes.end())
+      continue;
+    for (uint32_t fromIndex : incomingIt->second) {
+      const RoadLane &from = m_lanes[fromIndex];
+      if (from.samples.empty()) continue;
+      for (uint32_t toIndex : outgoingIt->second) {
+        const RoadLane &to = m_lanes[toIndex];
+        if (to.samples.empty() ||
+            (from.segmentIndex == to.segmentIndex &&
+             from.sectionIndex == to.sectionIndex))
+          continue;
+        const glm::vec2 start = from.samples.back().position;
+        const glm::vec2 end = to.samples.front().position;
+        const float chord = glm::length(end - start);
+        if (chord < 0.05f ||
+            glm::dot(from.samples.back().direction,
+                     to.samples.front().direction) < -0.86f)
+          continue;
+        const float width = std::max(roads.segments[from.segmentIndex].width, 2.0f);
+        const float handle = glm::clamp(chord * 0.42f, 1.0f,
+                                        std::max(2.0f, width * 1.5f));
+        RoadLaneConnector connector;
+        connector.id = (uint32_t)m_laneConnectors.size();
+        connector.nodeId = node.id;
+        connector.fromLaneId = from.id;
+        connector.toLaneId = to.id;
+        connector.priority = roadNavigationDefaults(
+            roads.segments[from.segmentIndex]).priority;
+        connector.turnAngleRadians = std::atan2(
+            navCross2(from.samples.back().direction,
+                      to.samples.front().direction),
+            glm::dot(from.samples.back().direction,
+                     to.samples.front().direction));
+        connector.samples = navBezier(start,
+            start + from.samples.back().direction * handle,
+            end - to.samples.front().direction * handle, end, 9);
+        if (connector.samples.size() >= 2) {
+          m_lanes[fromIndex].outgoingConnectorIds.push_back(connector.id);
+          m_laneConnectors.push_back(std::move(connector));
+        }
+      }
+    }
+  }
+
+  // Conflicting lane movements are symmetric references for the later traffic
+  // reservation system. Shared endpoints are ignored as they are intentional.
+  for (size_t a = 0; a < m_laneConnectors.size(); ++a) {
+    RoadLaneConnector &ca = m_laneConnectors[a];
+    for (size_t b = a + 1; b < m_laneConnectors.size(); ++b) {
+      RoadLaneConnector &cb = m_laneConnectors[b];
+      if (ca.nodeId != cb.nodeId)
+        continue;
+      bool conflict = false;
+      for (size_t i = 1; i < ca.samples.size() && !conflict; ++i) {
+        for (size_t j = 1; j < cb.samples.size(); ++j) {
+          if (navSegmentsCross(ca.samples[i - 1].position, ca.samples[i].position,
+                               cb.samples[j - 1].position, cb.samples[j].position)) {
+            conflict = true;
+            break;
+          }
+        }
+      }
+      if (conflict) {
+        ca.conflictingConnectorIds.push_back(cb.id);
+        cb.conflictingConnectorIds.push_back(ca.id);
+      }
+    }
+  }
+
+  struct WalkEndpoint {
+    uint32_t sidewalkId, segmentIndex, nodeId;
+    bool atStart;
+    int8_t side;
+    glm::vec2 position, pathDirection;
+    float angle;
+  };
+  std::unordered_map<uint32_t, std::vector<WalkEndpoint>> endpointsByNode;
+  for (const RoadSidewalk &walk : m_sidewalks) {
+    if (walk.closed || walk.samples.size() < 2)
+      continue;
+    if (walk.startNodeId != kInvalidRoadNodeId) {
+      const auto &sample = walk.samples.front();
+      endpointsByNode[walk.startNodeId].push_back(
+          {walk.id, walk.segmentIndex, walk.startNodeId, true,
+           walk.side, sample.position, sample.direction, 0.0f});
+    }
+    if (walk.endNodeId != kInvalidRoadNodeId) {
+      const auto &sample = walk.samples.back();
+      endpointsByNode[walk.endNodeId].push_back(
+          {walk.id, walk.segmentIndex, walk.endNodeId, false,
+           walk.side, sample.position, sample.direction, 0.0f});
+    }
+  }
+  for (const RoadNavigationNode &node : m_nodes) {
+    auto endpointsIt = endpointsByNode.find(node.id);
+    if (endpointsIt == endpointsByNode.end())
+      continue;
+    std::vector<WalkEndpoint> atNode = std::move(endpointsIt->second);
+    const glm::vec2 center = node.position;
+    for (WalkEndpoint &endpoint : atNode) {
+      const glm::vec2 radial = endpoint.position - center;
+      endpoint.angle = std::atan2(radial.y, radial.x);
+    }
+    if (atNode.size() < 2)
+      continue;
+    std::sort(atNode.begin(), atNode.end(), [](const WalkEndpoint &a,
+                                               const WalkEndpoint &b) {
+      return a.angle < b.angle;
+    });
+    const size_t pairCount = atNode.size() == 2 ? 1 : atNode.size();
+    for (size_t i = 0; i < pairCount; ++i) {
+      const WalkEndpoint &a = atNode[i];
+      const WalkEndpoint &b = atNode[(i + 1) % atNode.size()];
+      const bool crossing = a.segmentIndex == b.segmentIndex && a.side != b.side;
+      const float gap = glm::length(b.position - a.position);
+      if (gap < 0.1f || gap > 40.0f)
+        continue;
+      RoadWalkConnector connector;
+      connector.id = (uint32_t)m_walkConnectors.size();
+      connector.nodeId = node.id;
+      connector.fromSidewalkId = a.sidewalkId;
+      connector.toSidewalkId = b.sidewalkId;
+      connector.fromAtStart = a.atStart;
+      connector.toAtStart = b.atStart;
+      connector.crossing = crossing;
+      if (crossing) {
+        connector.samples = navBezier(a.position,
+            glm::mix(a.position, b.position, 1.0f / 3.0f),
+            glm::mix(a.position, b.position, 2.0f / 3.0f), b.position, 3);
+      } else {
+        const float handle = glm::clamp(gap * 0.35f, 0.6f, 6.0f);
+        const glm::vec2 aHeading = a.atStart ? -a.pathDirection : a.pathDirection;
+        const glm::vec2 bHeading = b.atStart ? b.pathDirection : -b.pathDirection;
+        connector.samples = navBezier(a.position, a.position + aHeading * handle,
+                                      b.position - bHeading * handle, b.position, 7);
+      }
+      if (connector.samples.size() >= 2)
+        m_walkConnectors.push_back(std::move(connector));
+    }
+  }
+
+  m_built = true;
+  std::cout << "[RoadNavigation] Built " << m_lanes.size() << " lanes, "
+            << m_laneConnectors.size() << " lane connectors, "
+            << m_sidewalks.size() << " sidewalks, "
+            << m_walkConnectors.size() << " sidewalk links" << std::endl;
+}
 
 static glm::vec2 catmullRom(const glm::vec2 &p0, const glm::vec2 &p1,
                             const glm::vec2 &p2, const glm::vec2 &p3, float t) {

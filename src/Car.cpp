@@ -28,6 +28,61 @@ static ObjModel *sharedCarModel = nullptr;
 static Shader *sharedCarShader = nullptr;
 static int carInstanceCount = 0;
 
+namespace {
+struct RoadRoutePoint {
+  glm::vec2 position{0.0f};
+  glm::vec2 direction{1.0f, 0.0f};
+  float curvature = 0.0f;
+};
+
+bool sampleRoadRoute(const std::vector<RoadNavigationSample> &samples,
+                     float distance, RoadRoutePoint &out) {
+  if (samples.size() < 2)
+    return false;
+  distance = glm::clamp(distance, samples.front().distance,
+                        samples.back().distance);
+  const auto upper = std::upper_bound(
+      samples.begin(), samples.end(), distance,
+      [](float d, const RoadNavigationSample &sample) {
+        return d < sample.distance;
+      });
+  const size_t i1 = upper == samples.end()
+                        ? samples.size() - 1
+                        : static_cast<size_t>(upper - samples.begin());
+  const size_t i0 = i1 > 0 ? i1 - 1 : 0;
+  const float span = samples[i1].distance - samples[i0].distance;
+  const float t = span > 1e-5f
+                      ? glm::clamp((distance - samples[i0].distance) / span,
+                                   0.0f, 1.0f)
+                      : 0.0f;
+  out.position = glm::mix(samples[i0].position, samples[i1].position, t);
+  out.direction = glm::mix(samples[i0].direction, samples[i1].direction, t);
+  const float directionLength = glm::length(out.direction);
+  if (directionLength > 1e-5f)
+    out.direction /= directionLength;
+  else
+    out.direction = samples[i0].direction;
+  out.curvature = glm::mix(samples[i0].curvature,
+                           samples[i1].curvature, t);
+  return true;
+}
+
+uint32_t chooseRoadRouteConnector(
+    const RoadLane &lane,
+    const std::vector<RoadLaneConnector> &connectors,
+    uint32_t &seed) {
+  std::vector<uint32_t> options;
+  for (uint32_t id : lane.outgoingConnectorIds) {
+    if (id < connectors.size() && connectors[id].fromLaneId == lane.id)
+      options.push_back(id);
+  }
+  if (options.empty())
+    return UINT32_MAX;
+  seed = seed * 1664525u + 1013904223u;
+  return options[seed % options.size()];
+}
+} // namespace
+
 void Car::resolveWheelMeshes() {
   if (!model)
     return;
@@ -462,8 +517,319 @@ void Car::updateRoamingAI(float dt, Terrain *terrain, float totalTime) {
   }
 }
 
+bool Car::startRoadRoute(Terrain *terrain, uint32_t laneId,
+                         float startDistance, uint32_t routeSeed) {
+  if (!terrain)
+    return false;
+  const RoadNavigationGraph &navigation = terrain->getRoadNavigationGraph();
+  const auto &lanes = navigation.lanes();
+  if (!navigation.isBuilt() || laneId >= lanes.size())
+    return false;
+  const RoadLane &lane = lanes[laneId];
+  RoadRoutePoint routePoint;
+  if (lane.samples.size() < 2 ||
+      !sampleRoadRoute(lane.samples, startDistance, routePoint))
+    return false;
+
+  roadRouteEnabled = true;
+  roadRouteStopped = false;
+  roadRouteOnConnector = false;
+  roadRouteLaneId = laneId;
+  roadRouteConnectorId = 0;
+  roadRouteSeed = routeSeed ? routeSeed : 1;
+  roadRouteNextConnectorId = lane.closed
+      ? UINT32_MAX
+      : chooseRoadRouteConnector(lane, navigation.laneConnectors(),
+                                 roadRouteSeed);
+  roadRouteLaneCount = navigation.lanes().size();
+  roadRouteConnectorCount = navigation.laneConnectors().size();
+  roadRouteProgress = glm::clamp(startDistance, 0.0f, lane.length);
+  roadRouteConnectorProgress = 0.0f;
+  roadRouteSpeedMps = 0.0f;
+  roadRouteTrafficSpeedCapMps = 100.0f;
+  state = State::ROAMING;
+  needsInitialSnap = false;
+  hasPreviousRenderState = false;
+  physicsAccumulator = 0.0f;
+  velocity = Vec3(0.0f, 0.0f, 0.0f);
+  angularVel = glm::vec3(0.0f);
+  engine.throttle = 0.0f;
+
+  position.x = routePoint.position.x;
+  position.z = routePoint.position.y;
+  const glm::vec2 direction = glm::normalize(routePoint.direction);
+  yaw = std::atan2(-direction.x, direction.y);
+
+  const glm::vec2 right(direction.y, -direction.x);
+  const float frontHeight = terrain->getGroundSurfaceHeight(
+      position.x + direction.x * (m_Wheelbase * 0.5f),
+      position.z + direction.y * (m_Wheelbase * 0.5f));
+  const float rearHeight = terrain->getGroundSurfaceHeight(
+      position.x - direction.x * (m_Wheelbase * 0.5f),
+      position.z - direction.y * (m_Wheelbase * 0.5f));
+  const float leftHeight = terrain->getGroundSurfaceHeight(
+      position.x - right.x * (m_TrackWidth * 0.5f),
+      position.z - right.y * (m_TrackWidth * 0.5f));
+  const float rightHeight = terrain->getGroundSurfaceHeight(
+      position.x + right.x * (m_TrackWidth * 0.5f),
+      position.z + right.y * (m_TrackWidth * 0.5f));
+  pitchAngle = glm::clamp(std::atan2(frontHeight - rearHeight, m_Wheelbase),
+                          -0.35f, 0.35f);
+  rollAngle = glm::clamp(std::atan2(rightHeight - leftHeight, m_TrackWidth),
+                         -0.40f, 0.40f);
+  position.y = terrain->getGroundSurfaceHeight(position.x, position.z) +
+               wheels[0].radius + wheels[0].suspensionRest - 0.08f;
+  rotation = glm::angleAxis(-yaw + glm::pi<float>(),
+                            glm::vec3(0.0f, 1.0f, 0.0f)) *
+             glm::angleAxis(pitchAngle, glm::vec3(1.0f, 0.0f, 0.0f)) *
+             glm::angleAxis(rollAngle, glm::vec3(0.0f, 0.0f, 1.0f));
+  return true;
+}
+
+Car::RoadTrafficStatus Car::getRoadTrafficStatus(
+    const RoadNavigationGraph &navigation) const {
+  RoadTrafficStatus status;
+  if (!roadRouteEnabled)
+    return status;
+  const auto &lanes = navigation.lanes();
+  if (roadRouteLaneId >= lanes.size())
+    return status;
+  const RoadLane &lane = lanes[roadRouteLaneId];
+  status.routeActive = roadRouteEnabled;
+  status.laneId = roadRouteLaneId;
+  status.laneProgress = roadRouteProgress;
+  status.laneLength = lane.length;
+  status.laneClosed = lane.closed;
+  status.onConnector = roadRouteOnConnector;
+  status.connectorId = roadRouteOnConnector
+      ? roadRouteConnectorId : roadRouteNextConnectorId;
+  status.hasConnector = roadRouteOnConnector ||
+      roadRouteNextConnectorId != UINT32_MAX;
+  status.distanceToConnector = roadRouteOnConnector
+      ? 0.0f : std::max(0.0f, lane.length - roadRouteProgress);
+  status.connectorProgress = roadRouteOnConnector
+      ? roadRouteConnectorProgress : 0.0f;
+  status.speedMps = roadRouteSpeedMps;
+  return status;
+}
+
+void Car::setRoadTrafficSpeedCap(float speedMps) {
+  roadRouteTrafficSpeedCapMps =
+      std::isfinite(speedMps) ? std::max(0.0f, speedMps) : 100.0f;
+}
+
+bool Car::updateRoadRoute(float dt, Terrain *terrain) {
+  if (!roadRouteEnabled || !terrain)
+    return false;
+  const RoadNavigationGraph &navigation = terrain->getRoadNavigationGraph();
+  const auto &lanes = navigation.lanes();
+  const auto &connectors = navigation.laneConnectors();
+  if (!navigation.isBuilt() || lanes.empty()) {
+    roadRouteEnabled = false;
+    state = State::PARKED;
+    return false;
+  }
+
+  auto rebindToNearestLane = [&]() {
+    float bestDistanceSq = 80.0f * 80.0f;
+    uint32_t bestLaneId = UINT32_MAX;
+    float bestProgress = 0.0f;
+    const glm::vec2 current(position.x, position.z);
+    for (const RoadLane &candidate : lanes) {
+      if (candidate.length < 2.0f || candidate.samples.size() < 2 ||
+          (!candidate.closed && candidate.outgoingConnectorIds.empty()))
+        continue;
+      for (const RoadNavigationSample &sample : candidate.samples) {
+        const float distanceSq = glm::dot(sample.position - current,
+                                          sample.position - current);
+        if (distanceSq < bestDistanceSq) {
+          bestDistanceSq = distanceSq;
+          bestLaneId = candidate.id;
+          bestProgress = sample.distance;
+        }
+      }
+    }
+    if (bestLaneId == UINT32_MAX)
+      return false;
+    const uint32_t seed = roadRouteSeed;
+    return startRoadRoute(terrain, bestLaneId, bestProgress, seed);
+  };
+
+  if (roadRouteLaneCount != lanes.size() ||
+      roadRouteConnectorCount != connectors.size() ||
+      roadRouteLaneId >= lanes.size() ||
+      (roadRouteOnConnector && roadRouteConnectorId >= connectors.size())) {
+    if (!rebindToNearestLane()) {
+      roadRouteEnabled = false;
+      state = State::PARKED;
+      return false;
+    }
+  }
+
+  const std::vector<RoadNavigationSample> *activeSamples = nullptr;
+  float activeProgress = 0.0f;
+  if (roadRouteOnConnector) {
+    const RoadLaneConnector &connector = connectors[roadRouteConnectorId];
+    activeSamples = &connector.samples;
+    activeProgress = roadRouteConnectorProgress;
+  } else {
+    const RoadLane &lane = lanes[roadRouteLaneId];
+    activeSamples = &lane.samples;
+    activeProgress = roadRouteProgress;
+  }
+  RoadRoutePoint expectedPoint;
+  if (!activeSamples || !sampleRoadRoute(*activeSamples, activeProgress,
+                                         expectedPoint) ||
+      glm::length(expectedPoint.position - glm::vec2(position.x, position.z)) >
+          80.0f) {
+    if (!rebindToNearestLane()) {
+      roadRouteEnabled = false;
+      state = State::PARKED;
+      return false;
+    }
+  }
+
+  const float safeDt = glm::clamp(dt, 0.0f, 0.1f);
+  const float maxTravelSpeed = 8.0f;
+  auto targetSpeedForLane = [&](uint32_t laneId) {
+    const float roadSpeed = lanes[laneId].speedLimit > 0.0f
+                                ? lanes[laneId].speedLimit
+                                : maxTravelSpeed;
+    return glm::clamp(roadSpeed, 2.0f, maxTravelSpeed);
+  };
+  const float routeSpeed = roadRouteOnConnector
+                               ? std::min(5.0f,
+                                   targetSpeedForLane(roadRouteLaneId))
+                               : targetSpeedForLane(roadRouteLaneId);
+  const float targetSpeed = roadRouteStopped
+      ? 0.0f : std::min(routeSpeed, roadRouteTrafficSpeedCapMps);
+  const float speedDelta = targetSpeed - roadRouteSpeedMps;
+  roadRouteSpeedMps += glm::clamp(speedDelta, -4.0f * safeDt,
+                                  2.0f * safeDt);
+
+  float remaining = roadRouteSpeedMps * safeDt;
+  for (int transitions = 0; remaining > 1e-4f && transitions < 8;
+       ++transitions) {
+    if (roadRouteStopped)
+      break;
+    const std::vector<RoadNavigationSample> *samples = nullptr;
+    float *progress = nullptr;
+    if (roadRouteOnConnector) {
+      const RoadLaneConnector &connector = connectors[roadRouteConnectorId];
+      samples = &connector.samples;
+      progress = &roadRouteConnectorProgress;
+    } else {
+      const RoadLane &lane = lanes[roadRouteLaneId];
+      samples = &lane.samples;
+      progress = &roadRouteProgress;
+    }
+    if (!samples || samples->size() < 2) {
+      roadRouteStopped = true;
+      roadRouteSpeedMps = 0.0f;
+      break;
+    }
+    const float pathLength = samples->back().distance;
+    const float toEnd = std::max(0.0f, pathLength - *progress);
+    if (remaining < toEnd) {
+      *progress += remaining;
+      remaining = 0.0f;
+      break;
+    }
+    remaining -= toEnd;
+    *progress = pathLength;
+    if (roadRouteOnConnector) {
+      const RoadLaneConnector &connector = connectors[roadRouteConnectorId];
+      roadRouteLaneId = connector.toLaneId;
+      roadRouteProgress = 0.0f;
+      roadRouteConnectorProgress = 0.0f;
+      roadRouteOnConnector = false;
+      if (roadRouteLaneId >= lanes.size()) {
+        roadRouteStopped = true;
+        roadRouteSpeedMps = 0.0f;
+      } else {
+        const RoadLane &nextLane = lanes[roadRouteLaneId];
+        roadRouteNextConnectorId = nextLane.closed
+            ? UINT32_MAX
+            : chooseRoadRouteConnector(nextLane, connectors,
+                                       roadRouteSeed);
+      }
+    } else {
+      const RoadLane &lane = lanes[roadRouteLaneId];
+      if (lane.closed && pathLength > 1e-4f) {
+        roadRouteProgress = 0.0f;
+      } else if (roadRouteNextConnectorId == UINT32_MAX ||
+                 roadRouteNextConnectorId >= connectors.size() ||
+                 connectors[roadRouteNextConnectorId].fromLaneId != lane.id) {
+        roadRouteStopped = true;
+        roadRouteSpeedMps = 0.0f;
+      } else {
+        roadRouteConnectorId = roadRouteNextConnectorId;
+        roadRouteNextConnectorId = UINT32_MAX;
+        if (connectors[roadRouteConnectorId].toLaneId >= lanes.size()) {
+          roadRouteStopped = true;
+          roadRouteSpeedMps = 0.0f;
+        } else {
+          roadRouteConnectorProgress = 0.0f;
+          roadRouteOnConnector = true;
+        }
+      }
+    }
+  }
+
+  const std::vector<RoadNavigationSample> *samples = roadRouteOnConnector
+      ? &connectors[roadRouteConnectorId].samples
+      : &lanes[roadRouteLaneId].samples;
+  const float progress = roadRouteOnConnector
+      ? roadRouteConnectorProgress : roadRouteProgress;
+  RoadRoutePoint routePoint;
+  if (!sampleRoadRoute(*samples, progress, routePoint))
+    return true;
+
+  const glm::vec2 direction = glm::normalize(routePoint.direction);
+  position.x = routePoint.position.x;
+  position.z = routePoint.position.y;
+  const glm::vec2 right(direction.y, -direction.x);
+  const float halfWheelbase = m_Wheelbase * 0.5f;
+  const float halfTrack = m_TrackWidth * 0.5f;
+  const float frontHeight = terrain->getGroundSurfaceHeight(
+      position.x + direction.x * halfWheelbase,
+      position.z + direction.y * halfWheelbase);
+  const float rearHeight = terrain->getGroundSurfaceHeight(
+      position.x - direction.x * halfWheelbase,
+      position.z - direction.y * halfWheelbase);
+  const float leftHeight = terrain->getGroundSurfaceHeight(
+      position.x - right.x * halfTrack, position.z - right.y * halfTrack);
+  const float rightHeight = terrain->getGroundSurfaceHeight(
+      position.x + right.x * halfTrack, position.z + right.y * halfTrack);
+  pitchAngle = glm::clamp(std::atan2(frontHeight - rearHeight, m_Wheelbase),
+                          -0.35f, 0.35f);
+  rollAngle = glm::clamp(std::atan2(rightHeight - leftHeight, m_TrackWidth),
+                         -0.40f, 0.40f);
+  position.y = terrain->getGroundSurfaceHeight(position.x, position.z) +
+               wheels[0].radius + wheels[0].suspensionRest - 0.08f;
+  yaw = std::atan2(-direction.x, direction.y);
+  rotation = glm::angleAxis(-yaw + glm::pi<float>(),
+                            glm::vec3(0.0f, 1.0f, 0.0f)) *
+             glm::angleAxis(pitchAngle, glm::vec3(1.0f, 0.0f, 0.0f)) *
+             glm::angleAxis(rollAngle, glm::vec3(0.0f, 0.0f, 1.0f));
+  steerAngle = glm::clamp(std::atan(m_Wheelbase * routePoint.curvature),
+                          -MAX_STEER_ANGLE, MAX_STEER_ANGLE);
+  velocity = Vec3(direction.x * roadRouteSpeedMps, 0.0f,
+                  direction.y * roadRouteSpeedMps);
+  for (Wheel &wheel : wheels) {
+    wheel.angularVelocity = roadRouteSpeedMps / std::max(wheel.radius, 0.1f);
+    wheel.spinAngle += wheel.angularVelocity * safeDt;
+    wheel.grounded = true;
+    wheel.currentLength = wheel.suspensionRest;
+  }
+  return true;
+}
+
 void Car::update(float dt, Terrain *terrain, float totalTime, Camera *camera) {
   if (!terrain)
+    return;
+
+  if (roadRouteEnabled && updateRoadRoute(dt, terrain))
     return;
 
   // ── One-time initial snap to terrain ─────────────────────────────────────

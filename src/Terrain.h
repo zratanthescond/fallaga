@@ -85,8 +85,10 @@ public:
     RoadGraph*       getRoadGraph()       const { return roadGraph; }
     RoadMeshBuilder* getRoadMeshBuilder() const { return roadMeshBuilder; }
     RoadTileField*   getRoadTileField()   const { return roadTileField; }
+    const RoadNavigationGraph& getRoadNavigationGraph() const { return roadNavigationGraph; }
     HeightSampler&   getRoadHeightSampler()     { return roadHeightSampler; }
     void rebuildRoadMesh();
+    void rebuildRoadNavigation();
     // Re-seats the road ribbon on the heightfield the GPU actually draws.
     // The roads are sampled from the native DEM grid while the terrain mesh is built
     // from the visual grid, and conforming terrain to the road only moves the coarse
@@ -138,12 +140,16 @@ private:
     std::vector<unsigned char> wadiSurfaceMask;
     int wadiSurfaceMaskW = 0;
     int wadiSurfaceMaskH = 0;
+    std::vector<unsigned char> beachSplatMask;
+    int beachSplatMaskW = 0;
+    int beachSplatMaskH = 0;
 
     // Geometry-based road system
     RoadGraph*       roadGraph       = nullptr;
     RoadDeformer*    roadDeformer    = nullptr;
     RoadMeshBuilder* roadMeshBuilder = nullptr;
     RoadTileField*   roadTileField   = nullptr;
+    RoadNavigationGraph roadNavigationGraph;
     HeightSampler    roadHeightSampler;
     TerrainCoordinateMapper roadMapper;   // plan→world transform shared by the road pipeline
     ObjModel* trainStationModel = nullptr;
@@ -180,6 +186,7 @@ private:
     std::uint64_t collisionSurfaceRevision = 0;
     // TerrainManager::getHeightRevision() value the height samplers were built for.
     unsigned int cachedHeightRevision = 0;
+    unsigned int cachedHeightmapRevision = 0;
 
     // GTA-style visibility caching: instanced object culling is expensive to redo
     // every frame across thousands of instances, and re-uploading GPU instance

@@ -9,6 +9,7 @@
 #include <queue>
 #include <glm/glm.hpp>
 #include "TerrainManager.h"
+#include "WaterLevel.h"
 
 class WaterSimulation {
 public:
@@ -251,7 +252,7 @@ private:
 
     float worldMinX = 0.0f, worldMaxX = 0.0f;
     float worldMinZ = 0.0f, worldMaxZ = 0.0f;
-    float oceanWaterLevel = -55.0f;
+    float oceanWaterLevel = TerrainConfig::kBaseWaterLevel;
 };
 
 #endif // WATER_SIMULATION_H

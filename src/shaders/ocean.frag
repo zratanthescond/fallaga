@@ -70,14 +70,15 @@ void main() {
             float normElev = texture(heightmapTex, vec2(u, v)).r;
             terrainH = hmMinElev + normElev * (hmMaxElev - hmMinElev);
 
-            // Precise 8129x8129 heightmap cutoff: dry land is strictly discarded
-            // with sub-meter smooth shoreline precision (eliminates all 109m square teeth)
+            // Use the same interpolated heightfield as the terrain. A hard discard
+            // at exactly zero depth aliases the coast at screen resolution, so keep
+            // a one-pixel coverage ramp around the true waterline instead.
             float rawDepth = min(waterLevel, connectedWaterLevel) - terrainH;
-            if (rawDepth <= 0.005) discard;
+            float shorelineAa = max(fwidth(rawDepth), 0.02);
+            if (rawDepth < -shorelineAa) discard;
 
             waterDepth = max(0.0, rawDepth);
-            shoreEdge = smoothstep(0.0, 0.30, waterDepth);
-            if (shoreEdge <= 0.001) discard;
+            shoreEdge = smoothstep(-shorelineAa, shorelineAa, rawDepth);
 
             // Sample river mask (Blue channel)
             isRiver = texture(roadMask, vec2(u, v)).b;

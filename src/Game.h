@@ -5,6 +5,8 @@
 #include "Horse.h"
 #include "Sky.h"
 #include "WaterSimulation.h"
+#include "WaterLevel.h"
+#include <unordered_map>
 
 class Game {
 public:
@@ -36,7 +38,7 @@ public:
     float sculptGradeDegrees = 20.0f;
     glm::vec3 lastRayHitPos = glm::vec3(0.0f, -1000.0f, 0.0f);
     bool rayHitTerrain = false;
-    float waterLevelAdjust = -55.0f; // Real-time sea level
+    float waterLevelAdjust = TerrainConfig::kBaseWaterLevel; // Real-time sea level in world metres
     // ── Road Edit mode state ──
     int roadToolMode = 0;              // 0=Select Road, 1=Draw Road, 2=Edit Points
     int selectedRoadIdx = -1;
@@ -45,6 +47,11 @@ public:
     bool draftInsertNewly = false;     // draw-tool: the dragged point was freshly inserted (edge split)
     bool roadScalingSelected = false;  // select-tool: scaling selected road with = / - keys
     bool roadGraphDirty = false;
+    bool roadNavigationDebugVisible = false;
+    bool roadNavLanesVisible = true;
+    bool roadNavConnectorsVisible = true;
+    bool roadNavConflictsVisible = true;
+    bool roadNavWalksVisible = true;
     std::vector<glm::vec3> roadDraftPoints;
     float roadTransformScale = 1.0f;   // whole-map scale factor (applied via button)
     float roadConnectTolerance = 25.0f; // connect-roads snap/merge tolerance (m)
@@ -60,6 +67,11 @@ public:
     float roadDrawWidth = 8.0f;        // m
     float roadDrawShoulder = 1.5f;     // m
     float roadDrawCornerRadius = 0.0f;  // m; 0 uses the road-width-based automatic curve
+    uint8_t roadDrawLanesPerDirection = 0; // 0 = automatic from width
+    bool roadDrawOneWay = false;
+    float roadDrawSpeedLimitMps = 0.0f; // 0 = automatic from road type
+    bool roadDrawSidewalks = true;
+    float roadDrawSidewalkWidth = 0.0f; // 0 = automatic from road type
     bool roadDrawClosedLoop = false;   // close the next drawn road into a continuous ring
     // Reference image overlay (loaded in road edit mode)
     bool roadRefVisible = true;
@@ -112,6 +124,7 @@ public:
     Horse* horse;
     Sky* sky;
     class Car* car;
+    std::vector<class Car*> trafficCars;
     WaterSimulation waterSim;
     int windowWidth;
     int windowHeight;
@@ -120,6 +133,8 @@ public:
     double totalTime;
 
 private:
+    void updateTrafficControls();
+    std::unordered_map<class Car*, uint32_t> activeTrafficConnectorReservations;
     bool quitRequested = false;
     int requestedExitCode = 0;
     // Cache for the reference map draped over the terrain (road edit mode only).
@@ -149,4 +164,5 @@ private:
     bool gpuPhasePending[kGpuPhaseSlots] = {};
     double gpuPhaseAccum[kGpuPhaseCount] = {};
     int gpuPhaseSampleCount = 0;
+    unsigned int waterHeightRevision = 0;
 };

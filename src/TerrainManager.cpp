@@ -80,8 +80,10 @@ TerrainManager::TerrainManager(const std::string& hmPath, const std::string& pmP
         physicsVisualHeights = visualHeights;
     }
 
-    int numChunksX = (visualW - 1) / stride;
-    int numChunksZ = (visualH - 1) / stride;
+    // Use a final partial chunk when the heightmap dimensions are not an exact
+    // multiple of the chunk stride, so the mesh reaches the map's east/south edges.
+    int numChunksX = (visualW - 1 + stride - 1) / stride;
+    int numChunksZ = (visualH - 1 + stride - 1) / stride;
     
     std::cout << "[TerrainManager] Visual Grid: " << visualW << "x" << visualH 
               << " -> " << numChunksX << "x" << numChunksZ << " chunks (" 
@@ -113,7 +115,7 @@ TerrainManager::~TerrainManager() {
     if (terrainRoughArray) glDeleteTextures(1, &terrainRoughArray);
     roadGeometryMask = heightmapTexID = roadMask = 0;
     terrainLayerArray = terrainNormalArray = terrainDispArray = terrainRoughArray = 0;
-    // portMask / albedoTex / splatmap2Tex are owned by TextureEngine's cache and
+    // portMask / albedoTex / splatmap2Tex / terrainSplatTex are owned by TextureEngine's cache and
     // are released by TextureEngine::cleanup(), so they are deliberately not
     // deleted here (that would be a double free).
     delete terrainShader;
@@ -150,6 +152,7 @@ void TerrainManager::loadHeightmap(const std::string& path) {
         // `resize` may reallocate; tell caching consumers (HeightSampler) that any
         // pointer they hold to the previous buffer is now dangling.
         ++heightRevision;
+        ++heightmapRevision;
 
         // Single loop to convert 16-bit raw data to float elevations
         float invDivisor = 1.0f / 65535.0f;
@@ -187,6 +190,7 @@ void TerrainManager::setupTextures(const std::string& pmPath) {
     portMask = TextureEngine::Instance().loadTexture(pmPath, false);
     albedoTex = TextureEngine::Instance().loadTexture("assets/terrain/splatmap1.png", false);
     splatmap2Tex = TextureEngine::Instance().loadTexture("assets/terrain/splatmap2.png", false);
+    terrainSplatTex = TextureEngine::Instance().loadTexture("assets/terrain/terrain_splat.png", false);
     
     int rw, rh, rch;
     unsigned char* roadData = stbi_load("assets/terrain/roadMap.png", &rw, &rh, &rch, 4);
@@ -321,10 +325,17 @@ void TerrainManager::update(const glm::vec3& camPos) {
                     visualHeights = heights;
                 }
                 physicsVisualHeights = visualHeights;
+                // Previous road cut/conform offsets and editor refinement belong
+                // to the old DEM. Do not subtract them from the newly loaded map.
+                appliedRoadOffsets.assign(visualHeights.size(), 0.0f);
+                appliedRoadConformOffsets.assign(visualHeights.size(), 0.0f);
+                refinement = TerrainRefinement{};
 
                 // 3. Regenerate mesh for each existing chunk!
-                int numChunksX = (visualW - 1) / stride;
-                int numChunksZ = (visualH - 1) / stride;
+                // Match startup chunk coverage for a newly loaded heightmap,
+                // including a final partial chunk at the image edges.
+                int numChunksX = (visualW - 1 + stride - 1) / stride;
+                int numChunksZ = (visualH - 1 + stride - 1) / stride;
                 
                 // Clear and recreate chunks if visual resolution changed, otherwise update their meshes
                 if ((int)chunks.size() != numChunksX * numChunksZ) {
@@ -415,6 +426,8 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
     glActiveTexture(GL_TEXTURE5); glBindTexture(GL_TEXTURE_2D, splatmap2Tex); terrainShader->setInt("splatmap2", 5);
     glActiveTexture(GL_TEXTURE6); glBindTexture(GL_TEXTURE_2D, roadGeometryMask ? roadGeometryMask : roadMask);
     terrainShader->setInt("splineRoadMask", 6);
+    glActiveTexture(GL_TEXTURE7); glBindTexture(GL_TEXTURE_2D, terrainSplatTex);
+    terrainShader->setInt("terrainSplatmap", 7);
     terrainShader->setBool("hasRoadMask", hasRoadMask);
     terrainShader->setBool("hasSplineRoadMask", hasRoadGeometryMask);
     terrainShader->setInt("activePaintLayerIdx", activePaintLayerIdx);

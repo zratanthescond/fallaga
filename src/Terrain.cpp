@@ -1,4 +1,5 @@
 #include "Terrain.h"
+#include "WaterLevel.h"
 #include "PhysicsSystem.h"
 #include "WaterSimulation.h"
 #include "ProceduralMapData.h"
@@ -21,7 +22,7 @@
 #include <stb_image.h>
 #include <vector>
 // Keep the water below the mapped coastal shelf; connected masking excludes inland pits.
-static constexpr float WATER_BASE = -55.0f;
+static constexpr float WATER_BASE = TerrainConfig::kBaseWaterLevel;
 static float waterLevelOffset = 0.0f; // Positive raises terrain (lowers water)
 static float waterLevelRuntime = WATER_BASE;  // Real-time editor override
 
@@ -310,26 +311,45 @@ Terrain::Terrain() {
                                       "assets/terrain/textureMap.png", -13938.0f,
                                       13938.0f, -13938.0f, 13938.0f, -70.0f, 87.8f);
 
-  // Keep the gameplay surface mask small: the source is 8129x8129, while a
-  // 1024-ish nearest-neighbor copy is enough to identify broad wadi channels.
+  int splatW = 0, splatH = 0, splatChannels = 0;
+  unsigned char* splatPixels = stbi_load("assets/terrain/terrain_splat.png",
+                                         &splatW, &splatH, &splatChannels, 4);
+  if (splatPixels && splatW > 0 && splatH > 0) {
+    beachSplatMask.resize(static_cast<size_t>(splatW) * splatH);
+    for (size_t i = 0; i < beachSplatMask.size(); ++i)
+      beachSplatMask[i] = splatPixels[i * 4]; // R = coastal sand weight
+    beachSplatMaskW = splatW;
+    beachSplatMaskH = splatH;
+    stbi_image_free(splatPixels);
+  } else {
+    if (splatPixels) stbi_image_free(splatPixels);
+    std::cerr << "[Terrain] terrain_splat.png unavailable; beach zone mask is disabled.\n";
+  }
+
+  // Reduce the native wadi mask onto the DEM grid. MIN pooling preserves black
+  // channel pixels that nearest-neighbor decimation would otherwise skip.
   int wadiW = 0, wadiH = 0, wadiChannels = 0;
   unsigned char* wadiPixels = stbi_load("assets/terrain/heightmap_wadis.png",
                                        &wadiW, &wadiH, &wadiChannels, 1);
   if (wadiPixels && wadiW > 0 && wadiH > 0) {
-    const int stride = std::max(1, (std::max(wadiW, wadiH) + 1023) / 1024);
-    wadiSurfaceMaskW = (wadiW + stride - 1) / stride;
-    wadiSurfaceMaskH = (wadiH + stride - 1) / stride;
+    wadiSurfaceMaskW = std::max(1, terrainManager->getGridW());
+    wadiSurfaceMaskH = std::max(1, terrainManager->getGridH());
     wadiSurfaceMask.resize(static_cast<size_t>(wadiSurfaceMaskW) * wadiSurfaceMaskH);
     for (int y = 0; y < wadiSurfaceMaskH; ++y) {
-      const int sourceY = std::min(y * stride, wadiH - 1);
+      const int sourceY0 = y * wadiH / wadiSurfaceMaskH;
+      const int sourceY1 = std::max(sourceY0 + 1, (y + 1) * wadiH / wadiSurfaceMaskH);
       for (int x = 0; x < wadiSurfaceMaskW; ++x) {
-        const int sourceX = std::min(x * stride, wadiW - 1);
-        wadiSurfaceMask[static_cast<size_t>(y) * wadiSurfaceMaskW + x] =
-            wadiPixels[static_cast<size_t>(sourceY) * wadiW + sourceX];
+        const int sourceX0 = x * wadiW / wadiSurfaceMaskW;
+        const int sourceX1 = std::max(sourceX0 + 1, (x + 1) * wadiW / wadiSurfaceMaskW);
+        unsigned char minMask = 255;
+        for (int sy = sourceY0; sy < std::min(sourceY1, wadiH); ++sy)
+          for (int sx = sourceX0; sx < std::min(sourceX1, wadiW); ++sx)
+            minMask = std::min(minMask, wadiPixels[static_cast<size_t>(sy) * wadiW + sx]);
+        wadiSurfaceMask[static_cast<size_t>(y) * wadiSurfaceMaskW + x] = minMask;
       }
     }
     stbi_image_free(wadiPixels);
-    std::cout << "[Terrain] Loaded wadi surface mask: " << wadiSurfaceMaskW
+    std::cout << "[Terrain] Loaded wadi surface mask (channel-preserving reduction): " << wadiSurfaceMaskW
               << "x" << wadiSurfaceMaskH << std::endl;
   } else {
     if (wadiPixels) stbi_image_free(wadiPixels);
@@ -359,6 +379,7 @@ Terrain::Terrain() {
       roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
                              terrainManager->getGridW(), terrainManager->getGridH());
       cachedHeightRevision = terrainManager->getHeightRevision();
+      cachedHeightmapRevision = terrainManager->getHeightmapRevision();
       roadMapper = mapper;
 
       // 2. Road graph: the old auto-traced road network is REMOVED â€” roads are
@@ -369,6 +390,7 @@ Terrain::Terrain() {
           // The JSON stores plan coordinates; translate into DEM world space
           // (mirrors what saveRoadsToJSON does in reverse).
           offsetRoadGraphToWorld(*roadGraph, HISTORIC_PLAN_OFFSET_X, HISTORIC_PLAN_OFFSET_Z);
+          verifyRoadAnchors(*roadGraph);
           roadGraph->buildTopology();
           std::cout << "[Terrain] Road system: restored " << roadGraph->segments.size()
                     << " manually drawn road segments\n";
@@ -382,6 +404,8 @@ Terrain::Terrain() {
       for (auto& seg : roadGraph->segments) {
           RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
       }
+      roadGraph->buildTopology();
+      roadNavigationGraph.build(*roadGraph);
       roadMeshBuilder = new RoadMeshBuilder();
       // Build a flat support ribbon for the terrain conform pass. The rendered
       // crowned mesh is rebuilt from the resulting heightfield in snapRoads.
@@ -1095,7 +1119,11 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           if (distToCity < 600.0f) continue;
 
           float wy = terrainManager->getHeightAt(cx, cz);
-          if (wy < -44.0f) continue; // Skip sea
+          if (wy <= getWaterLevel() + 0.5f) continue;
+          const Zone groundZone = getZoneAt(cx, cz);
+          if (groundZone == Zone::SEA || groundZone == Zone::BEACH ||
+              groundZone == Zone::PORT || groundZone == Zone::WADI)
+              continue;
 
           glm::vec3 normal = terrainManager->getNormalAt(cx, cz);
           float slope = 1.0f - normal.y;
@@ -1128,7 +1156,11 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
               float pz = cz + oz;
 
               float py = terrainManager->getHeightAt(px, pz);
-              if (py < -44.0f) continue;
+              if (py <= getWaterLevel() + 0.5f) continue;
+              const Zone patchZone = getZoneAt(px, pz);
+              if (patchZone == Zone::SEA || patchZone == Zone::BEACH ||
+                  patchZone == Zone::PORT || patchZone == Zone::WADI)
+                  continue;
 
               glm::mat4 mat(1.0f);
               mat = glm::translate(mat, glm::vec3(px, py, pz));
@@ -1155,7 +1187,11 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           if (distToCity < 600.0f) continue;
 
           float wy = terrainManager->getHeightAt(rx, rz);
-          if (wy < -44.0f) continue; // Skip sea
+          if (wy <= getWaterLevel() + 0.5f) continue;
+          const Zone groundZone = getZoneAt(rx, rz);
+          if (groundZone == Zone::SEA || groundZone == Zone::BEACH ||
+              groundZone == Zone::PORT || groundZone == Zone::WADI)
+              continue;
 
           glm::vec3 normal = terrainManager->getNormalAt(rx, rz);
           float slope = 1.0f - normal.y;
@@ -2508,10 +2544,24 @@ Terrain::Zone Terrain::getZoneAt(float x, float z) const {
   if (pointInPolygon(planX, planZ, port)) return Zone::PORT;
   if (pointInPolygon(planX, planZ, villeNouvelle)) return Zone::VILLE_NOUVELLE;
 
-  // The coastal band is low and lies east of the historic plan; urban port
-  // ground was handled above so this only labels exposed shoreline as beach.
-  if (x > 4650.0f && groundHeight <= getWaterLevel() + 8.0f)
-    return Zone::BEACH;
+  // The generated red splat channel marks low land near connected sea. It
+  // replaces the old world-X cutoff and leaves inland depressions unclassified.
+  if (!beachSplatMask.empty() && groundHeight <= getWaterLevel() + 8.0f) {
+    const float u = glm::clamp(
+        (x - terrainManager->getWorldMinX()) /
+            (terrainManager->getWorldMaxX() - terrainManager->getWorldMinX()),
+        0.0f, 1.0f);
+    const float v = glm::clamp(
+        (z - terrainManager->getWorldMinZ()) /
+            (terrainManager->getWorldMaxZ() - terrainManager->getWorldMinZ()),
+        0.0f, 1.0f);
+    const int px = std::clamp(static_cast<int>(u * (beachSplatMaskW - 1)),
+                              0, beachSplatMaskW - 1);
+    const int pz = std::clamp(static_cast<int>(v * (beachSplatMaskH - 1)),
+                              0, beachSplatMaskH - 1);
+    if (beachSplatMask[static_cast<size_t>(pz) * beachSplatMaskW + px] >= 32)
+      return Zone::BEACH;
+  }
 
   if (!wadiSurfaceMask.empty() && wadiSurfaceMaskW > 0 && wadiSurfaceMaskH > 0) {
     const float u = glm::clamp(
@@ -2561,7 +2611,9 @@ void Terrain::update(const glm::vec3& camPos) {
 
 void Terrain::refreshHeightDependentCaches() {
   if (!terrainManager) return;
-  if (cachedHeightRevision == terrainManager->getHeightRevision()) return;
+  const unsigned int heightRevision = terrainManager->getHeightRevision();
+  const unsigned int heightmapRevision = terrainManager->getHeightmapRevision();
+  if (cachedHeightRevision == heightRevision) return;
 
   TerrainCoordinateMapper mapper;
   mapper.bounds = { terrainManager->getWorldMinX(), terrainManager->getWorldMaxX(),
@@ -2573,9 +2625,16 @@ void Terrain::refreshHeightDependentCaches() {
   roadHeightSampler.init(mapper, terrainManager->getHeightsData(),
                          terrainManager->getGridW(), terrainManager->getGridH());
   roadMapper = mapper;
-  cachedHeightRevision = terrainManager->getHeightRevision();
+  cachedHeightRevision = heightRevision;
   std::cout << "[Terrain] Heightfield reloaded; road height sampler re-initialised."
             << std::endl;
+  const bool newSourceHeightmap = cachedHeightmapRevision != heightmapRevision;
+  cachedHeightmapRevision = heightmapRevision;
+  if (newSourceHeightmap && roadGraph && roadMeshBuilder && !roadGraph->segments.empty()) {
+    rebuildRoadMesh();
+    markBatchesDirty();
+    std::cout << "[Terrain] Road mesh re-seated on the reloaded heightmap.\n";
+  }
 }
 
 void Terrain::saveTerrain() {
@@ -2619,6 +2678,7 @@ void Terrain::rebuildRoadMesh() {
     RoadSpline::evaluate(seg, roadHeightSampler, 0.5f);
   }
   roadGraph->buildTopology();
+  roadNavigationGraph.build(*roadGraph);
   roadMeshBuilder->destroy();
   // Use a flat support ribbon while grading the terrain; snapRoads rebuilds
   // the final visible ribbon with its crown after the heightfield is settled.
@@ -2644,6 +2704,13 @@ void Terrain::rebuildRoadMesh() {
   std::cout << "[Terrain] Road mesh rebuilt: " << roadGraph->segments.size()
             << " segments, " << roadMeshBuilder->getVertexCount() << " vertices, "
             << roadMeshBuilder->getTriangleCount() << " triangles" << std::endl;
+}
+
+void Terrain::rebuildRoadNavigation() {
+  if (!roadGraph)
+    return;
+  roadGraph->buildTopology();
+  roadNavigationGraph.build(*roadGraph);
 }
 
 void Terrain::snapRoadsToRenderedTerrain() {

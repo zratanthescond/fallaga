@@ -1,4 +1,5 @@
 #include "TerrainChunk.h"
+#include "WaterLevel.h"
 #include <algorithm>
 #include <iostream>
 
@@ -14,6 +15,11 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
                                 const std::vector<unsigned char>* roadMaskData, int roadW, int roadH,
                                 const std::function<int(int, int)>* refineLevel,
                                 const HeightFn& sampleHeight) {
+    // Keep this in sync with Terrain.cpp's WATER_BASE. Subdivide only cells the
+    // sea-level contour crosses; sample their existing bilinear height surface so
+    // the shoreline gains geometric resolution without editing the heightmap.
+    constexpr float kShorelineLevel = TerrainConfig::kBaseWaterLevel;
+    constexpr int kShorelineRefinementLevel = 3; // 8x8 subcells, about 1.4 m per edge
     std::vector<Vertex> vertices;
     std::vector<unsigned int> indices;
 
@@ -59,19 +65,31 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
         return glm::normalize(glm::vec3((hL - hR) / (2.0f * pixelSpacingX), 1.0f,
                                         (hS - hN) / (2.0f * pixelSpacingZ)));
     };
+    auto crossesShoreline = [&](int gx, int gz) -> bool {
+        if (gx < 0 || gz < 0 || gx + 1 >= globalW || gz + 1 >= globalH) return false;
+        const float h00 = globalHeights[gz * globalW + gx];
+        const float h10 = globalHeights[gz * globalW + gx + 1];
+        const float h01 = globalHeights[(gz + 1) * globalW + gx];
+        const float h11 = globalHeights[(gz + 1) * globalW + gx + 1];
+        const float lo = std::min(std::min(h00, h10), std::min(h01, h11));
+        const float hi = std::max(std::max(h00, h10), std::max(h01, h11));
+        return lo <= kShorelineLevel && hi >= kShorelineLevel;
+    };
 
-    // Does this chunk contain any refined cell? If not, take the original path so
-    // terrain that was never sculpted is untouched.
+    // A cell intersecting sea level needs a few more vertices to represent the
+    // continuous shoreline between source pixels. Other cells keep the original
+    // path unless they were explicitly refined by the terrain editor.
     bool anyRefined = false;
-    if (refineLevel) {
-        for (int row = 0; row + 1 < size && !anyRefined; ++row)
-            for (int col = 0; col + 1 < size; ++col)
-                if ((*refineLevel)(std::min(startCol + col, globalW - 1),
-                                   std::min(startRow + row, globalH - 1)) > 0) {
-                    anyRefined = true;
-                    break;
-                }
-    }
+    for (int row = 0; row + 1 < size && !anyRefined; ++row)
+        for (int col = 0; col + 1 < size; ++col) {
+            const int gx = std::min(startCol + col, globalW - 1);
+            const int gz = std::min(startRow + row, globalH - 1);
+            const bool editorRefined = refineLevel && (*refineLevel)(gx, gz) > 0;
+            if (editorRefined || crossesShoreline(gx, gz)) {
+                anyRefined = true;
+                break;
+            }
+        }
 
     if (!anyRefined) {
         // ── Original uniform path, unchanged ────────────────────────────────
@@ -134,7 +152,10 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
             for (int col = 0; col + 1 < size; ++col) {
                 const int gCol = std::min(startCol + col, globalW - 1);
                 const int gRow = std::min(startRow + row, globalH - 1);
-                const int lvl = std::clamp(refineLevel ? (*refineLevel)(gCol, gRow) : 0, 0, 3);
+                const int editorLevel = refineLevel ? (*refineLevel)(gCol, gRow) : 0;
+                const int shorelineLevel = crossesShoreline(gCol, gRow)
+                                               ? kShorelineRefinementLevel : 0;
+                const int lvl = std::clamp(std::max(editorLevel, shorelineLevel), 0, 3);
                 const int n = 1 << lvl;
 
                 const unsigned int base = (unsigned int)vertices.size();

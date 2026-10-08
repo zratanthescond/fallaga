@@ -4,6 +4,7 @@
 #include <glm/glm.hpp>
 #include <vector>
 #include <cmath>
+#include "WaterLevel.h"
 
 /**
  * @brief Shared Gerstner Wave logic for both Physics (CPU) and Rendering (GPU).
@@ -31,7 +32,7 @@ namespace WaterUtils {
      * Matches the logic in ocean.vert but optimized for CPU performance.
      */
     inline float getWaveHeight(float x, float z, float time) {
-        float height = -35.0f; // WATER_BASE
+        float height = TerrainConfig::kBaseWaterLevel;
         
         for (const auto& w : waveLayers) {
             float k = 2.0f * 3.14159265f / w.length;

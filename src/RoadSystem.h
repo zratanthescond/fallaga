@@ -123,6 +123,7 @@ private:
 // It has to be at least as generous as the road editor's own connect tolerance, or
 // roads the editor considers joined are still rendered with a gap.
 constexpr float kRoadJunctionTolerance = 6.0f;
+constexpr uint32_t kInvalidRoadNodeId = 0xFFFFFFFFu;
 
 // A road only forms a junction with a road it arrives at transversely: |cos| of the
 // angle between the branch direction and the host tangent must be below this, i.e.
@@ -194,12 +195,24 @@ struct RoadSegment {
     // can never grow into one another.
     float cornerRadius = 0.0f;
 
+    // Optional navigation overrides (0 selects the road-type/width default).
+    uint8_t lanesPerDirection = 0;
+    bool oneWay = false;
+    float speedLimitMps = 0.0f;
+    bool sidewalksEnabled = true;
+    float sidewalkWidth = 0.0f;
+
     // Raw control points from JSON
     std::vector<RoadPoint> controlPoints;
 
     // True when the road forms a closed loop (round road / roundabout): rendered as
     // a continuous ring with no end caps and unbiased curvature at the seam.
     bool closed = false;
+
+    // Derived by RoadGraph::buildTopology. These identify the clusters at the
+    // control-point endpoints and are intentionally not serialized to JSON.
+    uint32_t startNodeId = kInvalidRoadNodeId;
+    uint32_t endNodeId = kInvalidRoadNodeId;
 
     // Evaluated spline (filled by RoadSpline::evaluate)
     std::vector<glm::vec3> splinePoints;   // x, y(elevation), z
@@ -229,6 +242,94 @@ public:
 
     std::vector<RoadSegment> segments;
     std::vector<RoadNode>    nodes;
+};
+
+// ──────────────────────── ROAD NAVIGATION DATA ──────────────────────────────
+
+// Navigation geometry is derived from evaluated road splines. It stores XZ only;
+// agents and debug drawing obtain height from Terrain at use time.
+struct RoadNavigationSample {
+    float distance = 0.0f;
+    glm::vec2 position{0.0f};
+    glm::vec2 direction{1.0f, 0.0f};
+    float curvature = 0.0f;
+};
+
+struct RoadNavigationNode {
+    uint32_t id = kInvalidRoadNodeId;
+    glm::vec2 position{0.0f};
+    bool midSegment = false;
+};
+
+struct RoadLane {
+    uint32_t id = 0;
+    uint32_t segmentIndex = 0;
+    uint32_t sectionIndex = 0;
+    uint32_t startNodeId = kInvalidRoadNodeId;
+    uint32_t endNodeId = kInvalidRoadNodeId;
+    uint8_t laneIndex = 0;
+    bool forward = true;
+    bool closed = false;
+    float speedLimit = 0.0f; // metres per second
+    float length = 0.0f;
+    std::vector<RoadNavigationSample> samples;
+    std::vector<uint32_t> outgoingConnectorIds;
+};
+
+struct RoadLaneConnector {
+    uint32_t id = 0;
+    uint32_t nodeId = kInvalidRoadNodeId;
+    uint32_t fromLaneId = 0;
+    uint32_t toLaneId = 0;
+    int priority = 0;
+    float turnAngleRadians = 0.0f;
+    std::vector<uint32_t> conflictingConnectorIds;
+    std::vector<RoadNavigationSample> samples;
+};
+
+struct RoadSidewalk {
+    uint32_t id = 0;
+    uint32_t segmentIndex = 0;
+    uint32_t sectionIndex = 0;
+    uint32_t startNodeId = kInvalidRoadNodeId;
+    uint32_t endNodeId = kInvalidRoadNodeId;
+    int8_t side = 1;
+    bool closed = false;
+    float length = 0.0f;
+    std::vector<RoadNavigationSample> samples;
+};
+
+struct RoadWalkConnector {
+    uint32_t id = 0;
+    uint32_t nodeId = kInvalidRoadNodeId;
+    uint32_t fromSidewalkId = 0;
+    uint32_t toSidewalkId = 0;
+    bool fromAtStart = false;
+    bool toAtStart = false;
+    bool crossing = false;
+    std::vector<RoadNavigationSample> samples;
+};
+
+class RoadNavigationGraph {
+public:
+    // Must run after RoadSpline::evaluate and RoadGraph::buildTopology.
+    void build(const RoadGraph& roads);
+    void clear();
+
+    const std::vector<RoadLane>& lanes() const { return m_lanes; }
+    const std::vector<RoadLaneConnector>& laneConnectors() const { return m_laneConnectors; }
+    const std::vector<RoadSidewalk>& sidewalks() const { return m_sidewalks; }
+    const std::vector<RoadWalkConnector>& walkConnectors() const { return m_walkConnectors; }
+    const std::vector<RoadNavigationNode>& nodes() const { return m_nodes; }
+    bool isBuilt() const { return m_built; }
+
+private:
+    std::vector<RoadLane> m_lanes;
+    std::vector<RoadLaneConnector> m_laneConnectors;
+    std::vector<RoadSidewalk> m_sidewalks;
+    std::vector<RoadWalkConnector> m_walkConnectors;
+    std::vector<RoadNavigationNode> m_nodes;
+    bool m_built = false;
 };
 
 // ──────────────────────── SPLINE SYSTEM ─────────────────────────────────────

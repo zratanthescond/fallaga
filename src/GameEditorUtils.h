@@ -3,6 +3,7 @@
 #include <glm/glm.hpp>
 #include <string>
 #include <iostream>
+#include "WaterLevel.h"
 
 // ============================================================================
 // GameEditorUtils.h
@@ -25,7 +26,7 @@ struct WaterLevelConfig {
     static constexpr float MAX = 0.0f;
     static constexpr float STEP_COARSE = 0.5f;
     static constexpr float STEP_FINE = 0.1f;
-    static constexpr float RESET_VALUE = -55.0f;
+    static constexpr float RESET_VALUE = TerrainConfig::kBaseWaterLevel;
 };
 
 } // namespace GameEditorUtils

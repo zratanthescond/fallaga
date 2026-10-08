@@ -10,6 +10,7 @@ uniform sampler2D roadMask;
 uniform sampler2D splineRoadMask;
 uniform sampler2D splatmap1;
 uniform sampler2D splatmap2;
+uniform sampler2D terrainSplatmap;
 
 uniform vec3 viewPos, lightDir, lightColor;
 uniform float sunTilt;
@@ -146,6 +147,46 @@ void main()
 
     vec3 col = colGround;
     vec3 sampledNorm = nrmGround;
+
+    // DEM-aligned material weights: R sand, G rock, B wadi gravel, A dry plain.
+    // World-space tiling is about 4 m, with the masks aligned to the heightmap UVs.
+    vec4 splatWeights = texture(terrainSplatmap, UV);
+    float splatTotal = dot(splatWeights, vec4(1.0));
+    splatWeights = splatTotal > 0.001
+        ? splatWeights / splatTotal
+        : vec4(0.0, 0.0, 0.0, 1.0);
+
+    const float splatScale = 0.25;
+    vec3 splatColor = vec3(0.0);
+    vec3 splatNormal = vec3(0.0);
+    if (splatWeights.r > 0.01) {
+        splatColor += sampleTriplanar(terrainTex, WorldPos, 0.0, triW, splatScale) * splatWeights.r;
+        splatNormal += (sampleTriplanar(terrainNormal, WorldPos, 0.0, triW, splatScale) * 2.0 - 1.0) * splatWeights.r;
+    }
+    if (splatWeights.g > 0.01) {
+        vec3 screeColor = sampleTriplanar(terrainTex, WorldPos, 9.0, triW, splatScale);
+        vec3 limeColor = sampleTriplanar(terrainTex, WorldPos, 4.0, triW, splatScale);
+        vec3 screeNormal = sampleTriplanar(terrainNormal, WorldPos, 9.0, triW, splatScale) * 2.0 - 1.0;
+        vec3 limeNormal = sampleTriplanar(terrainNormal, WorldPos, 4.0, triW, splatScale) * 2.0 - 1.0;
+        float rockMix = smoothstep(8.0, 22.0, angleDeg);
+        splatColor += mix(screeColor, limeColor, rockMix) * splatWeights.g;
+        splatNormal += mix(screeNormal, limeNormal, rockMix) * splatWeights.g;
+    }
+    if (splatWeights.b > 0.01) {
+        vec3 gravelColor = sampleTriplanar(terrainTex, WorldPos, 5.0, triW, splatScale);
+        vec3 siltColor = sampleTriplanar(terrainTex, WorldPos, 6.0, triW, splatScale);
+        vec3 gravelNormal = sampleTriplanar(terrainNormal, WorldPos, 5.0, triW, splatScale) * 2.0 - 1.0;
+        vec3 siltNormal = sampleTriplanar(terrainNormal, WorldPos, 6.0, triW, splatScale) * 2.0 - 1.0;
+        float wadiMix = noise(WorldPos.xz * 0.035 + vec2(17.0, 41.0));
+        splatColor += mix(gravelColor, siltColor, wadiMix) * splatWeights.b;
+        splatNormal += mix(gravelNormal, siltNormal, wadiMix) * splatWeights.b;
+    }
+    if (splatWeights.a > 0.01) {
+        splatColor += sampleTriplanar(terrainTex, WorldPos, 3.0, triW, splatScale) * splatWeights.a;
+        splatNormal += (sampleTriplanar(terrainNormal, WorldPos, 3.0, triW, splatScale) * 2.0 - 1.0) * splatWeights.a;
+    }
+    col = mix(colGround, splatColor, 0.72);
+    sampledNorm = normalize(mix(nrmGround, normalize(splatNormal), 0.72));
 
     // ── 2. GEOLOGICAL SLOPE EROSION & ROCK CLIFF STRATA ──
     // A. Moderate slopes (12° to 24°): topsoil erodes, exposing stony scree talus

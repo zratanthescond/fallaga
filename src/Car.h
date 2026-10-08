@@ -7,6 +7,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -14,6 +15,7 @@
 class Character;
 class Camera;
 class Terrain;
+class RoadNavigationGraph;
 class ObjModel;
 class VehicleBody;
 
@@ -91,11 +93,33 @@ public:
     bool horn = false;
   };
 
+  struct RoadTrafficStatus {
+    bool routeActive = false;
+    uint32_t laneId = 0;
+    float laneProgress = 0.0f;
+    float laneLength = 0.0f;
+    bool laneClosed = false;
+    bool onConnector = false;
+    uint32_t connectorId = 0;
+    bool hasConnector = false;
+    float distanceToConnector = 0.0f;
+    float connectorProgress = 0.0f;
+    float speedMps = 0.0f;
+  };
+
   Car(State initialState = State::DRIVEN);
   ~Car();
 
   void update(float deltaTime, Terrain *terrain, float totalTime,
               Camera *camera = nullptr);
+  // Starts a lightweight road-graph traffic route. These cars are visual traffic
+  // agents and follow the baked navigation samples without running player-car
+  // rigid-body control.
+  bool startRoadRoute(Terrain *terrain, uint32_t laneId, float startDistance,
+                      uint32_t routeSeed = 1);
+  RoadTrafficStatus getRoadTrafficStatus(
+      const RoadNavigationGraph &navigation) const;
+  void setRoadTrafficSpeedCap(float speedMps);
   void render(const glm::mat4 &projection, const glm::mat4 &view,
               Terrain *terrain);
 
@@ -186,6 +210,19 @@ private:
   float aiLostTimer = 0.0f;
   float aiBestScanYaw = 0.0f;
   bool needsInitialSnap = true;
+  bool roadRouteEnabled = false;
+  bool roadRouteStopped = false;
+  bool roadRouteOnConnector = false;
+  uint32_t roadRouteLaneId = 0;
+  uint32_t roadRouteConnectorId = 0;
+  uint32_t roadRouteNextConnectorId = UINT32_MAX;
+  uint32_t roadRouteSeed = 1;
+  std::size_t roadRouteLaneCount = 0;
+  std::size_t roadRouteConnectorCount = 0;
+  float roadRouteProgress = 0.0f;
+  float roadRouteConnectorProgress = 0.0f;
+  float roadRouteSpeedMps = 0.0f;
+  float roadRouteTrafficSpeedCapMps = 100.0f;
 
   float pitchAngle = 0.0f;
   float rollAngle = 0.0f;
@@ -240,6 +277,7 @@ private:
   void updatePlayerArcadePhysics(float dt, Terrain *terrain);
   void updateIdlePhysics(float dt, Terrain *terrain);
   void updateRoamingAI(float dt, Terrain *terrain, float totalTime);
+  bool updateRoadRoute(float dt, Terrain *terrain);
 
   void processInput(float dt);
   void updateTransmission(float dt, bool gas, bool braking);

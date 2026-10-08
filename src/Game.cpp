@@ -56,6 +56,17 @@ float roadDefaultWidthFor(RoadType t) {
 float roadDefaultShoulderFor(RoadType t) {
     return (t == RoadType::Medina) ? 0.75f : 1.5f;
 }
+float roadDefaultSpeedLimitFor(RoadType t) {
+    switch (t) {
+        case RoadType::ColonialAvenue: return 13.9f;
+        case RoadType::UrbanStreet:    return 11.1f;
+        case RoadType::CountryHighway: return 16.7f;
+        case RoadType::CountryDirt:    return 8.3f;
+        case RoadType::Port:           return 5.6f;
+        case RoadType::Medina:         return 5.6f;
+    }
+    return 8.3f;
+}
 // Distance from point (px,pz) to the segment (ax,az)-(bx,bz)
 float distPointToPolylineSegment(float px, float pz, float ax, float az, float bx, float bz) {
     float dx = bx - ax, dz = bz - az;
@@ -99,6 +110,58 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
     camera->reset();
     horse = new Horse();
     car = new Car(Car::State::PARKED);
+
+    // Seed a small amount of ambient traffic on the nearest connected road.
+    // The player car remains parked and independently driveable.
+    if (terrain) {
+        const RoadNavigationGraph &navigation = terrain->getRoadNavigationGraph();
+        const auto &lanes = navigation.lanes();
+        const Vec3 playerPosition = player->getPosition();
+        float nearestDistanceSq = 500.0f * 500.0f;
+        uint32_t nearestLaneId = UINT32_MAX;
+        float nearestProgress = 0.0f;
+        for (const RoadLane &lane : lanes) {
+            if (lane.length < 80.0f || lane.samples.size() < 2 ||
+                (!lane.closed && lane.outgoingConnectorIds.empty()))
+                continue;
+            for (const RoadNavigationSample &sample : lane.samples) {
+                const glm::vec2 delta = sample.position -
+                    glm::vec2(playerPosition.x, playerPosition.z);
+                const float distanceSq = glm::dot(delta, delta);
+                if (distanceSq < nearestDistanceSq) {
+                    nearestDistanceSq = distanceSq;
+                    nearestLaneId = lane.id;
+                    nearestProgress = sample.distance;
+                }
+            }
+        }
+        if (nearestLaneId != UINT32_MAX) {
+            const RoadLane &lane = lanes[nearestLaneId];
+            std::vector<float> spawnProgresses{nearestProgress};
+            const float secondProgress = nearestProgress + 65.0f;
+            if (secondProgress < lane.length - 10.0f)
+                spawnProgresses.push_back(secondProgress);
+            else if (nearestProgress > 75.0f)
+                spawnProgresses.push_back(nearestProgress - 65.0f);
+
+            for (size_t i = 0; i < spawnProgresses.size(); ++i) {
+                Car *trafficCar = new Car(Car::State::ROAMING);
+                if (trafficCar->startRoadRoute(
+                        terrain, nearestLaneId, spawnProgresses[i],
+                        static_cast<uint32_t>(0x13579u + i * 7919u))) {
+                    trafficCars.push_back(trafficCar);
+                } else {
+                    delete trafficCar;
+                }
+            }
+            std::cout << "[Traffic] Spawned " << trafficCars.size()
+                      << " road-following car(s) on lane " << nearestLaneId
+                      << ".\n";
+        } else {
+            std::cout << "[Traffic] No connected road near the player spawn; "
+                         "ambient traffic is disabled.\n";
+        }
+    }
     sky = new Sky();
     lastFrameTime = glfwGetTime();
     totalTime = 150.0f; // High noon bright daylight matching RDR2 reference photo
@@ -106,6 +169,7 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
     // Initialize Water Simulation grid with terrain manager bounds and base water level
     if (terrain && terrain->terrainManager) {
         waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f, waterLevelAdjust);
+        waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
         // CRITICAL: Upload initial water simulation data to GPU texture immediately after initialization
         terrain->updateWaterMapTexture(waterSim.getTextureData());
         std::cout << "[Water] Initialization complete at level " << waterLevelAdjust << "\n";
@@ -128,7 +192,137 @@ Game::~Game() {
     delete sky;
     delete horse;
     delete car;
+    for (Car *trafficCar : trafficCars)
+        delete trafficCar;
+    trafficCars.clear();
 }
+
+void Game::updateTrafficControls() {
+    if (!terrain || trafficCars.empty()) return;
+    const RoadNavigationGraph& navigation = terrain->getRoadNavigationGraph();
+    const auto& connectors = navigation.laneConnectors();
+    struct TrafficAgent {
+        Car* car = nullptr;
+        Car::RoadTrafficStatus status;
+        float speedCap = 100.0f;
+    };
+    std::vector<TrafficAgent> agents;
+    agents.reserve(trafficCars.size());
+    for (Car* trafficCar : trafficCars) {
+        if (!trafficCar) continue;
+        trafficCar->setRoadTrafficSpeedCap(100.0f);
+        agents.push_back({trafficCar,
+                          trafficCar->getRoadTrafficStatus(navigation),
+                          100.0f});
+    }
+
+    // Keep reservations while a car occupies a junction connector. Stale
+    // entries are released as soon as it exits or its route is rebuilt.
+    for (auto it = activeTrafficConnectorReservations.begin();
+         it != activeTrafficConnectorReservations.end();) {
+        auto agent = std::find_if(agents.begin(), agents.end(),
+            [&](const TrafficAgent& item) { return item.car == it->first; });
+        if (agent == agents.end() || !agent->status.onConnector ||
+            agent->status.connectorId != it->second) {
+            it = activeTrafficConnectorReservations.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    std::vector<Car*> connectorOwners(connectors.size(), nullptr);
+    for (const TrafficAgent& agent : agents) {
+        const auto& status = agent.status;
+        if (!status.onConnector || status.connectorId >= connectors.size())
+            continue;
+        connectorOwners[status.connectorId] = agent.car;
+        activeTrafficConnectorReservations[agent.car] = status.connectorId;
+    }
+
+    std::vector<size_t> approaches;
+    for (size_t i = 0; i < agents.size(); ++i) {
+        const auto& status = agents[i].status;
+        if (status.routeActive && !status.onConnector && status.hasConnector &&
+            status.connectorId < connectors.size() &&
+            status.distanceToConnector <= 50.0f)
+            approaches.push_back(i);
+    }
+    std::sort(approaches.begin(), approaches.end(), [&](size_t a, size_t b) {
+        const auto& sa = agents[a].status;
+        const auto& sb = agents[b].status;
+        const int pa = connectors[sa.connectorId].priority;
+        const int pb = connectors[sb.connectorId].priority;
+        if (pa != pb) return pa > pb;
+        const float turnA = std::fabs(connectors[sa.connectorId].turnAngleRadians);
+        const float turnB = std::fabs(connectors[sb.connectorId].turnAngleRadians);
+        if (std::fabs(turnA - turnB) > 1e-4f) return turnA < turnB;
+        const float etaA = sa.distanceToConnector / std::max(sa.speedMps, 1.0f);
+        const float etaB = sb.distanceToConnector / std::max(sb.speedMps, 1.0f);
+        return etaA < etaB;
+    });
+
+    auto movementIsFree = [&](uint32_t connectorId, Car* requester) {
+        if (connectorId >= connectors.size()) return false;
+        if (connectorOwners[connectorId] &&
+            connectorOwners[connectorId] != requester)
+            return false;
+        for (uint32_t conflictId :
+             connectors[connectorId].conflictingConnectorIds) {
+            if (conflictId < connectorOwners.size() &&
+                connectorOwners[conflictId] &&
+                connectorOwners[conflictId] != requester)
+                return false;
+        }
+        return true;
+    };
+
+    for (size_t index : approaches) {
+        TrafficAgent& agent = agents[index];
+        const auto& status = agent.status;
+        if (movementIsFree(status.connectorId, agent.car)) {
+            connectorOwners[status.connectorId] = agent.car;
+            continue;
+        }
+        // Begin braking early enough to stop several metres before the
+        // connector, using the same 4 m/s^2 deceleration limit as the follower.
+        const float stoppingDistance = std::max(
+            0.0f, status.distanceToConnector - 5.0f);
+        agent.speedCap = std::sqrt(8.0f * stoppingDistance);
+    }
+
+    // Same-lane following: track the leader along the lane and its connector,
+    // then reduce the follower's speed before the gap becomes unsafe.
+    for (size_t i = 0; i < agents.size(); ++i) {
+        TrafficAgent& follower = agents[i];
+        const auto& fs = follower.status;
+        if (!fs.routeActive) continue;
+        const float followerProgress = fs.onConnector
+            ? fs.laneLength + fs.connectorProgress : fs.laneProgress;
+        for (size_t j = 0; j < agents.size(); ++j) {
+            if (i == j) continue;
+            const auto& ls = agents[j].status;
+            if (!ls.routeActive || fs.laneId != ls.laneId) continue;
+            const float leaderProgress = ls.onConnector
+                ? ls.laneLength + ls.connectorProgress : ls.laneProgress;
+            float gap = leaderProgress - followerProgress;
+            if (fs.laneClosed && fs.laneLength > 1.0f) {
+                if (gap < 0.0f) gap += fs.laneLength;
+                if (gap > fs.laneLength * 0.5f) continue;
+            }
+            if (gap <= 0.0f || gap > 45.0f) continue;
+            const float desiredGap = 9.0f + fs.speedMps * 1.4f;
+            if (gap < desiredGap) {
+                const float followCap = std::max(
+                    0.0f, ls.speedMps + (gap - desiredGap) * 0.7f);
+                follower.speedCap = std::min(follower.speedCap, followCap);
+            }
+        }
+    }
+
+    for (TrafficAgent& agent : agents)
+        agent.car->setRoadTrafficSpeedCap(agent.speedCap);
+}
+
 void Game::setup(int width, int height) {
     windowWidth = width;
     windowHeight = height;
@@ -199,6 +393,12 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     if (car) {
         car->update(static_cast<float>(deltaTime), terrain, static_cast<float>(totalTime), camera);
     }
+    updateTrafficControls();
+    for (Car *trafficCar : trafficCars) {
+        if (trafficCar)
+            trafficCar->update(static_cast<float>(deltaTime), terrain,
+                               static_cast<float>(totalTime), nullptr);
+    }
     recordPhase(perf.carMs);
     // Update the camera after vehicle physics so the driving view follows the
     // car's current frame position instead of trailing one physics update.
@@ -209,6 +409,14 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     {
         auto camPos = camera->getPosition();
         terrain->update(glm::vec3(camPos.x, camPos.y, camPos.z));
+        if (terrain->terrainManager &&
+            waterHeightRevision != terrain->terrainManager->getHeightmapRevision()) {
+            waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f,
+                                -13938.0f, 13938.0f, waterLevelAdjust);
+            terrain->updateWaterMapTexture(waterSim.getTextureData());
+            waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
+            std::cout << "[Water] Rebuilt terrain water mask after heightmap reload.\n";
+        }
     }
     recordPhase(perf.terrainMs);
 
@@ -390,6 +598,11 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                     roadDrawType = i;
                                     roadDrawWidth = roadDefaultWidthFor((RoadType)i);
                                     roadDrawShoulder = roadDefaultShoulderFor((RoadType)i);
+                                    roadDrawLanesPerDirection = 0;
+                                    roadDrawOneWay = false;
+                                    roadDrawSpeedLimitMps = 0.0f;
+                                    roadDrawSidewalks = true;
+                                    roadDrawSidewalkWidth = 0.0f;
                                     std::cout << "[Road] New road type -> " << roadTypeLabel(i)
                                               << " (w " << roadDrawWidth << "m, s " << roadDrawShoulder << "m)\n";
                                 }
@@ -2084,6 +2297,60 @@ void Game::render() {
             glEnd();
             glPointSize(1.0f);
         }
+        if (roadNavigationDebugVisible) {
+            const RoadNavigationGraph& nav = terrain->getRoadNavigationGraph();
+            auto drawNavPath = [&](const std::vector<RoadNavigationSample>& samples,
+                                   float r, float g, float b, float lift,
+                                   float lineWidth) {
+                if (samples.size() < 2) return;
+                glColor3f(r, g, b);
+                glLineWidth(lineWidth);
+                glBegin(GL_LINE_STRIP);
+                for (const RoadNavigationSample& sample : samples) {
+                    const float y = terrain->getGroundSurfaceHeight(
+                        sample.position.x, sample.position.y) + lift;
+                    glVertex3f(sample.position.x, y, sample.position.y);
+                }
+                glEnd();
+            };
+            if (roadNavLanesVisible) {
+                for (const RoadLane& lane : nav.lanes()) {
+                    if (lane.forward)
+                        drawNavPath(lane.samples, 0.15f, 0.85f, 1.0f, 0.55f, 2.0f);
+                    else
+                        drawNavPath(lane.samples, 1.0f, 0.35f, 0.85f, 0.55f, 2.0f);
+                }
+            }
+            for (const RoadLaneConnector& connector : nav.laneConnectors()) {
+                const bool conflict = !connector.conflictingConnectorIds.empty();
+                if (roadNavConnectorsVisible) {
+                    const float turn = connector.turnAngleRadians;
+                    if (std::fabs(turn) < 0.28f)
+                        drawNavPath(connector.samples, 0.2f, 0.95f, 0.55f,
+                                    0.8f, 2.5f); // straight
+                    else if (turn > 0.0f)
+                        drawNavPath(connector.samples, 0.95f, 0.55f, 0.15f,
+                                    0.8f, 2.5f); // one turn direction
+                    else
+                        drawNavPath(connector.samples, 0.75f, 0.35f, 1.0f,
+                                    0.8f, 2.5f); // the other turn direction
+                }
+                if (conflict && roadNavConflictsVisible)
+                    drawNavPath(connector.samples, 1.0f, 0.12f, 0.08f,
+                                0.9f, 3.0f);
+            }
+            if (roadNavWalksVisible) {
+                for (const RoadSidewalk& walk : nav.sidewalks())
+                    drawNavPath(walk.samples, 0.15f, 0.55f, 1.0f, 0.65f, 1.5f);
+                for (const RoadWalkConnector& connector : nav.walkConnectors()) {
+                    if (connector.crossing)
+                        drawNavPath(connector.samples, 1.0f, 0.95f, 0.25f, 0.9f, 2.5f);
+                    else
+                        drawNavPath(connector.samples, 0.15f, 1.0f, 0.8f, 0.75f, 2.0f);
+                }
+            }
+            glLineWidth(1.0f);
+        }
         glEnable(GL_LIGHTING);
         glDepthFunc(GL_LESS);
     }
@@ -2109,6 +2376,18 @@ void Game::render() {
         if (carInFrustum || player->isDriving()) {
             GameplayUtils::setupEntityShader(car->getShader(), cameraPosition, lightDir, lColor);
             car->render(projection, view, terrain);
+        }
+    }
+    for (Car *trafficCar : trafficCars) {
+        if (!trafficCar)
+            continue;
+        const Vec3 trafficPosition = trafficCar->getPosition();
+        const glm::vec3 trafficPos(trafficPosition.x, trafficPosition.y,
+                                   trafficPosition.z);
+        if (camera->isSphereInFrustum(trafficPos, 15.0f)) {
+            GameplayUtils::setupEntityShader(trafficCar->getShader(),
+                                             cameraPosition, lightDir, lColor);
+            trafficCar->render(projection, view, terrain);
         }
     }
 
@@ -2462,7 +2741,10 @@ void Game::render() {
             float resetY = lpY + 185;
             drawRect(lpX + 15, resetY, lpW - 30, 22, 0.20f, 0.08f, 0.08f, 0.9f);
             drawRectOutline(lpX + 15, resetY, lpW - 30, 22, 0.5f, 0.2f, 0.2f);
-            drawStr(lpX + 80, resetY + 15, "Reset to -55.0m", 0.9f, 0.55f, 0.55f);
+            char resetLabel[64];
+            snprintf(resetLabel, sizeof(resetLabel), "Reset to %.2fm",
+                     TerrainConfig::kBaseWaterLevel);
+            drawStr(lpX + 80, resetY + 15, resetLabel, 0.9f, 0.55f, 0.55f);
 
             // Push level to terrain shader every frame
             terrain->setWaterLevel(waterLevelAdjust);
@@ -2507,7 +2789,10 @@ void Game::render() {
                 drawStr(lpX + 15, tipY, "TIP", 0.9f, 0.5f, 0.1f);
                 drawStr(lpX + 15, tipY + 18, "Press 4 to move/scale the projected map", 0.6f, 0.85f, 0.6f);
                 drawStr(lpX + 15, tipY + 34, "Tab hides panels   R cycles PiP", 0.6f, 0.6f, 0.6f);
-                // Last TIP line occupies [tipY+25, tipY+34] = [234, 243].
+                drawStr(lpX + 15, tipY + 50, "Select a road: ,/. lanes   O one-way", 0.62f, 0.75f, 0.85f);
+                drawStr(lpX + 15, tipY + 66, "V sidewalks   U/I speed   0 resets auto", 0.62f, 0.75f, 0.85f);
+                drawStr(lpX + 15, tipY + 82, "N overlay   F7 lanes   F8 turns", 0.62f, 0.75f, 0.85f);
+                drawStr(lpX + 15, tipY + 98, "F9 conflicts   F10 sidewalks/crossings", 0.62f, 0.75f, 0.85f);
             }
 
             RoadGraph* rg = terrain->getRoadGraph();
@@ -2606,6 +2891,20 @@ void Game::render() {
                     drawRect(lpX + 8 + 2 * (thirdW + 6), oY, thirdW, 24, 0.32f, 0.13f, 0.11f, 0.95f);
                     drawRectOutline(lpX + 8 + 2 * (thirdW + 6), oY, thirdW, 24, 0.6f, 0.3f, 0.25f);
                     drawStr(lpX + 8 + 2 * (thirdW + 6) + 10, oY + 17, "CANCEL", 0.85f, 1.0f, 0.95f);
+                }
+                {
+                    const std::string laneText = roadDrawLanesPerDirection > 0
+                        ? std::to_string((int)roadDrawLanesPerDirection) : "AUTO";
+                    const std::string speedText = roadDrawSpeedLimitMps > 0.0f
+                        ? std::to_string((int)std::round(roadDrawSpeedLimitMps * 3.6f)) + " km/h"
+                        : "AUTO";
+                    drawStr(lpX + 15, lpY + 588,
+                        "NAV: lanes " + laneText + "   speed " + speedText +
+                        (roadDrawOneWay ? "   ONE WAY" : "   TWO WAY"),
+                        0.8f, 0.9f, 0.75f);
+                    drawStr(lpX + 15, lpY + 604,
+                        ",/. lanes   O one-way   V sidewalks   U/I speed   0 auto",
+                        0.62f, 0.72f, 0.8f);
                 }
             } else if (roadToolMode == 3) {
                 std::string refName = std::string(roadRefPaths[roadRefIdx]);
@@ -3304,6 +3603,11 @@ void Game::commitRoadDraft() {
         ns.width = roadDrawWidth;
         ns.shoulderWidth = roadDrawShoulder;
         ns.cornerRadius = roadDrawCornerRadius;
+        ns.lanesPerDirection = roadDrawLanesPerDirection;
+        ns.oneWay = roadDrawOneWay;
+        ns.speedLimitMps = roadDrawSpeedLimitMps;
+        ns.sidewalksEnabled = roadDrawSidewalks;
+        ns.sidewalkWidth = roadDrawSidewalkWidth;
 
         // -- Closed-loop detection -----------------------------------------
         // When the last draft point coincides with the first (user snapped
@@ -3497,6 +3801,26 @@ void Game::keyDown(int key) {
 
         // ── Road Edit mode keys ──
         if (activeEditorMode == 5) {
+            if (key == GLFW_KEY_N) {
+                roadNavigationDebugVisible = !roadNavigationDebugVisible;
+                std::cout << "[Road] Navigation graph debug "
+                          << (roadNavigationDebugVisible ? "shown" : "hidden")
+                          << " (N toggles)\n";
+                return;
+            }
+            if (key >= GLFW_KEY_F7 && key <= GLFW_KEY_F10) {
+                bool* layer = key == GLFW_KEY_F7 ? &roadNavLanesVisible
+                    : key == GLFW_KEY_F8 ? &roadNavConnectorsVisible
+                    : key == GLFW_KEY_F9 ? &roadNavConflictsVisible
+                    : &roadNavWalksVisible;
+                *layer = !*layer;
+                const char* label = key == GLFW_KEY_F7 ? "lanes"
+                    : key == GLFW_KEY_F8 ? "turn connectors"
+                    : key == GLFW_KEY_F9 ? "conflicts" : "sidewalks/crossings";
+                std::cout << "[Road] Navigation " << label << " layer "
+                          << (*layer ? "shown\n" : "hidden\n");
+                return;
+            }
             if (key == GLFW_KEY_TAB) {
                 roadPanelsVisible = !roadPanelsVisible;
                 std::cout << "[Road] Side panels " << (roadPanelsVisible ? "shown (Tab hides to free the viewport for clicks)" : "hidden (Tab shows them again)") << "\n";
@@ -3517,8 +3841,98 @@ void Game::keyDown(int key) {
                 }
                 return;
             }
+            auto editNavigationTarget = [&](auto&& edit) {
+                if (roadToolMode == 1) {
+                    RoadSegment draft;
+                    draft.type = (RoadType)roadDrawType;
+                    draft.width = roadDrawWidth;
+                    draft.lanesPerDirection = roadDrawLanesPerDirection;
+                    draft.oneWay = roadDrawOneWay;
+                    draft.speedLimitMps = roadDrawSpeedLimitMps;
+                    draft.sidewalksEnabled = roadDrawSidewalks;
+                    draft.sidewalkWidth = roadDrawSidewalkWidth;
+                    edit(draft);
+                    roadDrawLanesPerDirection = draft.lanesPerDirection;
+                    roadDrawOneWay = draft.oneWay;
+                    roadDrawSpeedLimitMps = draft.speedLimitMps;
+                    roadDrawSidewalks = draft.sidewalksEnabled;
+                    roadDrawSidewalkWidth = draft.sidewalkWidth;
+                    return true;
+                }
+                RoadGraph* graph = terrain ? terrain->getRoadGraph() : nullptr;
+                if (!graph || selectedRoadIdx < 0 ||
+                    selectedRoadIdx >= (int)graph->segments.size())
+                    return false;
+                edit(graph->segments[selectedRoadIdx]);
+                terrain->rebuildRoadNavigation();
+                terrain->saveRoadsToJSON("assets/roads/roads_manual.json");
+                return true;
+            };
+            if (key == GLFW_KEY_COMMA || key == GLFW_KEY_PERIOD) {
+                const int change = key == GLFW_KEY_COMMA ? -1 : 1;
+                if (editNavigationTarget([&](RoadSegment& seg) {
+                        const int automatic = std::clamp((int)(seg.width / 6.0f), 1, 4);
+                        const int current = seg.lanesPerDirection > 0
+                            ? seg.lanesPerDirection : automatic;
+                        seg.lanesPerDirection = (uint8_t)std::clamp(current + change, 1, 8);
+                    })) {
+                    const int lanes = roadToolMode == 1 ? roadDrawLanesPerDirection
+                        : terrain->getRoadGraph()->segments[selectedRoadIdx].lanesPerDirection;
+                    std::cout << "[Road] Navigation lanes/direction -> " << (int)lanes
+                              << " (0 key restores automatic)\n";
+                } else {
+                    std::cout << "[Road] Select a road first, or use Draw mode for the next road\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_O || key == GLFW_KEY_V) {
+                const bool changed = editNavigationTarget([&](RoadSegment& seg) {
+                    if (key == GLFW_KEY_O) seg.oneWay = !seg.oneWay;
+                    else seg.sidewalksEnabled = !seg.sidewalksEnabled;
+                });
+                if (changed) {
+                    const bool enabled = roadToolMode == 1
+                        ? (key == GLFW_KEY_O ? roadDrawOneWay : roadDrawSidewalks)
+                        : (key == GLFW_KEY_O
+                            ? terrain->getRoadGraph()->segments[selectedRoadIdx].oneWay
+                            : terrain->getRoadGraph()->segments[selectedRoadIdx].sidewalksEnabled);
+                    std::cout << "[Road] " << (key == GLFW_KEY_O ? "One-way" : "Sidewalks")
+                              << (enabled ? " enabled\n" : " disabled\n");
+                } else {
+                    std::cout << "[Road] Select a road first, or use Draw mode for the next road\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_U || key == GLFW_KEY_I) {
+                const float change = key == GLFW_KEY_U ? -1.39f : 1.39f;
+                const bool changed = editNavigationTarget([&](RoadSegment& seg) {
+                    const float base = seg.speedLimitMps > 0.0f
+                        ? seg.speedLimitMps : roadDefaultSpeedLimitFor(seg.type);
+                    seg.speedLimitMps = glm::clamp(base + change, 2.8f, 33.3f);
+                });
+                if (changed) {
+                    const float speed = roadToolMode == 1 ? roadDrawSpeedLimitMps
+                        : terrain->getRoadGraph()->segments[selectedRoadIdx].speedLimitMps;
+                    std::cout << "[Road] Navigation speed -> " << speed << " m/s ("
+                              << speed * 3.6f << " km/h)\n";
+                } else {
+                    std::cout << "[Road] Select a road first, or use Draw mode for the next road\n";
+                }
+                return;
+            }
+            if (key == GLFW_KEY_0) {
+                const bool changed = editNavigationTarget([](RoadSegment& seg) {
+                    seg.lanesPerDirection = 0;
+                    seg.speedLimitMps = 0.0f;
+                    seg.sidewalkWidth = 0.0f;
+                });
+                std::cout << (changed
+                    ? "[Road] Lane, speed, and sidewalk width overrides reset to automatic\n"
+                    : "[Road] Select a road first, or use Draw mode for the next road\n");
+                return;
+            }
             if (key == GLFW_KEY_1) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 0; std::cout << "[Road] Tool: Select Road\n"; return; }
-            if (key == GLFW_KEY_2) { if (roadToolMode != 1) draftDragIdx = -1; roadToolMode = 1; std::cout << "[Road] Tool: Draw Road (LMB click=add/grab point, drag on edge=insert, drag=draw, Enter commit, Esc cancel)\n"; return; }
+            if (key == GLFW_KEY_2) { if (roadToolMode != 1) draftDragIdx = -1; roadToolMode = 1; std::cout << "[Road] Draw Road: ,/. lanes, O one-way, V sidewalks, U/I speed, 0 auto\n"; return; }
             if (key == GLFW_KEY_3) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 2; std::cout << "[Road] Tool: Edit Points (click grab/insert, drag move, Del remove)\n"; return; }
             if (key == GLFW_KEY_4) { if (roadToolMode == 1) { roadDraftPoints.clear(); draftDragIdx = -1; } roadToolMode = 3; std::cout << "[Road] Tool: Reference Map (drag to move, panel for scale/flip)\n"; return; }
             // (in Draw tool) Del / Backspace pops the last draft point (undo)
@@ -3547,6 +3961,11 @@ void Game::keyDown(int key) {
                     roadDrawType = (roadDrawType + 1) % 6;
                     roadDrawWidth = roadDefaultWidthFor((RoadType)roadDrawType);
                     roadDrawShoulder = roadDefaultShoulderFor((RoadType)roadDrawType);
+                    roadDrawLanesPerDirection = 0;
+                    roadDrawOneWay = false;
+                    roadDrawSpeedLimitMps = 0.0f;
+                    roadDrawSidewalks = true;
+                    roadDrawSidewalkWidth = 0.0f;
                     std::cout << "[Road] Next road type -> " << roadTypeLabel(roadDrawType)
                               << " (w " << roadDrawWidth << "m, s " << roadDrawShoulder << "m)\n";
                     return;
