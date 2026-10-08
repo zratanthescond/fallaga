@@ -299,30 +299,6 @@ bool parseRiver(RiverJsonReader& json, RiverChannel& river) {
     return true;
 }
 
-glm::vec2 riverTangent(const RiverChannel& channel, size_t index) {
-    const auto& points = channel.points;
-    for (size_t radius = 1; radius < points.size(); ++radius) {
-        const size_t before = index >= radius ? index - radius : index;
-        const size_t after = std::min(index + radius, points.size() - 1);
-        glm::vec2 tangent = points[after].position - points[before].position;
-        if (glm::dot(tangent, tangent) > 1e-8f) return glm::normalize(tangent);
-    }
-    return glm::vec2(1.0f, 0.0f);
-}
-
-float localFlowSpeed(const RiverChannel& channel, size_t index) {
-    const auto& points = channel.points;
-    const size_t a = index == 0 ? 0 : index - 1;
-    const size_t b = index + 1 < points.size() ? index + 1 : index;
-    const float distance = glm::length(points[b].position - points[a].position);
-    float slope = channel.slope;
-    if (distance > 1e-3f) {
-        slope = std::max(0.0f, (points[a].bedY - points[b].bedY) / distance);
-    }
-    // A small minimum keeps flat source samples visibly moving downstream.
-    return glm::clamp(std::sqrt(9.81f * std::max(slope, 0.001f)), 0.1f, 3.0f);
-}
-
 } // namespace
 
 bool RiverNetwork::loadFromJSON(const std::string& path, std::string* error) {
@@ -383,87 +359,4 @@ bool RiverNetwork::loadFromJSON(const std::string& path, std::string* error) {
     m_sourceSeaLevel = seaLevel;
     if (error) error->clear();
     return true;
-}
-
-RiverMeshBuilder::~RiverMeshBuilder() {
-    destroy();
-}
-
-void RiverMeshBuilder::build(const RiverNetwork& network, float perennialCatchmentKm2) {
-    destroy();
-    m_vertices.clear();
-    m_indices.clear();
-    m_channelCount = 0;
-
-    for (const RiverChannel& river : network.channels()) {
-        if (river.coastalFlat || river.drainageKm2 < perennialCatchmentKm2 || river.points.size() < 2)
-            continue;
-        if (m_vertices.size() > std::numeric_limits<uint32_t>::max() - river.points.size() * 2)
-            break;
-
-        const uint32_t base = static_cast<uint32_t>(m_vertices.size());
-        const float halfWidth = glm::clamp(river.widthM * 0.45f, 0.5f, 15.0f);
-        for (size_t i = 0; i < river.points.size(); ++i) {
-            const RiverPoint& point = river.points[i];
-            const glm::vec2 tangent = riverTangent(river, i);
-            const glm::vec2 side(-tangent.y, tangent.x);
-            const float speed = localFlowSpeed(river, i);
-            const float depth = std::max(0.0f, point.waterY - point.bedY);
-            const glm::vec2 left = point.position + side * halfWidth;
-            const glm::vec2 right = point.position - side * halfWidth;
-            m_vertices.push_back({glm::vec3(left.x, point.waterY + 0.03f, left.y), tangent,
-                                  left, speed, depth});
-            m_vertices.push_back({glm::vec3(right.x, point.waterY + 0.03f, right.y), tangent,
-                                  right, speed, depth});
-        }
-        for (size_t i = 0; i + 1 < river.points.size(); ++i) {
-            const uint32_t l0 = base + static_cast<uint32_t>(i * 2);
-            const uint32_t r0 = l0 + 1;
-            const uint32_t l1 = l0 + 2;
-            const uint32_t r1 = l0 + 3;
-            // Counter-clockwise from above so the ribbon has an upward normal.
-            m_indices.insert(m_indices.end(), {l0, l1, r0, r0, l1, r1});
-        }
-        ++m_channelCount;
-    }
-}
-
-void RiverMeshBuilder::upload() {
-    destroy();
-    if (m_vertices.empty() || m_indices.empty()) return;
-
-    glGenVertexArrays(1, &m_vao);
-    glGenBuffers(1, &m_vbo);
-    glGenBuffers(1, &m_ebo);
-    glBindVertexArray(m_vao);
-    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
-    glBufferData(GL_ARRAY_BUFFER, m_vertices.size() * sizeof(RiverVertex), m_vertices.data(), GL_STATIC_DRAW);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_ebo);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, m_indices.size() * sizeof(uint32_t), m_indices.data(), GL_STATIC_DRAW);
-
-    glEnableVertexAttribArray(0);
-    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(RiverVertex), reinterpret_cast<void*>(offsetof(RiverVertex, position)));
-    glEnableVertexAttribArray(1);
-    glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(RiverVertex), reinterpret_cast<void*>(offsetof(RiverVertex, flowDirection)));
-    glEnableVertexAttribArray(2);
-    glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, sizeof(RiverVertex), reinterpret_cast<void*>(offsetof(RiverVertex, uv)));
-    glEnableVertexAttribArray(3);
-    glVertexAttribPointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(RiverVertex), reinterpret_cast<void*>(offsetof(RiverVertex, flowSpeed)));
-    glEnableVertexAttribArray(4);
-    glVertexAttribPointer(4, 1, GL_FLOAT, GL_FALSE, sizeof(RiverVertex), reinterpret_cast<void*>(offsetof(RiverVertex, depth)));
-    glBindVertexArray(0);
-}
-
-void RiverMeshBuilder::destroy() {
-    if (m_vao) glDeleteVertexArrays(1, &m_vao);
-    if (m_vbo) glDeleteBuffers(1, &m_vbo);
-    if (m_ebo) glDeleteBuffers(1, &m_ebo);
-    m_vao = m_vbo = m_ebo = 0;
-}
-
-void RiverMeshBuilder::render() const {
-    if (!m_vao || m_indices.empty()) return;
-    glBindVertexArray(m_vao);
-    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(m_indices.size()), GL_UNSIGNED_INT, nullptr);
-    glBindVertexArray(0);
 }
