@@ -31,7 +31,6 @@ public:
     Shader* terrainShader = nullptr;
     Shader* modelShader   = nullptr;
     Shader* streetShader  = nullptr;
-    Shader* wetWaterShader = nullptr;
 
     static bool isFlatMode;
 
@@ -88,6 +87,7 @@ public:
     RoadMeshBuilder* getRoadMeshBuilder() const { return roadMeshBuilder; }
     RoadTileField*   getRoadTileField()   const { return roadTileField; }
     const RoadNavigationGraph& getRoadNavigationGraph() const { return roadNavigationGraph; }
+    const WetWaterNetwork& getWetWaterNetwork() const { return wetWaterNetwork; }
     HeightSampler&   getRoadHeightSampler()     { return roadHeightSampler; }
     void rebuildRoadMesh();
     void rebuildRoadNavigation();
@@ -155,7 +155,6 @@ private:
     HeightSampler    roadHeightSampler;
     RiverNetwork     riverNetwork;
     WetWaterNetwork  wetWaterNetwork;
-    WetWaterMeshBuilder wetWaterMeshBuilder;
     TerrainCoordinateMapper roadMapper;   // plan→world transform shared by the road pipeline
     ObjModel* trainStationModel = nullptr;
     ObjModel* cityWallModel = nullptr;

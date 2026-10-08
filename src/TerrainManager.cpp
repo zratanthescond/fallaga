@@ -125,8 +125,13 @@ TerrainManager::~TerrainManager() {
 void TerrainManager::setRoadGeometryMask(const unsigned char* mask, int maskW, int maskH) {
     if (!mask || maskW < 2 || maskH < 2) {
         hasRoadGeometryMask = false;
+        roadGeometryMaskData.clear();
+        roadGeometryMaskW = roadGeometryMaskH = 0;
         return;
     }
+    roadGeometryMaskData.assign(mask, mask + static_cast<size_t>(maskW) * maskH);
+    roadGeometryMaskW = maskW;
+    roadGeometryMaskH = maskH;
     if (roadGeometryMask == 0) glGenTextures(1, &roadGeometryMask);
     glBindTexture(GL_TEXTURE_2D, roadGeometryMask);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
@@ -576,6 +581,26 @@ float TerrainManager::getRoadAt(float x, float z) const {
     float r00 = roadMaskData[(z0*roadW+x0)*4+0]/255.0f, r10 = roadMaskData[(z0*roadW+x1)*4+0]/255.0f;
     float r01 = roadMaskData[(z1*roadW+x0)*4+0]/255.0f, r11 = roadMaskData[(z1*roadW+x1)*4+0]/255.0f;
     return r00*(1-tx)*(1-tz) + r10*tx*(1-tz) + r01*(1-tx)*tz + r11*tx*tz;
+}
+
+float TerrainManager::getRoadGeometryAt(float x, float z) const {
+    if (roadGeometryMaskData.empty() || roadGeometryMaskW < 2 || roadGeometryMaskH < 2)
+        return 0.0f;
+    const float u = std::clamp((x - worldMinX) / (worldMaxX - worldMinX), 0.0f, 1.0f);
+    const float v = std::clamp((z - worldMinZ) / (worldMaxZ - worldMinZ), 0.0f, 1.0f);
+    const float fx = u * (roadGeometryMaskW - 1);
+    const float fz = v * (roadGeometryMaskH - 1);
+    const int x0 = static_cast<int>(fx), z0 = static_cast<int>(fz);
+    const int x1 = std::min(x0 + 1, roadGeometryMaskW - 1);
+    const int z1 = std::min(z0 + 1, roadGeometryMaskH - 1);
+    const float tx = fx - x0, tz = fz - z0;
+    auto at = [&](int px, int pz) {
+        return roadGeometryMaskData[static_cast<size_t>(pz) * roadGeometryMaskW + px] / 255.0f;
+    };
+    return at(x0, z0) * (1.0f - tx) * (1.0f - tz) +
+           at(x1, z0) * tx * (1.0f - tz) +
+           at(x0, z1) * (1.0f - tx) * tz +
+           at(x1, z1) * tx * tz;
 }
 
 float TerrainManager::getRiverAt(float x, float z) const {

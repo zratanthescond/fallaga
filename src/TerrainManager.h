@@ -18,10 +18,10 @@ public:
     void exportToOBJ(const std::string& filename, int downsample = 4) const;
     glm::vec3 getNormalAt(float x, float z) const;
     float getRoadAt(float x, float z) const;
+    float getRoadGeometryAt(float x, float z) const;
     float getRiverAt(float x, float z) const;
     GLuint getHeightmapTexture() const { return heightmapTexID; }
     GLuint getRoadMask() const { return roadMask; }
-    GLuint getRoadGeometryMask() const { return roadGeometryMask; }
     // Apply/remove road shaping in the visual and physics heightfields. Passing
     // null offsets removes tracked road-bed and mesh-conformance changes.
     void applyRoadBedHeightfield(const float* offsets, int offsetW, int offsetH);
@@ -67,7 +67,6 @@ public:
     // anything comparing the two (road/terrain conformance checks) must read this
     // instead to see the surface the GPU actually draws.
     const std::vector<float>& getVisualHeightsData() const { return visualHeights; }
-    const std::vector<float>& getPhysicsVisualHeightsData() const { return physicsVisualHeights; }
 
     // ── Sculpt "Add Geometry" tool ─────────────────────────────────────────────
     // Adds mesh resolution inside the brush footprint so smoothing has vertices to
@@ -121,6 +120,8 @@ private:
     std::vector<float> appliedRoadConformOffsets;
     std::vector<unsigned char> roadMaskData;
     bool hasRoadGeometryMask = false;
+    std::vector<unsigned char> roadGeometryMaskData;
+    int roadGeometryMaskW = 0, roadGeometryMaskH = 0;
 
     // Subdivision and its fine height field. Free of OpenGL so the logic is testable
     // without a context; see TerrainRefinement.h for why subdivision alone cannot

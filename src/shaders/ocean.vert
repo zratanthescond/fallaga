@@ -47,8 +47,11 @@ void addGerstnerWave(vec3 basePos, vec2 d, float a, float s, float l, float q,
 
 void main() {
     vec3 pos = aPos;
-    // Keep the visible water plane at the editable sea level.
-    pos.y = waterLevel;
+    vec4 simState = texture(waterMapTex, aTexCoords);
+    float surfaceLevel = simState.g > 0.001 ? simState.r : waterLevel;
+    // The original shared surface follows simulated local stages. The simulation
+    // map and this grid use the same resolution; no per-stream mesh is generated.
+    pos.y = surfaceLevel;
     vec3 tangent = vec3(1.0, 0.0, 0.0);
     vec3 binormal = vec3(0.0, 0.0, 1.0);
     
@@ -67,9 +70,10 @@ void main() {
         if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
             float normElev = texture(heightmapTex, vec2(u, v)).r;
             float terrainH = hmMinElev + normElev * (hmMaxElev - hmMinElev);
-            isRiver = texture(roadMask, vec2(u, v)).b;
+            isRiver = max(texture(roadMask, vec2(u, v)).b,
+                          smoothstep(1.5, 2.5, simState.b));
             
-            float depth = max(0.0, waterLevel - terrainH);
+            float depth = max(0.0, surfaceLevel - terrainH);
             waveScale = clamp(depth / 3.5, 0.0, 1.0);
         }
     }

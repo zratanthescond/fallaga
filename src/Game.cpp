@@ -168,7 +168,8 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 
     // Initialize Water Simulation grid with terrain manager bounds and base water level
     if (terrain && terrain->terrainManager) {
-        waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f, waterLevelAdjust);
+        waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f,
+                            waterLevelAdjust, &terrain->getWetWaterNetwork());
         waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
         // CRITICAL: Upload initial water simulation data to GPU texture immediately after initialization
         terrain->updateWaterMapTexture(waterSim.getTextureData());
@@ -412,7 +413,8 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
         if (terrain->terrainManager &&
             waterHeightRevision != terrain->terrainManager->getHeightmapRevision()) {
             waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f,
-                                -13938.0f, 13938.0f, waterLevelAdjust);
+                                -13938.0f, 13938.0f, waterLevelAdjust,
+                                &terrain->getWetWaterNetwork());
             terrain->updateWaterMapTexture(waterSim.getTextureData());
             waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
             std::cout << "[Water] Rebuilt terrain water mask after heightmap reload.\n";
@@ -420,10 +422,15 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
     }
     recordPhase(perf.terrainMs);
 
-    // The rendered water map is static between terrain/water-level edits.
-    // WaterSimulation::update() only changes private flow state; its texture
-    // data is derived from the unchanged masks and heights. Recomputing it and
-    // uploading the full 512x512 texture every frame caused a GPU sync stall.
+    // Advance the existing constrained water simulation at 4 Hz. Its output is
+    // the single water map consumed by the existing ocean/water surface shader.
+    waterSimulationAccumulator += std::max(0.0, deltaTime);
+    if (terrain && terrain->terrainManager && waterSimulationAccumulator >= 0.25) {
+        const float step = static_cast<float>(std::min(waterSimulationAccumulator, 0.25));
+        waterSimulationAccumulator -= step;
+        waterSim.update(step);
+        terrain->updateWaterMapTexture(waterSim.getTextureData());
+    }
 
     // ----------------------------------------------------
     // EDITOR MOUSE & RAYCAST INTERACTION (UI CLICKS & 3D INTERACTION)
@@ -542,7 +549,8 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             mouseX <= lpX + lpW - 15) {
                             std::cout << "[Editor UI] Triggering Global Hydraulic Erosion Pass...\n";
                             terrain->terrainManager->erodeGlobal();
-                            waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f, waterLevelAdjust);
+                            waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f,
+                                                waterLevelAdjust, &terrain->getWetWaterNetwork());
                             terrain->updateWaterMapTexture(waterSim.getTextureData());
                         }
                     }

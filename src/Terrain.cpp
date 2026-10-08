@@ -358,7 +358,6 @@ Terrain::Terrain() {
   }
 
   oceanShader = new Shader("src/shaders/ocean.vert", "src/shaders/ocean.frag");
-  wetWaterShader = new Shader("src/shaders/wet_water.vert", "src/shaders/wet_water.frag");
   streetShader =
       new Shader("src/shaders/street.vert", "src/shaders/street.frag");
   modelShader = new Shader("src/shaders/model.vert", "src/shaders/model.frag");
@@ -698,12 +697,16 @@ Terrain::Terrain() {
             << ", normal map: " << (roadNormalTex ? "yes" : "no")
             << std::endl;
 
-  // Initialize dynamic waterMapTex (256x256 single-channel floating-point texture)
+  // RGBA simulation map: world-space surface height, wet coverage, water kind,
+  // and flow strength. The existing ocean renderer consumes this shared map.
   glGenTextures(1, &waterMapTex);
   glBindTexture(GL_TEXTURE_2D, waterMapTex);
-  std::vector<float> initiallyDry(WaterSimulation::SIM_SIZE * WaterSimulation::SIM_SIZE, -1000.0f);
-  glTexImage2D(GL_TEXTURE_2D, 0, GL_R32F, WaterSimulation::SIM_SIZE, WaterSimulation::SIM_SIZE,
-               0, GL_RED, GL_FLOAT, initiallyDry.data());
+  const size_t waterCellCount = static_cast<size_t>(WaterSimulation::SIM_SIZE) * WaterSimulation::SIM_SIZE;
+  std::vector<float> initiallyDry(waterCellCount * WaterSimulation::CHANNELS, 0.0f);
+  for (size_t i = 0; i < waterCellCount; ++i)
+    initiallyDry[i * WaterSimulation::CHANNELS] = waterLevelRuntime;
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, WaterSimulation::SIM_SIZE, WaterSimulation::SIM_SIZE,
+               0, GL_RGBA, GL_FLOAT, initiallyDry.data());
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -717,17 +720,6 @@ Terrain::Terrain() {
   std::cout << "[Terrain] Pre-loading Tree and Grass models..." << std::endl;
   assetCache["assets/Tree_02/Tree.obj"] = new ObjModel("assets/Tree_02/Tree.obj");
   assetCache["assets/terrain/grass_medium_01_2k.fbx"] = new ObjModel("assets/terrain/grass_medium_01_2k.fbx");
-
-  // Place water against the completed rendered/physics heightfield, after roads
-  // have been snapped and conformed. This samples terrain but never changes it.
-  if (terrainManager && (!wetWaterNetwork.pools().empty() ||
-                         !wetWaterNetwork.trickles().empty())) {
-    wetWaterMeshBuilder.build(wetWaterNetwork, *terrainManager);
-    wetWaterMeshBuilder.upload();
-    std::cout << "[Terrain] Wet-water geometry built: " << wetWaterMeshBuilder.poolCount()
-              << " pools, " << wetWaterMeshBuilder.trickleCount() << " trickles, "
-              << wetWaterMeshBuilder.triangleCount() << " triangles.\n";
-  }
 
   std::cout << "[Terrain] Initialization done." << std::endl;
 }
@@ -763,7 +755,6 @@ Terrain::~Terrain() {
   delete terrainManager;
   delete terrainShader;
   delete oceanShader;
-  delete wetWaterShader;
   delete streetShader;
   delete modelShader;
   delete cityWallModel;
@@ -865,7 +856,9 @@ struct WaterVertex {
 void Terrain::buildWaterMesh() {
   std::vector<WaterVertex> verts;
   std::vector<unsigned int> idx;
-  int W = 256, H = 256; // Optimized density for high performance Gerstner waves
+  // Match the existing simulation map so its local water stages are represented
+  // by the shared surface instead of spawning separate water geometry.
+  int W = WaterSimulation::SIM_SIZE, H = WaterSimulation::SIM_SIZE;
   float startX = -13938.0f, endX = 13938.0f;
   float startZ = -13938.0f, endZ = 13938.0f;
 
@@ -2286,49 +2279,6 @@ void Terrain::renderWater(const glm::mat4 &proj, const glm::mat4 &view,
   glDrawElements(GL_TRIANGLES, waterIndexCount, GL_UNSIGNED_INT, nullptr);
   glBindVertexArray(0);
 
-  // Freshwater features are separate surfaces fitted to the final terrain.
-  // Their shader clips against the final terrain heightfield and both road masks, so the
-  // water mesh cannot hide the road surface or change terrain elevations.
-  if (terrainManager && wetWaterShader && wetWaterShader->isValid() &&
-      wetWaterMeshBuilder.getTerrainHeightTexture() != 0) {
-    wetWaterShader->use();
-    wetWaterShader->setMat4("projection", proj);
-    wetWaterShader->setMat4("view", view);
-    wetWaterShader->setFloat("time", static_cast<float>(glfwGetTime()));
-    wetWaterShader->setVec3("cameraPos", cam);
-    wetWaterShader->setVec3("lightDir", light);
-    wetWaterShader->setFloat("worldMinX", terrainManager->getWorldMinX());
-    wetWaterShader->setFloat("worldMaxX", terrainManager->getWorldMaxX());
-    wetWaterShader->setFloat("worldMinZ", terrainManager->getWorldMinZ());
-    wetWaterShader->setFloat("worldMaxZ", terrainManager->getWorldMaxZ());
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, wetWaterMeshBuilder.getTerrainHeightTexture());
-    wetWaterShader->setInt("terrainHeightTex", 0);
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, terrainManager->getRoadMask());
-    wetWaterShader->setInt("paintedRoadMask", 1);
-    wetWaterShader->setInt("usePaintedRoadMask", terrainManager->getRoadMask() != 0 ? 1 : 0);
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, terrainManager->getRoadGeometryMask());
-    wetWaterShader->setInt("vectorRoadMask", 2);
-    wetWaterShader->setInt("useVectorRoadMask", terrainManager->getRoadGeometryMask() != 0 ? 1 : 0);
-    glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, normalMap1 ? normalMap1 : flatNormalTex);
-    wetWaterShader->setInt("normalMap1", 3);
-    glActiveTexture(GL_TEXTURE4);
-    glBindTexture(GL_TEXTURE_2D, normalMap2 ? normalMap2 : flatNormalTex);
-    wetWaterShader->setInt("normalMap2", 4);
-    glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_2D, foamTex ? foamTex : flatNormalTex);
-    wetWaterShader->setInt("foamTexture", 5);
-    glActiveTexture(GL_TEXTURE6);
-    glBindTexture(GL_TEXTURE_2D, sceneColorTex);
-    wetWaterShader->setInt("sceneColorTex", 6);
-    wetWaterShader->setInt("useSceneColor", sceneColorTex != 0 ? 1 : 0);
-    wetWaterMeshBuilder.render();
-  }
-
   glDepthMask(GL_TRUE);
   glDisable(GL_BLEND);
   glActiveTexture(GL_TEXTURE0);
@@ -3053,7 +3003,7 @@ void Terrain::updateWaterMapTexture(const float* data) const {
   if (waterMapTex != 0 && data != nullptr) {
     glBindTexture(GL_TEXTURE_2D, waterMapTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, WaterSimulation::SIM_SIZE, WaterSimulation::SIM_SIZE,
-                    GL_RED, GL_FLOAT, data);
+                    GL_RGBA, GL_FLOAT, data);
     glBindTexture(GL_TEXTURE_2D, 0);
   }
 }

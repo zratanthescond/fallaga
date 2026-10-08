@@ -165,4 +165,5 @@ private:
     double gpuPhaseAccum[kGpuPhaseCount] = {};
     int gpuPhaseSampleCount = 0;
     unsigned int waterHeightRevision = 0;
+    double waterSimulationAccumulator = 0.0;
 };

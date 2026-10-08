@@ -56,16 +56,22 @@ void main() {
     float isRiver    = 0.0;
     vec2  shoreNormal = vec2(-1.0, 0.0); // Points toward shore (uphill)
     float shoreEdge  = 1.0;
+    float simulatedCoverage = 1.0;
+    float simulatedKind = 0.0;
+    float simulatedFlowSpeed = 0.0;
+    float surfaceLevel = waterLevel;
 
     if (useHeightmap == 1) {
         float u = (FragPos.x - hmWorldMinX) / (hmWorldMaxX - hmWorldMinX);
         float v = (FragPos.z - hmWorldMinZ) / (hmWorldMaxZ - hmWorldMinZ);
 
         if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
-            // The simulation marks below-sea depressions disconnected from the
-            // coast with a sentinel. Keep those inland basins dry.
-            float connectedWaterLevel = texture(waterMapTex, vec2(u, v)).r;
-            if (connectedWaterLevel < -100.0) discard;
+            vec4 waterState = texture(waterMapTex, vec2(u, v));
+            simulatedCoverage = clamp(waterState.g, 0.0, 1.0);
+            simulatedKind = waterState.b;
+            simulatedFlowSpeed = waterState.a;
+            if (simulatedCoverage <= 0.001) discard;
+            surfaceLevel = waterState.r;
 
             float normElev = texture(heightmapTex, vec2(u, v)).r;
             terrainH = hmMinElev + normElev * (hmMaxElev - hmMinElev);
@@ -73,7 +79,7 @@ void main() {
             // Use the same interpolated heightfield as the terrain. A hard discard
             // at exactly zero depth aliases the coast at screen resolution, so keep
             // a one-pixel coverage ramp around the true waterline instead.
-            float rawDepth = min(waterLevel, connectedWaterLevel) - terrainH;
+            float rawDepth = surfaceLevel - terrainH;
             float shorelineAa = max(fwidth(rawDepth), 0.02);
             if (rawDepth < -shorelineAa) discard;
 
@@ -81,7 +87,8 @@ void main() {
             shoreEdge = smoothstep(-shorelineAa, shorelineAa, rawDepth);
 
             // Sample river mask (Blue channel)
-            isRiver = texture(roadMask, vec2(u, v)).b;
+            isRiver = max(texture(roadMask, vec2(u, v)).b,
+                          smoothstep(1.5, 2.5, simulatedKind));
 
             // Heightmap gradient: points uphill towards beach / dry ground
             float eps = 0.0025;
@@ -106,7 +113,8 @@ void main() {
     vec2 riverFlow = -shoreNormal;
     vec2 flowDir   = mix(oceanFlow, riverFlow, isRiver);
 
-    float flowRate = mix(0.07, 0.35, isRiver);
+    float flowRate = mix(0.07, 0.35, isRiver) *
+                     mix(1.0, clamp(simulatedFlowSpeed, 0.25, 2.0), isRiver);
     float t1 = fract(time * flowRate);
     float t2 = fract(time * flowRate + 0.5);
     float flowBlend = abs(t1 - 0.5) / 0.5;
@@ -319,6 +327,7 @@ void main() {
 
     // Smooth alpha ramp down to the exact waterline
     finalAlpha *= shoreEdge;
+    finalAlpha *= smoothstep(0.0, 0.6, simulatedCoverage);
 
     // ── 13. ATMOSPHERIC HORIZON FOG (Seamlessly blends water into sky) ────────
     float oceanFogAmt = smoothstep(1200.0, 5500.0, dist);
