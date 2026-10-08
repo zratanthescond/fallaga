@@ -28,6 +28,7 @@ add_executable(RDR2_Prototype
     src/Character.cpp
     src/Horse.cpp
     src/Terrain.cpp
+    src/RiverSystem.cpp
     src/HeightmapTerrain.cpp
     src/Camera.cpp
     src/ObjectModel.cpp

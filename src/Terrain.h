@@ -13,6 +13,7 @@
 #include "RoadSystem.h"
 #include "Shader.h"
 #include "TerrainManager.h"
+#include "RiverSystem.h"
 
 struct Monument { char id; float x,z,w,h; const char* name; };
 struct Street   { float x1,z1,x2,z2,width; };
@@ -30,6 +31,7 @@ public:
     Shader* terrainShader = nullptr;
     Shader* modelShader   = nullptr;
     Shader* streetShader  = nullptr;
+    Shader* riverShader   = nullptr;
 
     static bool isFlatMode;
 
@@ -151,6 +153,8 @@ private:
     RoadTileField*   roadTileField   = nullptr;
     RoadNavigationGraph roadNavigationGraph;
     HeightSampler    roadHeightSampler;
+    RiverNetwork     riverNetwork;
+    RiverMeshBuilder riverMeshBuilder;
     TerrainCoordinateMapper roadMapper;   // plan→world transform shared by the road pipeline
     ObjModel* trainStationModel = nullptr;
     ObjModel* cityWallModel = nullptr;

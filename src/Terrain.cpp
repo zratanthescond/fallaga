@@ -358,12 +358,29 @@ Terrain::Terrain() {
   }
 
   oceanShader = new Shader("src/shaders/ocean.vert", "src/shaders/ocean.frag");
+  riverShader = new Shader("src/shaders/river.vert", "src/shaders/river.frag");
   streetShader =
       new Shader("src/shaders/street.vert", "src/shaders/street.frag");
   modelShader = new Shader("src/shaders/model.vert", "src/shaders/model.frag");
 
   std::cout << "[Terrain] Initializing Water Mesh..." << std::endl;
   buildWaterMesh();
+
+  // Keep the full generated network available for editing and future wadi flood
+  // work, but render only the >=12 km^2 perennial channels from option C. The
+  // coastal-flat traces are data artifacts and are excluded from the water mesh.
+  std::string riverLoadError;
+  if (riverNetwork.loadFromJSON("assets/hydrology/rivers.json", &riverLoadError)) {
+    riverMeshBuilder.build(riverNetwork, 12.0f);
+    riverMeshBuilder.upload();
+    std::cout << "[Terrain] Rivers loaded: " << riverNetwork.channels().size()
+              << " channels; perennial mesh has " << riverMeshBuilder.channelCount()
+              << " channels, " << riverMeshBuilder.vertexCount() << " vertices and "
+              << riverMeshBuilder.triangleCount() << " triangles (source sea level "
+              << riverNetwork.sourceSeaLevel() << " m).\n";
+  } else {
+    std::cerr << "[Terrain] River network unavailable: " << riverLoadError << "\n";
+  }
 
   // â”€â”€ GEOMETRY-BASED ROAD SYSTEM â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   std::cout << "[Terrain] Initializing Geometry Road System..." << std::endl;
@@ -732,6 +749,7 @@ Terrain::~Terrain() {
   delete terrainManager;
   delete terrainShader;
   delete oceanShader;
+  delete riverShader;
   delete streetShader;
   delete modelShader;
   delete cityWallModel;
@@ -2254,8 +2272,34 @@ void Terrain::renderWater(const glm::mat4 &proj, const glm::mat4 &view,
   glDrawElements(GL_TRIANGLES, waterIndexCount, GL_UNSIGNED_INT, nullptr);
   glBindVertexArray(0);
 
+  // River channels have independent heights and flow, so they are rendered as
+  // their own ribbons after the flat ocean surface.
+  if (riverShader && riverMeshBuilder.vertexCount() > 0) {
+    riverShader->use();
+    riverShader->setMat4("projection", proj);
+    riverShader->setMat4("view", view);
+    riverShader->setMat4("model", glm::mat4(1.0f));
+    riverShader->setFloat("time", static_cast<float>(glfwGetTime()));
+    riverShader->setFloat("seaLevel", waterLevelRuntime);
+    riverShader->setVec3("cameraPos", cam);
+    riverShader->setVec3("lightDir", light);
+    riverShader->setVec3("lightColor", lightColor);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, normalMap1 ? normalMap1 : flatNormalTex);
+    riverShader->setInt("normalMap1", 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, normalMap2 ? normalMap2 : flatNormalTex);
+    riverShader->setInt("normalMap2", 1);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, foamTex ? foamTex : flatNormalTex);
+    riverShader->setInt("foamTexture", 2);
+    riverMeshBuilder.render();
+  }
+
   glDepthMask(GL_TRUE);
   glDisable(GL_BLEND);
+  glActiveTexture(GL_TEXTURE0);
   glUseProgram(0);
 }
 
