@@ -1663,13 +1663,15 @@ void RoadSpline::evaluate(RoadSegment &seg, const HeightSampler &sampler,
   const auto &cps = seg.controlPoints;
   int n = (int)cps.size();
   seg.surfaceBoundsValid = false;
-  if (n < 2)
-    return;
-
+  // Re-evaluation is also used while editing. Never leave a previously valid
+  // spline attached to a segment whose control points have since been removed.
   seg.splinePoints.clear();
   seg.tangents.clear();
   seg.rightVecs.clear();
+  seg.curvature.clear();
   seg.cumulativeDist.clear();
+  if (n < 2)
+    return;
 
   // Collect 2D control points
   std::vector<glm::vec2> pts(n);
@@ -1844,6 +1846,11 @@ void RoadSpline::evaluate(RoadSegment &seg, const HeightSampler &sampler,
   // Sampling at >0.5/m is already done above; store as sampled geometry.
   // Sample heightmap for elevation directly without alteration
   int m = (int)path.size();
+  // Duplicate or nearly coincident authored points can collapse during
+  // resampling. Such a path has no usable tangent and must not reach the
+  // endpoint tangent code below (which requires at least two samples).
+  if (m < 2)
+    return;
   seg.splinePoints.resize(m);
   for (int i = 0; i < m; ++i) {
     float y = sampler.isValid() ? sampler.renderedGround(path[i].x, path[i].y) : 0.0f;
@@ -2448,9 +2455,10 @@ void RoadTileField::build(const std::vector<RoadSegment> &segments,
       continue;
 
     const uint8_t stamp = (uint8_t)((int)seg.type + 1);
-    for (int i = 0; i + 1 < n; ++i) {
+    const int spanCount = seg.closed ? n : n - 1;
+    for (int i = 0; i < spanCount; ++i) {
       const glm::vec3 &a = seg.splinePoints[i];
-      const glm::vec3 &b = seg.splinePoints[i + 1];
+      const glm::vec3 &b = seg.splinePoints[(i + 1) % n];
       int c0 = INT_MAX, r0 = INT_MAX, c1 = INT_MIN, r1 = INT_MIN;
       RoadTile::walkRibbon(m_map, w, h, a.x, a.z, b.x, b.z,
                            [&](int col, int row) {
