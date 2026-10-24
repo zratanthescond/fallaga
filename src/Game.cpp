@@ -179,7 +179,6 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 
 Game::~Game() {
     AudioSystem::getInstance().cleanup();
-    if (gpuTimerQueries[0]) glDeleteQueries(4, gpuTimerQueries);
     if (gpuPhaseQueries[0][0]) {
         for (int s = 0; s < kGpuPhaseSlots; ++s)
             for (int p = 0; p < kGpuPhaseCount; ++p)
@@ -1720,35 +1719,6 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
 void Game::render() {
     using RenderPerfClock = std::chrono::steady_clock;
     static const bool profileRender = std::getenv("FALLAGA_RENDER_PERF") != nullptr;
-    static bool gpuTimerPending[4] = {};
-    static int gpuTimerFrame = 0;
-    static int gpuTimerSamples = 0;
-    static double gpuTimerAccumulatedMs = 0.0;
-    int activeGpuTimerSlot = -1;
-    if (profileRender && GLEW_ARB_timer_query) {
-        if (gpuTimerQueries[0] == 0) glGenQueries(4, gpuTimerQueries);
-        const int slot = gpuTimerFrame++ % 4;
-        if (gpuTimerPending[slot]) {
-            GLuint available = GL_FALSE;
-            glGetQueryObjectuiv(gpuTimerQueries[slot], GL_QUERY_RESULT_AVAILABLE, &available);
-            if (available == GL_TRUE) {
-                GLuint64 elapsedNs = 0;
-                glGetQueryObjectui64v(gpuTimerQueries[slot], GL_QUERY_RESULT, &elapsedNs);
-                gpuTimerAccumulatedMs += static_cast<double>(elapsedNs) / 1000000.0;
-                gpuTimerPending[slot] = false;
-                if (++gpuTimerSamples >= 60) {
-                    std::cout << "[RENDER GPU PERF] avg ms: "
-                              << gpuTimerAccumulatedMs / gpuTimerSamples << '\n';
-                    gpuTimerSamples = 0;
-                    gpuTimerAccumulatedMs = 0.0;
-                }
-            }
-        }
-        if (!gpuTimerPending[slot]) {
-            activeGpuTimerSlot = slot;
-            glBeginQuery(GL_TIME_ELAPSED, gpuTimerQueries[slot]);
-        }
-    }
     RenderPerfClock::time_point renderPhaseStart{};
     double skyRenderMs = 0.0;
     double preTerrainRenderMs = 0.0;
@@ -3508,11 +3478,6 @@ if (projSaveFlash > 0.0f) {
     // 9. Cleanup
     glDisable(GL_LIGHTING);
     glUseProgram(0);
-
-    if (activeGpuTimerSlot >= 0) {
-        glEndQuery(GL_TIME_ELAPSED);
-        gpuTimerPending[activeGpuTimerSlot] = true;
-    }
 
     recordRenderPhase(renderPostMs);
     gpuPhaseNext(); // post: closes the last phase query

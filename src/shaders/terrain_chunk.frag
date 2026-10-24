@@ -28,6 +28,7 @@ uniform float u_farLodDistance;
 // matches the road ribbon drawn over it instead of forming a dark outline round it.
 // The gravel scan is authored dark (mean sRGB ~0.25), so this multiplies UP.
 uniform float u_roadArmGain;
+uniform float u_detailDist;
 
 // --- UTILITIES ---
 // Non-periodic Dave Hoskins hash (clean, no repeating lattice)
@@ -188,6 +189,8 @@ void main()
     col = mix(colGround, splatColor, 0.72);
     sampledNorm = normalize(mix(nrmGround, normalize(splatNormal), 0.72));
 
+    vec3 worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
+    if (u_detailDist <= 0.0 || dist < u_detailDist) {
     // ── 2. GEOLOGICAL SLOPE EROSION & ROCK CLIFF STRATA ──
     // A. Moderate slopes (12° to 24°): topsoil erodes, exposing stony scree talus
     float screeFactor = smoothstep(11.0, 20.0, angleDeg) * (1.0 - smoothstep(22.0, 32.0, angleDeg));
@@ -300,7 +303,7 @@ void main()
         sampledNorm = mix(sampledNorm, harborNrm, smoothstep(0.05, 0.60, totalHarborWeight));
     }
 
-    vec3 worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
+    worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
 
     // ── 5. ROADS, RAILWAYS, AND REALISTIC ASYMMETRIC WADIS ──
     if (hasRoadMask || hasSplineRoadMask) {
@@ -539,6 +542,7 @@ void main()
             col *= mix(vec3(1.0), vec3(0.82, 0.78, 0.72), wetWadi * 0.25);
             specMask = max(specMask, wetWadi * 0.10);
         }
+    }
     }
 
     // ── 6. BALANCED NATURAL LIGHTING (PBR-LITE) ──

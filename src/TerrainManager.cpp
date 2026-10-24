@@ -10,6 +10,7 @@
 #include <functional>
 #include <limits>
 #include <unordered_map>
+#include <cstdlib>
 #include <sys/stat.h>
 
 TerrainManager::TerrainManager(const std::string& hmPath, const std::string& pmPath, float minX, float maxX, float minZ, float maxZ, float minH, float maxH)
@@ -408,6 +409,18 @@ void TerrainManager::render(const glm::mat4& proj, const glm::mat4& view, const 
         return 0.0f;
     }();
     terrainShader->setFloat("u_farLodDistance", farLodDistance);
+    // The fragment shader's expensive geology, harbor, road and wadi material
+    // branches are meant to fade out at distance. Keep the default in sync with
+    // the shader comment; previously this uniform was never uploaded, so OpenGL
+    // left it at 0 and the shader treated every pixel as near detail forever.
+    static const float detailDistance = [] {
+        if (const char* e = std::getenv("FALLAGA_DETAIL_DIST")) {
+            const float v = std::strtof(e, nullptr);
+            if (v >= 0.0f) return v;
+        }
+        return 130.0f;
+    }();
+    terrainShader->setFloat("u_detailDist", detailDistance);
     // Roadbed brightness on the terrain. The gravel scan is authored dark (mean sRGB
     // ~0.25), and the road ribbon multiplies it by its own gain before lighting, so
     // the terrain arm needs a comparable boost or the ribbon reads as a lighter strip

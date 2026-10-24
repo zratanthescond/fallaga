@@ -151,9 +151,6 @@ private:
     bool projRefHeightGridFlipX = false;
     bool projRefHeightGridFlipZ = false;
     float projRefHeightGridYOffset = 0.0f;
-    // GPU timer queries. Members (not function-local statics) so the destructor can
-    // delete them; they used to be glGen'd and never freed.
-    unsigned int gpuTimerQueries[4] = {0, 0, 0, 0};
     // Per-phase GPU timers: [slot][phase]. Results are read two frames after the
     // slot is used, so a slot is never reused before its queries have completed and
     // reading them cannot stall the pipeline. Phase order follows the render order:
