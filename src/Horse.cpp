@@ -298,41 +298,35 @@ void Horse::dismountCharacter(Character* character) {
 void Horse::render(const glm::mat4& projection, const glm::mat4& view) {
     if (!model || !horseShader) return;
 
-    // 1. Initialize Model Matrix
+    // The redHorse.fbx mesh is authored Y-up with its origin at the hooves
+    // (bind-pose bounds min.y ~ -3.5, height ~195 units). Unlike the character
+    // (Z-up), it must NOT receive a -90deg X correction or it tips onto its nose
+    // and buries most of the body in the terrain.
+    const float scaleFactor = 0.0100f;
+
+    // 1. Build the model matrix: scale -> yaw/pitch/roll -> translate to world.
     glm::mat4 modelMatrix = glm::mat4(1.0f);
-    
-    // --- Transformations applied in reverse order (right-to-left in GLM) ---
-    
-    // 5. Apply Translation (Position in World Space - APPLIED LAST)
     glm::vec3 horsePos(position.x, position.y, position.z);
-    // glm::translate(M, T) results in T * M
     modelMatrix = glm::translate(modelMatrix, horsePos);
-    
-    // 4. Apply PITCH, ROLL, and YAW Rotation (Terrain Alignment)
     modelMatrix = modelMatrix * m_PitchRollMatrix;
+    modelMatrix = glm::scale(modelMatrix, glm::vec3(scaleFactor));
 
-    // 2. Model Correction Rotation (FBX Z-up → Engine Y-up conversion)
-    // Same -90° X rotation as the character model uses for FBX files.
-    modelMatrix = glm::rotate(modelMatrix, glm::radians(-90.0f), glm::vec3(1.0f, 0.0f, 0.0f));
+    // 2. Ground the hooves: lift so the lowest bind-pose point sits at the origin.
+    float yOffset = 0.0f;
+    if (((AnimatedModel*)model)->hasBounds()) {
+        yOffset = -((AnimatedModel*)model)->getMinBounds().y * scaleFactor;
+    }
 
-    // 1. Apply Scaling (Must be applied first to model coordinates - APPLIED FIRST)
-    float scaleFactor = 0.0030f; 
-    modelMatrix = glm::scale(modelMatrix, glm::vec3(scaleFactor)); 
-    
-    // --- End Transformations ---
-    
-    // 2. Activate the shader and set uniforms
+    // 3. Activate the shader and set uniforms
     horseShader->use();
-
-    // 3. Set the standard matrices (Projection, View, Model) as uniforms
     horseShader->setMat4("projection", projection);
     horseShader->setMat4("view", view);
-    horseShader->setMat4("model", modelMatrix); 
-    horseShader->setFloat("yOffset", 0.0f); // Default yOffset to 0 for horse
-    
+    horseShader->setMat4("model", modelMatrix);
+    horseShader->setFloat("yOffset", yOffset);
+
     // 4. Pass the calculated bone matrices (gBones uniform)
     ((AnimatedModel*)model)->setBoneUniforms(*horseShader);
-    
+
     // 5. Draw the animated mesh
     ((AnimatedModel*)model)->draw();
 }

@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <functional>
 #include <GL/glew.h>
 #include "Vec3.h"
 #include <glm/glm.hpp>
@@ -17,12 +18,16 @@ class Shader;
 struct Material {
     std::string name;
     unsigned int textureID = 0;
+    bool textureSRGB = false;
     unsigned int normalMapID = 0;
     unsigned int specularMapID = 0;
     float ambient[4] = {0.2f, 0.2f, 0.2f, 1.0f}; // Ka
     float diffuse[4] = {0.8f, 0.8f, 0.8f, 1.0f}; // Kd
     float specular[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // Ks
     float shininess = 32.0f; // Ns
+    // glTF cutout threshold for foliage cards. Non-glTF materials keep the
+    // renderer's conservative 0.45 default.
+    float alphaCutoff = 0.45f;
 };
 
 // Simplified structs (keep only if actually used by legacy methods, otherwise remove)
@@ -50,6 +55,8 @@ struct Mesh {
     unsigned int EBO = 0;
     unsigned int instanceVBO = 0; // VBO for Per-Instance Model Matrices
     unsigned int indexCount = 0;
+    GLenum primitiveMode = GL_TRIANGLES;
+    bool hasUsableTexCoords = false;
     glm::mat4 nodeTransform = glm::mat4(1.0f); // Absolute transform from Blender node hierarchy
     mutable size_t lastUploadedSize = 0; // Track uploaded size to prevent redundant uploads
 };
@@ -63,7 +70,10 @@ public:
     void render() const; // Legacy (not recommended)
     void render(Shader& shader, unsigned int overrideTextureID = 0) const; // Modern
     void renderMesh(int meshIndex, Shader& shader) const; // Single mesh with per-mesh model matrix
-    void renderInstanced(Shader& shader, const std::vector<glm::mat4>& instanceMatrices, bool forceUpdate = false) const; 
+    void renderInstanced(Shader& shader, const std::vector<glm::mat4>& instanceMatrices,
+                         bool forceUpdate = false,
+                         std::function<float(float, float)> riparianAt = {},
+                         glm::vec3 cameraPosition = glm::vec3(0.0f)) const;
     int getMeshCount() const { return (int)meshes.size(); }
     std::string getMeshName(int index) const { return (index >= 0 && index < (int)meshes.size()) ? meshes[index].name : ""; }
     std::string getMeshNodeName(int index) const { return (index >= 0 && index < (int)meshes.size()) ? meshes[index].nodeName : ""; }
@@ -143,13 +153,15 @@ public:
 private:
     // Private declarations (must also match the .cpp file)
     void processMaterials();
-    void processNode(aiNode* node);
+    void processNode(aiNode* node, const aiMatrix4x4& parentTransform);
     void setupDisplayList(); 
     void setupGPUBuffers(); // New modern approach
     void createFallbackCube();
     // Use GLuint for OpenGL ID if that is the correct type for your system/API
-    void loadTexture(const std::string& textureFilename, unsigned int& textureID); 
-    void loadTextureFromMemory(const aiTexture* embeddedTexture, unsigned int& textureID); 
+    void loadTexture(const std::string& textureFilename, unsigned int& textureID,
+                     bool srgb = false, float alphaCoverageCutoff = -1.0f);
+    void loadTextureFromMemory(const aiTexture* embeddedTexture, unsigned int& textureID,
+                               bool srgb = false, float alphaCoverageCutoff = -1.0f);
     
     std::vector<Material> materials;
     std::string basepath; 

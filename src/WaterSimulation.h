@@ -169,6 +169,61 @@ public:
 
     const float* getTextureData() const { return textureData.data(); }
 
+    // Match the water texture's GL_LINEAR sampling (texel centres are at
+    // (i + 0.5) / SIM_SIZE, not i / (SIM_SIZE - 1)).
+    float sampleTextureChannelAt(float x, float z, int channel) const {
+        if (!(worldMaxX > worldMinX) || !(worldMaxZ > worldMinZ) ||
+            textureData.size() < static_cast<size_t>(SIM_SIZE) * SIM_SIZE * CHANNELS)
+            return 0.0f;
+        const float fx = std::clamp((x - worldMinX) / (worldMaxX - worldMinX), 0.0f, 1.0f)
+                         * SIM_SIZE - 0.5f;
+        const float fz = std::clamp((z - worldMinZ) / (worldMaxZ - worldMinZ), 0.0f, 1.0f)
+                         * SIM_SIZE - 0.5f;
+        const float cx = std::clamp(fx, 0.0f, static_cast<float>(SIM_SIZE - 1));
+        const float cz = std::clamp(fz, 0.0f, static_cast<float>(SIM_SIZE - 1));
+        const int x0 = std::min(static_cast<int>(cx), SIM_SIZE - 2);
+        const int z0 = std::min(static_cast<int>(cz), SIM_SIZE - 2);
+        const float tx = cx - x0, tz = cz - z0;
+        const auto sample = [&](int sx, int sz) {
+            return textureData[(static_cast<size_t>(sz) * SIM_SIZE + sx) * CHANNELS + channel];
+        };
+        const float top = sample(x0, z0) * (1.0f - tx) + sample(x0 + 1, z0) * tx;
+        const float bottom = sample(x0, z0 + 1) * (1.0f - tx) + sample(x0 + 1, z0 + 1) * tx;
+        return top * (1.0f - tz) + bottom * tz;
+    }
+
+    // Matches the water shader's footprint. Only connected ocean coverage is
+    // expanded to axial neighbours to bridge the coarse flood-fill grid. Pools
+    // and trickles already carry fractional coverage and must keep their authored
+    // banks; dilating those sources used to turn dry land into phantom water.
+    float coverageAt(float x, float z) const {
+        if (!(worldMaxX > worldMinX) || !(worldMaxZ > worldMinZ)) return 0.0f;
+        const float cellX = (worldMaxX - worldMinX) / SIM_SIZE;
+        const float cellZ = (worldMaxZ - worldMinZ) / SIM_SIZE;
+        float coverage = sampleTextureChannelAt(x, z, 1);
+        const float kind = sampleTextureChannelAt(x, z, 2);
+        if (kind < 1.5f) {
+            const auto oceanCoverage = [&](float sx, float sz) {
+                const float neighbourKind = sampleTextureChannelAt(sx, sz, 2);
+                return neighbourKind >= 0.5f && neighbourKind < 1.5f
+                    ? sampleTextureChannelAt(sx, sz, 1) : 0.0f;
+            };
+            coverage = std::max(coverage, oceanCoverage(x - cellX, z));
+            coverage = std::max(coverage, oceanCoverage(x + cellX, z));
+            coverage = std::max(coverage, oceanCoverage(x, z - cellZ));
+            coverage = std::max(coverage, oceanCoverage(x, z + cellZ));
+        }
+        return std::clamp(coverage, 0.0f, 1.0f);
+    }
+
+    float surfaceAt(float x, float z) const {
+        // The water shader uses ocean level where coverage came only from a
+        // neighbouring connected cell; the centre's channel 0 is then dry land.
+        if (sampleTextureChannelAt(x, z, 1) <= 0.001f)
+            return oceanWaterLevel;
+        return sampleTextureChannelAt(x, z, 0);
+    }
+
     void setOceanWaterLevel(float level) {
         if (std::abs(oceanWaterLevel - level) < 0.001f) return;
         oceanWaterLevel = level;
@@ -180,6 +235,40 @@ public:
                 waterDepths[i] = 0.0f;
         }
         updateTextureData();
+    }
+
+    // Re-derives the connected-sea mask from the current terrain heights.
+    //
+    // Without this, the water map's coverage channel is frozen at whatever the
+    // flood fill produced during initialize()/setOceanWaterLevel(), and the ocean
+    // fragment shader hard-discards wherever that coverage is zero. Terrain edits
+    // (sculpt, shoreline straightening) therefore could never move the visible
+    // waterline: a cell raised above the sea kept its coverage (so water stayed)
+    // and a cell pushed below the sea could not gain any (so no water appeared).
+    // Call this after any operation that changes terrain heights near the coast.
+    void refreshOcean() {
+        oceanMask = floodFillOcean(oceanWaterLevel);
+        for (int i = 0; i < SIM_SIZE * SIM_SIZE; ++i) {
+            if (oceanMask[i])
+                waterDepths[i] = std::max(0.0f, oceanWaterLevel - terrainHeights[i]);
+            else if (!wetMask[i])
+                waterDepths[i] = 0.0f;
+        }
+        updateTextureData();
+    }
+
+    // Re-samples the whole terrain height grid from the TerrainManager, then
+    // re-derives the sea mask. Use when edits may have changed heights that the
+    // per-stroke updateTerrainArea() disc did not cover.
+    void resampleTerrainAndRefreshOcean(TerrainManager* tm) {
+        if (!tm) return;
+        for (int z = 0; z < SIM_SIZE; ++z) {
+            const float wz = gridToWorldZ(z);
+            for (int x = 0; x < SIM_SIZE; ++x) {
+                terrainHeights[z * SIM_SIZE + x] = tm->getHeightAt(gridToWorldX(x), wz);
+            }
+        }
+        refreshOcean();
     }
 
 private:

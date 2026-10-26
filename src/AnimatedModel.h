@@ -57,6 +57,11 @@ public:
    bool loadAnimation(const std::string& animFilename, const std::string& animName);
    void setAnimationCyclic(const std::string& animName, bool isCyclic);
    bool isAnimationFinished() const { return m_AnimationIsFinished; }
+
+   // Bind-pose axis-aligned bounds in the model's local (mesh) space.
+   bool hasBounds() const { return m_HasBounds; }
+   glm::vec3 getMinBounds() const { return m_MinBounds; }
+   glm::vec3 getMaxBounds() const { return m_MaxBounds; }
    
    glm::mat4 getBoneWorldTransform(const std::string& boneName) const {
        auto it = m_BoneInfoMap.find(boneName);
@@ -103,6 +108,11 @@ bool m_AnimationIsFinished = false;
     std::string m_BasePath;
     glm::mat4 m_GlobalInverseTransform;
     MeshData m_MeshData;
+
+    // Bind-pose bounds accumulator (filled in processMesh)
+    glm::vec3 m_MinBounds = glm::vec3(1e30f);
+    glm::vec3 m_MaxBounds = glm::vec3(-1e30f);
+    bool m_HasBounds = false;
     
     std::string getCanonicalBoneName(const std::string& nodeName) const;
   

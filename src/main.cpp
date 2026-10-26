@@ -101,9 +101,11 @@ int main() {
         std::cerr << "Failed to initialize GLFW\n";
         return -1;
     }
-     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
+    // Target the current stable desktop OpenGL API. Keep the compatibility
+    // profile until the remaining immediate-mode editor overlays are replaced.
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
+    glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 6);
+    glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_COMPAT_PROFILE);
     glfwWindowHint(GLFW_DEPTH_BITS, 24); 
     glfwWindowHint(GLFW_AUTO_ICONIFY, GLFW_FALSE); 
 
@@ -132,9 +134,21 @@ int main() {
         std::cerr << "Failed to initialize GLEW\n";
         return -1;
     }
+    GLint glMajor = 0, glMinor = 0;
+    glGetIntegerv(GL_MAJOR_VERSION, &glMajor);
+    glGetIntegerv(GL_MINOR_VERSION, &glMinor);
+    if (glMajor < 4 || (glMajor == 4 && glMinor < 6)) {
+        std::cerr << "OpenGL 4.6 is required; driver created "
+                  << glMajor << '.' << glMinor << ".\n";
+        glfwDestroyWindow(window);
+        glfwTerminate();
+        return -1;
+    }
     std::cout << "[OpenGL] vendor=" << reinterpret_cast<const char*>(glGetString(GL_VENDOR))
               << " renderer=" << reinterpret_cast<const char*>(glGetString(GL_RENDERER))
-              << " version=" << reinterpret_cast<const char*>(glGetString(GL_VERSION)) << '\n';
+              << " version=" << reinterpret_cast<const char*>(glGetString(GL_VERSION))
+              << " GLSL=" << reinterpret_cast<const char*>(glGetString(GL_SHADING_LANGUAGE_VERSION))
+              << '\n';
 
     // --- Prefer low-latency presentation; allow users to restore VSync ---
     const char* vsyncEnv = std::getenv("FALLAGA_VSYNC");
@@ -273,6 +287,7 @@ int main() {
         {
             static const char* shotEnv = std::getenv("FALLAGA_SHOT");
             static long shotFrame = shotEnv ? atol(shotEnv) : -1;
+            static const char* sceneFboAbEnv = std::getenv("FALLAGA_SCENEFBO_AB");
             static const char* carSeqEnv = std::getenv("FALLAGA_CAR_SEQUENCE");
             static const char* roadProjEnv = std::getenv("FALLAGA_ROAD_PROJECT");
             static long frameNo = 0;
@@ -556,6 +571,25 @@ int main() {
                     std::cout << "[TEST] Dismount completed, player in Idle at frame " << frameNo << "\n";
                     glfwSetWindowShouldClose(window, GLFW_TRUE);
                 }
+            } else if (sceneFboAbEnv && shotFrame > 0 && frameNo == shotFrame) {
+                // In-process A/B for the scene target: separate runs are not pixel-stable,
+                // so the frame just rendered (through the target) is captured, then the
+                // target is disabled and the same frame is re-rendered straight to the
+                // screen. The two must match if the composite is truly identity.
+                const char* sideA = std::getenv("FALLAGA_AB_A");
+                const char* sideB = std::getenv("FALLAGA_AB_B");
+                saveCapture(sideA ? sideA : "scratch/ab_fbo.png");
+                // Same frame with SSAO disabled: the only pixel-stable measure of what the
+                // AO pass actually changed (separate runs are not comparable).
+                const bool prevSsao = game->ssaoEnabled;
+                game->ssaoEnabled = false;
+                game->render();
+                saveCapture("scratch/ab_nossao.png");
+                game->ssaoEnabled = prevSsao;
+                game->sceneFboEnabled = false;
+                game->render();
+                saveCapture(sideB ? sideB : "scratch/ab_direct.png");
+                glfwSetWindowShouldClose(window, GLFW_TRUE);
             } else if (shotFrame > 0 && frameNo == shotFrame) {
                 const char* out = std::getenv("FALLAGA_SHOT_PATH");
                 saveCapture(out ? out : "scratch/frame.png");

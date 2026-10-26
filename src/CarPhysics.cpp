@@ -429,6 +429,30 @@ void Car::updateActivePhysics(float dt, Terrain *terrain) {
   rigidState.velocity = glm::vec3(velocity.x, velocity.y, velocity.z);
   rigidState.angularVelocity = angularVel;
   rigidState.rotation = rotation;
+
+  // Soft kerb wall: push each corner back toward the carriageway. The force is
+  // applied at the centre of mass, matching the other chassis-level forces.
+  {
+    const glm::vec3 right = rotation * glm::vec3(1.0f, 0.0f, 0.0f);
+    const glm::vec3 fwd = rotation * glm::vec3(0.0f, 0.0f, 1.0f);
+    const float hx = std::max(0.55f, m_TrackWidth * 0.48f);
+    const float hz = std::max(0.9f, m_Wheelbase * 0.48f);
+    const glm::vec3 corners[4] = {
+        glm::vec3(position.x, position.y, position.z) + right * hx + fwd * hz,
+        glm::vec3(position.x, position.y, position.z) - right * hx + fwd * hz,
+        glm::vec3(position.x, position.y, position.z) + right * hx - fwd * hz,
+        glm::vec3(position.x, position.y, position.z) - right * hx - fwd * hz};
+    for (const glm::vec3& c : corners) {
+      glm::vec2 push;
+      float depth = 0.0f;
+      if (!terrain->getKerbPenetration(c.x, c.z, push, depth)) continue;
+      const float into = -(velocity.x * push.x + velocity.z * push.y);
+      const float f = drivingConfig.massKg *
+                      (60.0f * depth + 8.0f * std::max(into, 0.0f));
+      totalForce += glm::vec3(push.x, 0.0f, push.y) * f;
+    }
+  }
+
   const VehicleBody::State bodyState =
       vehicleBody->step(rigidState, totalForce, totalTorque, dt, heightAt);
   recordPhase(perf.bulletMs);

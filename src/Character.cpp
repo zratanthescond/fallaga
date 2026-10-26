@@ -2,6 +2,7 @@
 #include <GLFW/glfw3.h>
 #include <GL/glut.h> 
 #include <iostream>
+#include <cstdlib>
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
@@ -22,6 +23,10 @@
 // Moving to header eliminates duplication between .h and .cpp
 Character::Character() {
     position = Vec3(4275.0f, -46.5f, -835.0f); // Spawn at Place Pichon / Square de la Marine overlooking port
+    // Opt-in test location with valid steppe/olive density and no city exclusion.
+    if (const char* demo = std::getenv("FALLAGA_VEGETATION_DEMO")) {
+        if (demo[0] == '1') position = Vec3(5000.0f, -10.0f, 4500.0f);
+    }
     velocity = Vec3(0, 0, 0);  // CRITICAL: Initialize velocity to zero
     m_noclipToggled = false;
 

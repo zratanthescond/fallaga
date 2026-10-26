@@ -397,6 +397,9 @@ void AnimatedModel::processMesh(aiMesh* mesh)
     for (unsigned int i = 0; i < mesh->mNumVertices; i++) {
         Vertex vertex;
         vertex.Position = glm::vec3(mesh->mVertices[i].x, mesh->mVertices[i].y, mesh->mVertices[i].z);
+        m_MinBounds = glm::min(m_MinBounds, vertex.Position);
+        m_MaxBounds = glm::max(m_MaxBounds, vertex.Position);
+        m_HasBounds = true;
         if (mesh->HasNormals()) {
             vertex.Normal = glm::vec3(mesh->mNormals[i].x, mesh->mNormals[i].y, mesh->mNormals[i].z);
         }

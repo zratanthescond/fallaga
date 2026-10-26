@@ -6,6 +6,7 @@
 #include <string>
 #include <map>
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <glm/glm.hpp>
 #include "ObjectModel.h"
@@ -14,6 +15,9 @@
 #include "Shader.h"
 #include "TerrainManager.h"
 #include "RiverSystem.h"
+#include "vegetation/VegetationMasks.h"
+#include "vegetation/BiomeMasks.h"
+#include "EnvironmentMap.h"
 
 struct Monument { char id; float x,z,w,h; const char* name; };
 struct Street   { float x1,z1,x2,z2,width; };
@@ -73,9 +77,28 @@ public:
     void    saveTerrain();
     void    buildWaterFBOs(int width, int height);
 
+    // Phase 1 vegetation suitability raster: habitat, painted density,
+    // exclusions, roads, water and placed-model footprints. Cheap enough to
+    // rebuild when the city layout changes, and independent of render state so
+    // it can be inspected headlessly.
+    bool rebuildVegetationMasks();
+    bool rebuildEnvironmentMap();
+    bool rebuildBiomeMasks();
+    void setWaterCoverageSampler(std::function<float(float, float)> coverage,
+                                 std::function<float(float, float)> surface = {});
+    bool vegetationMasksReady() const { return vegetationMasks.ready(); }
+    const vegetation::VegetationMasks& getVegetationMasks() const {
+        return vegetationMasks;
+    }
+    unsigned int ensureVegetationDebugTexture(int mode);
+
     float     getHeight  (float x, float z) const;
     // Height of the walkable/drivable surface: road mesh where present, terrain elsewhere.
     float     getGroundSurfaceHeight(float x, float z) const;
+    // True when (x,z) is on a raised sidewalk band and not inside any road's
+    // carriageway. pushDir points away from the kerb, depth is metres past it.
+    bool      getKerbPenetration(float x, float z, glm::vec2& pushDir,
+                                 float& depth) const;
     std::uint64_t getCollisionSurfaceRevision() const { return collisionSurfaceRevision; }
     glm::vec3 getNormalAt(float x, float z) const;
     float     getRoadAt  (float x, float z) const;
@@ -146,6 +169,36 @@ private:
     int beachSplatMaskW = 0;
     int beachSplatMaskH = 0;
 
+    // Artist-painted biome weight maps (density_*.png) and the scatter exclusion
+    // mask, reduced to a single byte per texel. Sampled in world space by the
+    // grass field to decide where grass grows and how thick it is.
+    std::vector<unsigned char> densityDuneMask;
+    std::vector<unsigned char> densityOliveMask;
+    std::vector<unsigned char> densitySteppeMask;
+    std::vector<unsigned char> scatterExclusionMask;
+    int densityMaskW = 0;
+    int densityMaskH = 0;
+    void loadDensityMasks();
+    float sampleDensityMask(const std::vector<unsigned char>& mask,
+                            float x, float z) const;
+    bool isWithinRoadScatterClearance(float x, float z,
+                                      float clearance) const;
+    void uploadEnvironmentMapTexture(bool hasCover);
+    void uploadBiomeMasksTexture();
+
+    vegetation::VegetationMasks vegetationMasks;
+    env::BiomeMasks biomeMasks;
+    env::EnvironmentMap environmentMap;
+    std::function<float(float, float)> waterCoverageSampler;
+    std::function<float(float, float)> waterSurfaceSampler;
+    unsigned int environmentHeightRevision = 0;
+    unsigned int environmentTexture = 0;
+    unsigned int biomeTexture = 0;
+    mutable unsigned int grassEnvironmentRevision = 0;
+    unsigned int vegetationDebugTex = 0;
+    int vegetationDebugTexMode = -1;
+    bool vegetationDebugTexDirty = true;
+
     // Geometry-based road system
     RoadGraph*       roadGraph       = nullptr;
     RoadDeformer*    roadDeformer    = nullptr;
@@ -199,7 +252,33 @@ private:
     // fallback to catch rotation-only visibility changes.
     mutable std::map<std::string, std::vector<glm::mat4>> cachedCulledBatches;
     mutable glm::vec3 lastCullCamPos = glm::vec3(1e9f, 1e9f, 1e9f);
+    mutable glm::vec3 lastCullCamForward = glm::vec3(0.0f);
     mutable int cullFrameCounter = 0;
+
+    // Dense, camera-relative grass field built from the supplied plant pack.
+    // Placement uses a world-aligned blue-noise sample pattern, so instances
+    // have natural spacing and keep stable positions between rebuilds.
+    // Rebuilt only when the camera has travelled far enough that new cells
+    // enter the field radius.
+    mutable std::vector<glm::mat4> grassFieldInstances;
+    mutable glm::vec3 lastGrassFieldCamPos = glm::vec3(1e9f);
+    mutable bool grassFieldBuilt = false;
+    // Incremental (time-sliced) rebuild state: a rebuild is spread across frames
+    // so it never stalls a single frame, and the previous field keeps rendering
+    // until the new one is complete.
+    mutable bool grassBuildActive = false;
+    mutable glm::vec3 grassBuildCam = glm::vec3(1e9f);
+    mutable int grassBuildPhase = 0;
+    mutable int grassBuildJ = 0;
+    mutable int grassBuildI = 0;
+    mutable std::size_t grassBuildSample = 0;
+    mutable int grassBuildPlaced = 0;
+    mutable double grassBuildStartMs = 0.0;
+    mutable std::vector<glm::mat4> grassBuildInstances;
+    // Appends the dense field (plus optionally the roadside patches) for `cam`.
+    // Returns true when the field was regenerated this call.
+    bool updateGrassField(const glm::vec3& cam,
+                          const std::vector<glm::mat4>& roadsidePatches) const;
 
     // Water
     unsigned int waterVAO = 0, waterVBO = 0, waterEBO = 0;
@@ -209,12 +288,21 @@ private:
     unsigned int normalMap2 = 0;
     unsigned int foamTex    = 0;
     unsigned int mapTexture      = 0;  // 1899 Sousse map projected onto terrain
-    // Tarred gravel surface for the road ribbon, bound for the road pass only. The
-    // street shader samples it with the metric UV so the aggregate keeps a constant
-    // physical size. 0 falls back to the procedural asphalt in street.frag.
-    unsigned int roadSurfaceTex  = 0;
-    // Matching normal map, OpenGL convention, linear (normals are data not colour).
-    unsigned int roadNormalTex   = 0;
+    // Historical road textures from bla_road_txd:
+    unsigned int roadSurfaceTex    = 0; // Cobblestone street paving
+    unsigned int roadNormalTex     = 0;
+    unsigned int roadCurbTex       = 0; // Stone curb blocks
+    unsigned int roadCurbNormalTex = 0;
+    unsigned int roadSidewalkTex   = 0; // Red herringbone brick sidewalk
+    unsigned int roadSidewalkNormalTex = 0;
+    unsigned int roadPavingTex     = 0; // Flagstone / port / medina paving
+    unsigned int roadPavingNormalTex = 0;
+    unsigned int roadDirtTex       = 0; // Muddy dirt road / cart track
+    unsigned int roadDirtNormalTex = 0;
+    unsigned int roadSandTex       = 0; // Sand shoulder & gutter accumulation
+    unsigned int roadSandNormalTex = 0;
+    unsigned int roadJointTex      = 0; // Cobblestone joint / mortar mask
+    unsigned int roadMossTex       = 0; // Gutter weeds / moss tufts
 
 
     // Wall geometry
@@ -236,6 +324,7 @@ private:
     void buildWaterMesh();
     void initStreets();
     void buildStreetMesh();
+    void bindStreetTextures(Shader* shader) const;
     void renderStreets(const glm::mat4& proj, const glm::mat4& view,
                        const glm::vec3& lightDir, const glm::vec3& viewPos) const;
     void rebuildCarCollisionGrid() const;

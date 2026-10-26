@@ -1,4 +1,4 @@
-#version 330 core
+#version 460 core
 out vec4 FragColor;
 in vec3 WorldPos, Normal;
 in vec2 UV;
@@ -11,6 +11,12 @@ uniform sampler2D splineRoadMask;
 uniform sampler2D splatmap1;
 uniform sampler2D splatmap2;
 uniform sampler2D terrainSplatmap;
+uniform sampler2D environmentMap;
+uniform vec4 environmentMapWorldRect;
+uniform bool u_envHasCover;
+uniform sampler2D biomeMap;
+uniform vec4 biomeMapWorldRect;
+uniform bool u_hasBiomeMap;
 
 uniform vec3 viewPos, lightDir, lightColor;
 uniform float sunTilt;
@@ -28,6 +34,9 @@ uniform float u_farLodDistance;
 // matches the road ribbon drawn over it instead of forming a dark outline round it.
 // The gravel scan is authored dark (mean sRGB ~0.25), so this multiplies UP.
 uniform float u_roadArmGain;
+// Beyond this distance the expensive geological, harbor, wadi and road detail
+// branches are skipped entirely (they are invisible at range anyway). Set via
+// FALLAGA_DETAIL_DIST at runtime. Default 130 m gives a good quality/cost trade-off.
 uniform float u_detailDist;
 
 // --- UTILITIES ---
@@ -97,14 +106,16 @@ void main()
     vec3 colClumpyGrass = texture(terrainTex, vec3(baseUV, 1.0)).rgb;
     vec3 nrmClumpyGrass = texture(terrainNormal, vec3(baseUV, 1.0)).rgb * 2.0 - 1.0;
 
-    // Layer 2: Lush Prairie Grass (hea_grass_lush_je_02). Cheap distance LOD: beyond
-    // u_farLodDistance this layer is a near-duplicate of layer 1 at a slightly
-    // different scale, so it is not sampled at all and its weight folds into layer 1.
-    bool nearEnoughForSecondLayer = dist < u_farLodDistance;
+    // Layer 2: Lush Prairie Grass (hea_grass_lush_je_02).
+    // u_farLodDistance <= 0.0 means LOD dropping is disabled (sampled everywhere).
+    bool nearEnoughForSecondLayer = (u_farLodDistance <= 0.0) || (dist < u_farLodDistance);
     vec3 colLushGrass = vec3(0.0), nrmLushGrass = vec3(0.0, 0.0, 1.0);
     if (nearEnoughForSecondLayer) {
         colLushGrass = texture(terrainTex, vec3(baseUV * 1.15, 2.0)).rgb;
         nrmLushGrass = texture(terrainNormal, vec3(baseUV * 1.15, 2.0)).rgb * 2.0 - 1.0;
+    } else {
+        colLushGrass = colClumpyGrass;
+        nrmLushGrass = nrmClumpyGrass;
     }
 
     // Layer 3: Warm Loam Soil (hen_mud_soil_01)
@@ -117,20 +128,13 @@ void main()
     float biomeNoise = nMacro1 * 0.65 + nMacro2 * 0.35;
 
     // Rich landscape blend:
-    // Rolling hills are dominated by vibrant olive-green grass (Layer 2) with clumpy tufts (Layer 1)
-    // and exposed warm loam soil (Layer 3) in depressions and drier knolls
-    float lushWeight = smoothstep(0.30, 0.70, biomeNoise);
-    if (!nearEnoughForSecondLayer) {
-        // Fold the dropped layer's weight into layer 1 instead of mixing toward the
-        // black that an unsampled fetch leaves behind -- otherwise distant terrain
-        // would darken rather than just lose a near-duplicate detail layer.
-        colLushGrass = colClumpyGrass;
-        nrmLushGrass = nrmClumpyGrass;
-    }
-    vec3 colGrass = mix(colLushGrass, colClumpyGrass, (1.0 - lushWeight) * 0.40);
-    vec3 nrmGrass = mix(nrmLushGrass, nrmClumpyGrass, (1.0 - lushWeight) * 0.40);
+    // Rolling hills and valleys are dominated by vibrant green prairie grass (Layer 2)
+    // with clumpy tufts (Layer 1) and exposed warm loam soil (Layer 3) in dry depressions
+    float lushWeight = smoothstep(0.20, 0.65, biomeNoise);
+    vec3 colGrass = mix(colClumpyGrass, colLushGrass, lushWeight * 0.75 + 0.25);
+    vec3 nrmGrass = mix(nrmClumpyGrass, nrmLushGrass, lushWeight * 0.75 + 0.25);
 
-    float soilWeight = smoothstep(0.18, 0.42, 1.0 - biomeNoise) * 0.28;
+    float soilWeight = smoothstep(0.12, 0.36, 1.0 - biomeNoise) * 0.20;
     vec3 colGround = mix(colGrass, colLoamSoil, soilWeight);
     vec3 nrmGround = mix(nrmGrass, nrmLoamSoil, soilWeight);
 
@@ -149,9 +153,17 @@ void main()
     vec3 col = colGround;
     vec3 sampledNorm = nrmGround;
 
-    // DEM-aligned material weights: R sand, G rock, B wadi gravel, A dry plain.
+    // DEM-aligned material weights: G rock, B wadi gravel, A dry plain.
+    // R is a legacy coastal hint; the shared water raster supplies actual sand.
     // World-space tiling is about 4 m, with the masks aligned to the heightmap UVs.
+    vec2 envUV = (WorldPos.xz - environmentMapWorldRect.xy) / max(environmentMapWorldRect.zw, vec2(0.001));
+    vec4 envState = texture(environmentMap, envUV);
+    vec2 biomeUV = (WorldPos.xz - biomeMapWorldRect.xy) / max(biomeMapWorldRect.zw, vec2(0.001));
+    vec4 biomeState = u_hasBiomeMap ? texture(biomeMap, biomeUV) : vec4(0.0);
     vec4 splatWeights = texture(terrainSplatmap, UV);
+    // Never let the painted red channel paint stale sand after the water moves.
+    // Sand is blended exactly once below from this shared rendered-water map.
+    splatWeights.r = 0.0;
     float splatTotal = dot(splatWeights, vec4(1.0));
     splatWeights = splatTotal > 0.001
         ? splatWeights / splatTotal
@@ -186,11 +198,63 @@ void main()
         splatColor += sampleTriplanar(terrainTex, WorldPos, 3.0, triW, splatScale) * splatWeights.a;
         splatNormal += (sampleTriplanar(terrainNormal, WorldPos, 3.0, triW, splatScale) * 2.0 - 1.0) * splatWeights.a;
     }
-    col = mix(colGround, splatColor, 0.72);
-    sampledNorm = normalize(mix(nrmGround, normalize(splatNormal), 0.72));
+    // Slope-adaptive splat mix: valley floors and meadows stay 82% lush green grass,
+    // while steeper inclines expose more rocky soil and DEM scree
+    float splatMix = mix(0.18, 0.45, smoothstep(6.0, 22.0, angleDeg));
+    col = mix(colGround, splatColor, splatMix);
+    sampledNorm = normalize(mix(nrmGround, normalize(splatNormal), splatMix));
 
-    vec3 worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
-    if (u_detailDist <= 0.0 || dist < u_detailDist) {
+    // Keep the ground palette aligned with the vegetation suitability raster.
+    // Sparse cover reads as dry soil; healthy steppe and riparian zones read as turf.
+    if (u_envHasCover && !isHarbor) {
+        float cover = envState.a;
+        float riparian = envState.b;
+        vec3 turf = mix(colClumpyGrass, colLushGrass, 0.5 + 0.5 * lushWeight);
+        turf = mix(turf, colLushGrass * vec3(0.85, 1.0, 0.80), riparian * 0.6);
+        vec3 dry = mix(colClumpyGrass, colLoamSoil, 0.65);
+        vec3 ground = mix(dry, turf, smoothstep(0.12, 0.60, cover));
+        col = mix(col, ground, 0.75 * (1.0 - envState.r));
+    }
+
+    // Derived terrain biomes add broad meadow, grove, flower and scree structure
+    // from the actual heightfield. The shore mask still wins at water edges.
+    if (u_hasBiomeMap && !isHarbor) {
+        float groveWeight = biomeState.g * (1.0 - envState.r);
+        float rockWeight = smoothstep(0.20, 0.72, biomeState.a);
+        float flowerWeight = biomeState.b * (1.0 - rockWeight);
+
+        vec3 meadowTurf = mix(colLoamSoil, colLushGrass, 0.55);
+        col = mix(col, meadowTurf, biomeState.r * 0.28 * (1.0 - envState.r));
+
+        vec3 understory = mix(colLoamSoil * vec3(0.72, 0.82, 0.62),
+                              colClumpyGrass * vec3(0.54, 0.72, 0.50), 0.5);
+        col = mix(col, understory, groveWeight * 0.42);
+
+        if (rockWeight > 0.01) {
+            vec3 scree = sampleTriplanar(terrainTex, WorldPos, 9.0, triW, splatScale);
+            col = mix(col, scree, rockWeight * 0.48);
+        }
+
+        // A restrained violet ground tint echoes flower drifts in the meadow;
+        // nearby GLB plants provide the actual flower silhouettes.
+        col = mix(col, col * vec3(0.82, 0.76, 1.04), flowerWeight * 0.18);
+
+        // Keep the far tree line continuous between individual instanced trees.
+        float farForest = smoothstep(300.0, 1400.0, dist) * groveWeight;
+        col = mix(col, vec3(0.075, 0.105, 0.075), farForest * 0.58);
+    }
+
+    // ── LOD CUTOFF ─────────────────────────────────────────────────────────────────
+    // Beyond u_detailDist the geological, harbour, road and wadi branches each cost
+    // 10-30 extra texture fetches for detail that is sub-pixel at that range.
+    // Skip them and jump straight to lighting: the base + splat colour is already
+    // correct and the edge is imperceptible in motion.
+    bool nearDetail = (u_detailDist <= 0.0 || dist < u_detailDist);
+    vec3 worldNormal;
+    if (!nearDetail) {
+        worldNormal = normalize(N + vec3(sampledNorm.x, 0.0, sampledNorm.y) * 0.65);
+    } else {
+
     // ── 2. GEOLOGICAL SLOPE EROSION & ROCK CLIFF STRATA ──
     // A. Moderate slopes (12° to 24°): topsoil erodes, exposing stony scree talus
     float screeFactor = smoothstep(11.0, 20.0, angleDeg) * (1.0 - smoothstep(22.0, 32.0, angleDeg));
@@ -218,21 +282,29 @@ void main()
         sampledNorm = mix(sampledNorm, nrmRock, cliffFactor);
     }
 
-    // ── 3. COASTAL SAND TRANSITION (near sea level along the open eastern shoreline) ──
-    float coastFactor = (1.0 - smoothstep(waterLevel + 0.2, waterLevel + 1.8, alt)) * smoothstep(3200.0, 3700.0, WorldPos.x);
+    // ── 3. SHARED WATER SHORE / SAND TRANSITION (sea, pools and streams) ──
+    float coastFactor = envState.r;
+    if (u_envHasCover) {
+        coastFactor *= mix(1.0, 0.2, smoothstep(0.25, 0.80, envState.a));
+    }
     if (coastFactor > 0.01 && !isHarbor) {
         vec3 colCoastSand = texture(terrainTex, vec3(baseUV * 0.9, 0.0)).rgb; // Layer 0: Coastal Sand
         vec3 nrmCoastSand = texture(terrainNormal, vec3(baseUV * 0.9, 0.0)).rgb * 2.0 - 1.0;
         col = mix(col, colCoastSand, coastFactor);
         sampledNorm = mix(sampledNorm, nrmCoastSand, coastFactor);
     }
+    // Shared shore raster darkens the saturated wet strip and lowers its roughness
+    // consistently with vegetation and water foam placement.
+    float sharedWet = envState.g * (1.0 - float(isHarbor));
+    col *= 1.0 - 0.22 * sharedWet;
+    specMask = mix(specMask, 0.32, sharedWet * 0.75);
 
     // ── 4. HISTORIC PORT, QUAYS & BREAKWATER TEXTURING ──
     if (isHarbor) {
         // --- A. Textures and Scales ---
         // Layer 12: Port Cobblestone Paving (authentic street/wharf stone pavers)
-        // Scale 0.22: ~4.5m repeat, authentic human scale for Mediterranean harbor cobblestones
-        vec2 cobbleUV = WorldPos.xz * 0.22;
+        // Scale 0.50: ~2m repeat, so individual stones read at street-block scale.
+        vec2 cobbleUV = WorldPos.xz * 0.50;
         vec3 colCobble = texture(terrainTex, vec3(cobbleUV, 12.0)).rgb;
         vec3 nrmCobble = texture(terrainNormal, vec3(cobbleUV, 12.0)).rgb * 2.0 - 1.0;
 
@@ -543,23 +615,24 @@ void main()
             specMask = max(specMask, wetWadi * 0.10);
         }
     }
-    }
+
+    } // end nearDetail block
 
     // ── 6. BALANCED NATURAL LIGHTING (PBR-LITE) ──
     vec3 L = normalize(lightDir);
     float dayFactor = clamp(smoothstep(-0.15, 0.25, sunTilt), 0.35, 1.0);
 
     // Subsurface scatter wrap for sand, earth, and grass
-    float wrap = 0.25;
+    float wrap = 0.20;
     float wrapNdL = clamp((dot(worldNormal, L) + wrap) / (1.0 + wrap), 0.0, 1.0);
 
-    // Rich hemisphere ambient (sky blue from above, warm earth from below)
-    vec3 skyCol    = vec3(0.35, 0.55, 0.85) * dayFactor;
-    vec3 groundCol = vec3(0.25, 0.20, 0.15) * dayFactor;
+    // Balanced natural ambient (gentle sky fill from above, warm earth from below)
+    vec3 skyCol    = vec3(0.24, 0.38, 0.58) * dayFactor;
+    vec3 groundCol = vec3(0.28, 0.22, 0.16) * dayFactor;
     vec3 ambient   = mix(groundCol, skyCol, worldNormal.y * 0.5 + 0.5) * col;
 
-    // Direct warm sunlight
-    vec3 diffuse = col * wrapNdL * lightColor * 1.25 * dayFactor;
+    // Direct warm sunlight (calibrated to preserve texture tones under ACES tonemapping)
+    vec3 diffuse = col * wrapNdL * lightColor * 1.05 * dayFactor;
 
     // Specular reflection (subtle gloss on wet mud, brilliant sheen on water stream)
     vec3 halfDir = normalize(L + V);

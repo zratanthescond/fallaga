@@ -28,6 +28,9 @@ add_executable(RDR2_Prototype
     src/Character.cpp
     src/Horse.cpp
     src/Terrain.cpp
+    src/EnvironmentMap.cpp
+    src/vegetation/BiomeMasks.cpp
+    src/vegetation/VegetationMasks.cpp
     src/RiverSystem.cpp
     src/HeightmapTerrain.cpp
     src/Camera.cpp
@@ -37,6 +40,7 @@ add_executable(RDR2_Prototype
     src/TerrainData.cpp
     src/TerrainManager.cpp
     src/TerrainChunk.cpp
+    src/SculptTools.cpp
     src/TerrainTextureLayer.cpp
     src/TextureEngine.cpp
     src/stb_impl.cpp
@@ -53,6 +57,8 @@ add_executable(RDR2_Prototype
     src/vehicle/VehicleStability.cpp
     src/vehicle/VehicleSurface.cpp
     src/RoadSystem.cpp
+    src/SceneTarget.cpp
+    src/SSAO.cpp
     src/terrain/TerrainSystem.cpp
     src/terrain/Heightfield.cpp
     )
@@ -138,6 +144,13 @@ if(BUILD_TESTING)
     add_test(NAME sculpt_refine_test COMMAND sculpt_refine_test
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
+    # Heights only, no GL context: covers the flat-surface brushes (Flatten/Level)
+    # in SculptTools.cpp, which is compiled directly into the test.
+    add_executable(sculpt_flat_test sculpt_flat_test.cpp)
+    target_include_directories(sculpt_flat_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GLEW_INCLUDE_DIRS})
+    target_link_libraries(sculpt_flat_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
+    add_test(NAME sculpt_flat_test COMMAND sculpt_flat_test)
+
     # The road must sit on the rendered terrain. Includes RoadSystem.cpp directly, so
     # no GL context and no Terrain instance is needed.
     add_executable(road_surface_test road_surface_test.cpp)
@@ -152,4 +165,27 @@ if(BUILD_TESTING)
     target_link_libraries(road_junction_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
     add_test(NAME road_junction_test COMMAND road_junction_test
              WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # The carriageway surface texture must follow the road direction, not the world
+    # axes, or it shears across every bend. Includes RoadSystem.cpp directly, so no
+    # GL context is needed.
+    add_executable(road_uv_test road_uv_test.cpp)
+    target_include_directories(road_uv_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${GLEW_INCLUDE_DIRS})
+    target_link_libraries(road_uv_test PRIVATE ${OPENGL_LIBRARIES} GLEW::GLEW glfw GLUT::GLUT assimp::assimp)
+    add_test(NAME road_uv_test COMMAND road_uv_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+
+    # Heights only, no GL context: covers the sculpt undo/redo journal primitives
+    # (TerrainUndo.h) and the TerrainRefinement hooks they need.
+    add_executable(terrain_undo_test terrain_undo_test.cpp)
+    target_include_directories(terrain_undo_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME terrain_undo_test COMMAND terrain_undo_test)
+
+    add_executable(vegetation_masks_test
+        vegetation_masks_test.cpp
+        src/vegetation/VegetationMasks.cpp
+    )
+    target_include_directories(vegetation_masks_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(vegetation_masks_test PRIVATE assimp::assimp)
+    add_test(NAME vegetation_masks_test COMMAND vegetation_masks_test)
 endif()

@@ -1,0 +1,35 @@
+newmtl Grass_Blades
+Ka 1.000 1.000 1.000
+Kd 1.000 1.000 1.000
+Ks 0.000 0.000 0.000
+Ns 1.000
+d 1.000
+illum 2
+map_Kd textures/plant_grass_blades.png
+
+newmtl Grass_Cloves
+Ka 1.000 1.000 1.000
+Kd 1.000 1.000 1.000
+Ks 0.000 0.000 0.000
+Ns 1.000
+d 1.000
+illum 2
+map_Kd textures/plant_grass_cloves.png
+
+newmtl 5_leaf_ground_plant
+Ka 1.000 1.000 1.000
+Kd 1.000 1.000 1.000
+Ks 0.000 0.000 0.000
+Ns 1.000
+d 1.000
+illum 2
+map_Kd textures/plant_5leaf.png
+
+newmtl dandelion
+Ka 1.000 1.000 1.000
+Kd 1.000 1.000 1.000
+Ks 0.000 0.000 0.000
+Ns 1.000
+d 1.000
+illum 2
+map_Kd textures/plant_dandelion.png

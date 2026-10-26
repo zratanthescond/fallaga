@@ -1,4 +1,4 @@
-#version 330 core
+#version 460 core
 
 // ----------------------------------------------------
 // Input from Vertex Shader
@@ -134,10 +134,24 @@ void main()
     // 7. Gamma Correction (Linear to sRGB)
     result = pow(result, vec3(1.0 / 2.2));
 
-    // 8. Fog (Match terrain)
+    // 8. Forced perspective haze (matches terrain_chunk.frag exactly)
     float dist = length(viewPos - FragPos);
-    float fogAmt = clamp(1.0 - exp(-dist * 0.00015), 0.0, 0.85);
-    vec3 fogCol = mix(vec3(0.6, 0.62, 0.65), vec3(0.85, 0.83, 0.78), dayBoost);
+    float sunTilt = L.y;
+    vec3 dayBottom    = vec3(0.5, 0.8, 1.0);
+    vec3 sunsetBottom = vec3(1.0, 0.4, 0.2);
+    vec3 nightBottom  = vec3(0.05, 0.1, 0.2);
+    vec3 fogCol;
+    if (sunTilt > 0.1) {
+        fogCol = mix(sunsetBottom, dayBottom, smoothstep(0.1, 0.5, sunTilt));
+    } else if (sunTilt > -0.1) {
+        fogCol = mix(nightBottom, sunsetBottom, smoothstep(-0.1, 0.1, sunTilt));
+    } else {
+        fogCol = nightBottom;
+    }
+    vec3 sunHazeColor = mix(vec3(1.0, 0.65, 0.35), vec3(1.0, 0.95, 0.85), clamp(sunTilt * 2.0, 0.0, 1.0));
+    fogCol = mix(fogCol, sunHazeColor, pow(max(dot(V, -L), 0.0), 4.0) * 0.25 * smoothstep(-0.05, 0.2, sunTilt));
+    // Haze held off until ~1.2 km and kept faint, matching terrain_chunk.frag.
+    float fogAmt = clamp(1.0 - exp(-max(dist - 1200.0, 0.0) * 0.0004), 0.0, 1.0);
 
     FragColor = vec4(mix(result, fogCol, fogAmt), 1.0);
 }

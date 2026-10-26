@@ -10,6 +10,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <chrono>
@@ -104,6 +105,17 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
         SousseMapData::saveLayout("assets/saves/city.txt");
     }
 
+    // Build the vegetation mask after WaterSimulation initializes, so its water
+    // and shore classes come from the rendered coverage rather than the fallback.
+    if (const char* overlayMode = std::getenv("FALLAGA_VEG_OVERLAY")) {
+        vegetationMasksVisible = true;
+        vegetationDebugMode = std::clamp(std::atoi(overlayMode), 0, 3);
+    }
+    if (const char* overlayZoom = std::getenv("FALLAGA_VEG_ZOOM")) {
+        const float parsed = std::strtof(overlayZoom, nullptr);
+        if (parsed >= 100.0f) vegetationDebugWindowMeters = parsed;
+    }
+
     camera = new Camera(player);
     camera->setTerrain(terrain); // Set the terrain for camera height clipping
     camera->setAngles(90.0f, 12.0f);
@@ -168,11 +180,21 @@ Game::Game() : lastFrameTime(0.0), deltaTime(0.0) {
 
     // Initialize Water Simulation grid with terrain manager bounds and base water level
     if (terrain && terrain->terrainManager) {
-        waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f,
+        waterSim.initialize(terrain->terrainManager,
+                            terrain->terrainManager->getWorldMinX(),
+                            terrain->terrainManager->getWorldMaxX(),
+                            terrain->terrainManager->getWorldMinZ(),
+                            terrain->terrainManager->getWorldMaxZ(),
                             waterLevelAdjust, &terrain->getWetWaterNetwork());
         waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
         // CRITICAL: Upload initial water simulation data to GPU texture immediately after initialization
         terrain->updateWaterMapTexture(waterSim.getTextureData());
+        terrain->setWaterCoverageSampler([this](float x, float z) {
+            return waterSim.coverageAt(x, z);
+        }, [this](float x, float z) {
+            return waterSim.surfaceAt(x, z);
+        });
+        terrain->rebuildVegetationMasks();
         std::cout << "[Water] Initialization complete at level " << waterLevelAdjust << "\n";
     }
 }
@@ -328,6 +350,22 @@ void Game::setup(int width, int height) {
     windowHeight = height;
     // Build water reflection/refraction FBOs now that we have the window size
     terrain->buildWaterFBOs(width, height);
+    // Screen-space target is on by default; FALLAGA_SCENEFBO=0 renders straight to the
+    // default framebuffer (the reference path).
+    const char* sceneFboEnv = std::getenv("FALLAGA_SCENEFBO");
+    sceneFboEnabled = (sceneFboEnv == nullptr) || (std::atoi(sceneFboEnv) != 0);
+    // Screen-space AO costs another full-screen depth pass and blur. Keep it
+    // opt-in on the GTX 960M class target; set FALLAGA_SSAO=1 to enable it.
+    const char* ssaoEnv = std::getenv("FALLAGA_SSAO");
+    ssaoEnabled = sceneFboEnabled && ssaoEnv && (std::atoi(ssaoEnv) != 0);
+    auto readEnvFloat = [](const char* name, float fallback) -> float {
+        const char* v = std::getenv(name);
+        return v ? (float)atof(v) : fallback;
+    };
+    ssaoRadius   = readEnvFloat("FALLAGA_SSAO_RADIUS", ssaoRadius);
+    ssaoBias     = readEnvFloat("FALLAGA_SSAO_BIAS", ssaoBias);
+    ssaoPower    = readEnvFloat("FALLAGA_SSAO_POWER", ssaoPower);
+    ssaoStrength = readEnvFloat("FALLAGA_SSAO_STRENGTH", ssaoStrength);
     // ... other initial setup for Game
 }
 
@@ -411,10 +449,15 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
         terrain->update(glm::vec3(camPos.x, camPos.y, camPos.z));
         if (terrain->terrainManager &&
             waterHeightRevision != terrain->terrainManager->getHeightmapRevision()) {
-            waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f,
-                                -13938.0f, 13938.0f, waterLevelAdjust,
+            waterSim.initialize(terrain->terrainManager,
+                                terrain->terrainManager->getWorldMinX(),
+                                terrain->terrainManager->getWorldMaxX(),
+                                terrain->terrainManager->getWorldMinZ(),
+                                terrain->terrainManager->getWorldMaxZ(), waterLevelAdjust,
                                 &terrain->getWetWaterNetwork());
             terrain->updateWaterMapTexture(waterSim.getTextureData());
+            terrain->rebuildEnvironmentMap();
+            if (terrain->vegetationMasksReady()) terrain->rebuildVegetationMasks();
             waterHeightRevision = terrain->terrainManager->getHeightmapRevision();
             std::cout << "[Water] Rebuilt terrain water mask after heightmap reload.\n";
         }
@@ -428,6 +471,12 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
         const float step = static_cast<float>(std::min(waterSimulationAccumulator, 0.25));
         waterSimulationAccumulator -= step;
         waterSim.update(step);
+        if (waterTerrainEdited) {
+            // Terrain changed near the coast, so the frozen sea mask is stale and
+            // the waterline would not follow the edited terrain without this.
+            waterSim.resampleTerrainAndRefreshOcean(terrain->terrainManager);
+            waterTerrainEdited = false;
+        }
         terrain->updateWaterMapTexture(waterSim.getTextureData());
     }
 
@@ -460,6 +509,11 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
             bool leftMouseClicked = leftMouseDown && !lastLeftMouseDown;
             lastLeftMouseDown = leftMouseDown;
 
+            // Releasing the button ends any in-progress sculpt stroke so the next
+            // press starts a fresh segment instead of interpolating from the old one.
+            if (!leftMouseDown && terrain && terrain->terrainManager)
+                terrain->terrainManager->endSculptStroke();
+
             // Check Mode Switcher Clicks (Top Bar)
             if (mouseY >= 0 && mouseY <= 32) {
                 const float tabW = 110.0f, tabGap = 8.0f, edgeM = 10.0f;
@@ -473,6 +527,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             activeEditorMode = i;
                             editMode = (i != 0);
                             editorBrushMode = (i == 2) ? 1 : (i == 3) ? 7 : 0;
+                            shorelineHasFirstPoint = false;
                             std::cout << "[Editor Mode] Switched to Mode " << i << "...\n";
                             break;
                         }
@@ -519,13 +574,30 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                                i * SculptPanel::kToolRowH;
                             if (leftMouseClicked && mouseY >= btnY &&
                                 mouseY <= btnY + SculptPanel::kToolRowH - 4) {
-                                editorBrushMode = 1 + i; // sculpt brush ids 1-7
+                                editorBrushMode = 1 + i; // sculpt brush ids 1-10
+                                if (editorBrushMode != 8) shorelineHasFirstPoint = false;
                                 std::cout << "[Editor UI] Sculpt tool: " << editorBrushMode << "\n";
                             }
                         }
 
                         GameEditorUtils::updateBrushSliders(mouseX, mouseY, lpX, lpY, lpW,
-                            brushRadius, brushStrength, true, &sculptAngleDegrees, &sculptGradeDegrees);
+                            brushRadius, brushStrength, true, &sculptHardness,
+                            &sculptAngleDegrees, &sculptGradeDegrees);
+
+                        // Falloff shape picker.
+                        {
+                            const float fy = lpY + SculptPanel::kFalloffTop + SculptPanel::kFalloffBtnY;
+                            for (int m = 0; m < GameEditorUtils::FalloffConfig::MODE_COUNT; ++m) {
+                                const float bx2 = lpX + 15 + m * 72;
+                                if (leftMouseClicked && mouseY >= fy &&
+                                    mouseY <= fy + SculptPanel::kFalloffBtnH - 4 &&
+                                    mouseX >= bx2 && mouseX <= bx2 + 66) {
+                                    sculptFalloffMode = m;
+                                    std::cout << "[Editor UI] Falloff: "
+                                              << GameEditorUtils::FalloffConfig::modeName(m) << "\n";
+                                }
+                            }
+                        }
 
                         // Detail level buttons for the Add Geometry tool.
                         {
@@ -548,7 +620,11 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             mouseX <= lpX + lpW - 15) {
                             std::cout << "[Editor UI] Triggering Global Hydraulic Erosion Pass...\n";
                             terrain->terrainManager->erodeGlobal();
-                            waterSim.initialize(terrain->terrainManager, -13938.0f, 13938.0f, -13938.0f, 13938.0f,
+                waterSim.initialize(terrain->terrainManager,
+                                    terrain->terrainManager->getWorldMinX(),
+                                    terrain->terrainManager->getWorldMaxX(),
+                                    terrain->terrainManager->getWorldMinZ(),
+                                    terrain->terrainManager->getWorldMaxZ(),
                                                 waterLevelAdjust, &terrain->getWetWaterNetwork());
                             terrain->updateWaterMapTexture(waterSim.getTextureData());
                         }
@@ -582,8 +658,8 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                 std::cout << "[Water Level] Reset to " << waterLevelAdjust << "m\n";
                             }
                         }
-                        terrain->setWaterLevel(waterLevelAdjust);
                         waterSim.setOceanWaterLevel(waterLevelAdjust);
+                        terrain->setWaterLevel(waterLevelAdjust);
                         terrain->updateWaterMapTexture(waterSim.getTextureData());
                     }
                     else if (activeEditorMode == 5) {
@@ -1364,11 +1440,18 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                         }
                         lastLMB = leftMouseDown;
                     }
-                    else if (activeEditorMode == 2 && editorBrushMode >= 1 && editorBrushMode <= 5) { // Sculpt brushes
+                    else if (activeEditorMode == 2 && ((editorBrushMode >= 1 && editorBrushMode <= 5) ||
+                                                       editorBrushMode == 9 || editorBrushMode == 10)) { // Sculpt brushes (1-5) + Flatten/Level (9,10)
                         if (leftMouseDown && terrain->terrainManager) {
-                            terrain->terrainManager->sculpt(lastRayHitPos.x, lastRayHitPos.z, brushRadius,
+                            // Continuous stroke: TerrainManager samples the pointer path
+                            // and spreads this frame's strength along it, so the result
+                            // no longer depends on the frame rate.
+                            terrain->terrainManager->sculptStroke(
+                                lastRayHitPos.x, lastRayHitPos.z, brushRadius,
                                 brushStrength, editorBrushMode, static_cast<float>(deltaTime),
-                                sculptAngleDegrees, sculptGradeDegrees);
+                                sculptAngleDegrees, sculptGradeDegrees,
+                                sculptFalloffMode, sculptHardness);
+                            waterTerrainEdited = true;
                             waterSim.updateTerrainArea(terrain->terrainManager, lastRayHitPos.x, lastRayHitPos.z, brushRadius);
                             terrain->updateWaterMapTexture(waterSim.getTextureData());
                         }
@@ -1384,6 +1467,7 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                 lastRayHitPos.x, lastRayHitPos.z, brushRadius, brushStrength,
                                 static_cast<float>(deltaTime), roadMesh->debugVertices(),
                                 roadMesh->debugIndices());
+                            waterTerrainEdited = true;
                         } else if (shapingRoadBed) {
                             // Re-seat the ribbon on release, not every frame: doing it
                             // per frame made the conform chase terrain it had just
@@ -1392,6 +1476,32 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                             if (terrain->terrainManager)
                                 terrain->terrainManager->logHeightfieldSignature("brush/RELEASE-before-snap");
                             terrain->snapRoadsToRenderedTerrain();
+                            waterTerrainEdited = true;
+                        }
+                    }
+                    else if (activeEditorMode == 2 && editorBrushMode == 8) { // Straighten shoreline between two clicks
+                        if (leftMouseClicked && terrain->terrainManager) {
+                            if (!shorelineHasFirstPoint) {
+                                shorelineFirstPoint = glm::vec2(lastRayHitPos.x, lastRayHitPos.z);
+                                shorelineHasFirstPoint = true;
+                                std::cout << "[Shoreline] First endpoint set. Click the second endpoint.\n";
+                            } else {
+                                const bool changed = terrain->terrainManager->straightenShoreline(
+                                    shorelineFirstPoint.x, shorelineFirstPoint.y,
+                                    lastRayHitPos.x, lastRayHitPos.z,
+                                    brushRadius, waterLevelAdjust);
+                                shorelineHasFirstPoint = false;
+                                if (changed) {
+                                    // Re-derive the connected-sea mask from the edited
+                                    // terrain; without this the water coverage is frozen
+                                    // and the visible waterline never moves.
+                                    waterSim.resampleTerrainAndRefreshOcean(terrain->terrainManager);
+                                    terrain->updateWaterMapTexture(waterSim.getTextureData());
+                                    std::cout << "[Shoreline] Straightening applied.\n";
+                                } else {
+                                    std::cout << "[Shoreline] No change (points too close or outside terrain).\n";
+                                }
+                            }
                         }
                     }
                     else if (activeEditorMode == 2 && editorBrushMode == 7) { // Add geometry, then smooth it
@@ -1406,7 +1516,9 @@ void Game::update( float mouseDeltaX, float mouseDeltaY, float mouseScroll) {
                                 lastRayHitPos.x, lastRayHitPos.z, brushRadius, addGeomLevel);
                             terrain->terrainManager->smoothFine(
                                 lastRayHitPos.x, lastRayHitPos.z, brushRadius,
-                                brushStrength, static_cast<float>(deltaTime));
+                                brushStrength, static_cast<float>(deltaTime),
+                                sculptFalloffMode, sculptHardness);
+                            waterTerrainEdited = true;
                             waterSim.updateTerrainArea(terrain->terrainManager, lastRayHitPos.x, lastRayHitPos.z, brushRadius);
                             terrain->updateWaterMapTexture(waterSim.getTextureData());
                         }
@@ -1816,7 +1928,37 @@ void Game::render() {
     };
     if (profileRender) renderPhaseStart = RenderPerfClock::now();
 
+    // Route the whole 3D scene into the off-screen target so the screen-space passes
+    // (SSAO, next step) can read its depth and colour. With no effect applied yet the
+    // composite copies it back unchanged. FALLAGA_SCENEFBO=0 bypasses the target and
+    // renders straight to the screen, which is the A/B reference for the composite.
+    // The GTX 960M class is fill-rate limited by the terrain shader. Render the 3D
+    // scene below native resolution and upscale once; the editor HUD still renders
+    // at full resolution after the composite. Override with FALLAGA_SCENE_SCALE=1
+    // to restore native 3D resolution, or tune between 0.5 and 1.0.
+    static const float sceneScale = [] {
+        if (const char* e = std::getenv("FALLAGA_SCENE_SCALE")) {
+            const float v = std::strtof(e, nullptr);
+            if (v >= 0.5f && v <= 1.0f) return v;
+        }
+        return 0.70f;
+    }();
+    const int sceneWidth = std::max(1, static_cast<int>(windowWidth * sceneScale + 0.5f));
+    const int sceneHeight = std::max(1, static_cast<int>(windowHeight * sceneScale + 0.5f));
+    const bool useSceneFbo = sceneFboEnabled && sceneTarget.ensure(sceneWidth, sceneHeight);
+    if (useSceneFbo) {
+        sceneTarget.bind();
+    } else {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, windowWidth, windowHeight);
+    }
+
     // 1. Reset Buffer and Global States
+    // The fullscreen composite leaves the depth mask off; a disabled depth mask makes
+    // glClear(GL_DEPTH_BUFFER_BIT) a no-op, so it must be re-enabled *before* the clear
+    // or the off-screen target keeps the previous frame's depth and every pass fails its
+    // depth test. (The direct path never composites, which is why it looked correct.)
+    glDepthMask(GL_TRUE);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
     glEnable(GL_DEPTH_TEST);
     glDepthFunc(GL_LESS);
@@ -2140,6 +2282,103 @@ void Game::render() {
         }
     }
 
+    // ── SHORELINE STRAIGHTEN LIVE PREVIEW ──
+    // Draw after the terrain with depth testing disabled so the guide stays
+    // readable over both dark water and pale sand. Restore GL state afterwards.
+    if (editMode && activeEditorMode == 2 && editorBrushMode == 8 &&
+        terrain && terrain->terrainManager && rayHitTerrain) {
+        const bool depthWasEnabled = glIsEnabled(GL_DEPTH_TEST) == GL_TRUE;
+        const bool lightingWasEnabled = glIsEnabled(GL_LIGHTING) == GL_TRUE;
+        const bool blendWasEnabled = glIsEnabled(GL_BLEND) == GL_TRUE;
+        const bool textureWasEnabled = glIsEnabled(GL_TEXTURE_2D) == GL_TRUE;
+        glUseProgram(0);
+        glBindVertexArray(0);
+        glDisable(GL_LIGHTING);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_TEXTURE_2D);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        const glm::vec2 cursor(lastRayHitPos.x, lastRayHitPos.z);
+        if (shorelineHasFirstPoint) {
+            const glm::vec2 a = shorelineFirstPoint;
+            const glm::vec2 b = cursor;
+            const glm::vec2 delta = b - a;
+            const float len = glm::length(delta);
+            const float halfWidth = std::max(1.0f, brushRadius);
+            auto lineY = [&](float x, float z) {
+                return terrain->getHeight(x, z) + 2.0f;
+            };
+            if (len > 0.05f) {
+                const glm::vec2 n(-delta.y / len, delta.x / len);
+                const glm::vec2 leftA = a + n * halfWidth;
+                const glm::vec2 leftB = b + n * halfWidth;
+                const glm::vec2 rightA = a - n * halfWidth;
+                const glm::vec2 rightB = b - n * halfWidth;
+
+                // Width guides first: dark outline, then cyan inner stroke.
+                glColor4f(0.015f, 0.02f, 0.03f, 0.95f);
+                glLineWidth(5.0f);
+                glBegin(GL_LINES);
+                glVertex3f(leftA.x, lineY(leftA.x,leftA.y), leftA.y);
+                glVertex3f(leftB.x, lineY(leftB.x,leftB.y), leftB.y);
+                glVertex3f(rightA.x, lineY(rightA.x,rightA.y), rightA.y);
+                glVertex3f(rightB.x, lineY(rightB.x,rightB.y), rightB.y);
+                glEnd();
+                glColor4f(0.05f, 0.95f, 1.0f, 0.95f);
+                glLineWidth(2.0f);
+                glBegin(GL_LINES);
+                glVertex3f(leftA.x, lineY(leftA.x,leftA.y), leftA.y);
+                glVertex3f(leftB.x, lineY(leftB.x,leftB.y), leftB.y);
+                glVertex3f(rightA.x, lineY(rightA.x,rightA.y), rightA.y);
+                glVertex3f(rightB.x, lineY(rightB.x,rightB.y), rightB.y);
+                glEnd();
+
+                // Straight centerline: thick dark halo plus bright yellow line.
+                glColor4f(0.01f, 0.015f, 0.025f, 1.0f);
+                glLineWidth(8.0f);
+                glBegin(GL_LINES);
+                glVertex3f(a.x, lineY(a.x,a.y), a.y);
+                glVertex3f(b.x, lineY(b.x,b.y), b.y);
+                glEnd();
+                glColor4f(1.0f, 0.82f, 0.02f, 1.0f);
+                glLineWidth(4.0f);
+                glBegin(GL_LINES);
+                glVertex3f(a.x, lineY(a.x,a.y) + 0.08f, a.y);
+                glVertex3f(b.x, lineY(b.x,b.y) + 0.08f, b.y);
+                glEnd();
+            }
+
+            // Fixed first endpoint (green) and live endpoint (orange).
+            glPointSize(13.0f);
+            glColor4f(0.01f, 0.015f, 0.025f, 1.0f);
+            glBegin(GL_POINTS);
+            glVertex3f(a.x, lineY(a.x,a.y) + 0.15f, a.y);
+            glVertex3f(b.x, lineY(b.x,b.y) + 0.15f, b.y);
+            glEnd();
+            glPointSize(8.0f);
+            glBegin(GL_POINTS);
+            glColor4f(0.15f, 1.0f, 0.35f, 1.0f);
+            glVertex3f(a.x, lineY(a.x,a.y) + 0.2f, a.y);
+            glColor4f(1.0f, 0.35f, 0.05f, 1.0f);
+            glVertex3f(b.x, lineY(b.x,b.y) + 0.2f, b.y);
+            glEnd();
+        } else {
+            // Before the first click, show where the start point will land.
+            glPointSize(11.0f);
+            glColor4f(1.0f, 0.82f, 0.02f, 1.0f);
+            glBegin(GL_POINTS);
+            glVertex3f(cursor.x, terrain->getHeight(cursor.x,cursor.y) + 2.0f, cursor.y);
+            glEnd();
+        }
+        glLineWidth(1.0f);
+        glPointSize(1.0f);
+        if (!blendWasEnabled) glDisable(GL_BLEND);
+        if (textureWasEnabled) glEnable(GL_TEXTURE_2D);
+        if (lightingWasEnabled) glEnable(GL_LIGHTING);
+        if (depthWasEnabled) glEnable(GL_DEPTH_TEST);
+    }
+
     // ── ROAD EDIT OVERLAY (in-world draft polyline + selection highlight) ──
     if (editMode && activeEditorMode == 5 && terrain->getRoadGraph()) {
         RoadGraph* rg = terrain->getRoadGraph();
@@ -2333,6 +2572,11 @@ void Game::render() {
         glDepthFunc(GL_LESS);
     }
     
+    // Everything drawn from here on is a dynamic entity (horse, cars, player). Snapshot the depth
+    // buffer first so the screen-space AO / sun shadows are computed on the static world only and
+    // do not add a second shadow around entities that already shade themselves.
+    if (useSceneFbo) sceneTarget.captureWorldDepth();
+
     // 7. Character & Horse Shaders
     GameplayUtils::setupEntityShader(player->getShader(), cameraPosition, lightDir, lColor);
 
@@ -2375,11 +2619,22 @@ void Game::render() {
 
     // ── BLIT SCENE COLOR TO REFRACTION FBO (0.05ms hardware blit - replaces entire second world render pass!) ──
     if (terrain->fbosReady && terrain->refrFBO) {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        // The opaque scene now lives in the off-screen target, so the refraction reads
+        // from its colour attachment rather than the (empty) default framebuffer.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, useSceneFbo ? sceneTarget.framebuffer() : 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, terrain->refrFBO);
-        glBlitFramebuffer(0, 0, windowWidth, windowHeight, 0, 0, terrain->fboW, terrain->fboH, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glViewport(0, 0, windowWidth, windowHeight);
+        const int sceneReadWidth = useSceneFbo ? sceneTarget.width() : windowWidth;
+        const int sceneReadHeight = useSceneFbo ? sceneTarget.height() : windowHeight;
+        glBlitFramebuffer(0, 0, sceneReadWidth, sceneReadHeight,
+                          0, 0, terrain->fboW, terrain->fboH,
+                          GL_COLOR_BUFFER_BIT, GL_LINEAR);
+        // Restore the scene target so the transparent water pass draws over the scene.
+        if (useSceneFbo) {
+            sceneTarget.bind();
+        } else {
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+            glViewport(0, 0, windowWidth, windowHeight);
+        }
     }
 
     // 8. Render Water (transparent pass - after all opaque objects)
@@ -2387,8 +2642,51 @@ void Game::render() {
     recordRenderPhase(waterRenderMs);
     gpuPhaseNext(); // water -> post
 
+    // Screen-space AO from the scene depth, folded into the copy below. The composite
+    // stays an exact identity copy whenever SSAO is disabled or fails to set up.
+    if (useSceneFbo && ssaoEnabled && ssao.ensure(sceneTarget.width(), sceneTarget.height())) {
+        // Extra knobs, read once (env vars so no Game.h change is needed):
+        //   FALLAGA_RT_SHADOW       sun contact-shadow strength 0..1  (0 = off, default 0)
+        //   FALLAGA_RT_SHADOW_DIST  ray length towards the sun, metres (default 1.2)
+        //   FALLAGA_SSAO_FLOOR      AO never darker than this         (default 0.45)
+        //   FALLAGA_SSAO_FADE       AO / shadow range, metres         (default 40)
+        static const auto envF = [](const char* name, float fallback) {
+            const char* v = std::getenv(name);
+            return v ? (float)std::atof(v) : fallback;
+        };
+        static const float rtShadowStrength = envF("FALLAGA_RT_SHADOW", 0.0f);
+        static const float rtShadowDist     = envF("FALLAGA_RT_SHADOW_DIST", 1.2f);
+        static const float aoFloor          = envF("FALLAGA_SSAO_FLOOR", 0.45f);
+        static const float fadeEnd          = envF("FALLAGA_SSAO_FADE", 40.0f);
+
+        SSAOParams sp;
+        sp.radius = ssaoRadius;
+        sp.bias = ssaoBias;
+        sp.power = ssaoPower;
+        sp.fadeEnd = fadeEnd;
+        sp.fadeStart = fadeEnd * 0.5f;
+        sp.shadowEnabled = rtShadowStrength > 0.0f;
+        // lightDir points from the surface TOWARDS the light (the same convention the road and
+        // terrain shaders use for dot(N, L)); rotate it into view space for the depth march.
+        sp.sunView = glm::normalize(glm::mat3(view) * glm::normalize(glm::vec3(lightDir)));
+        sp.shadowDist = rtShadowDist;
+        ssao.render(sceneTarget.worldDepthTexture(), projection, sp);
+        sceneTarget.setAmbientOcclusion(ssao.aoTexture(), ssaoStrength);
+        sceneTarget.setScreenSpaceParams(aoFloor, rtShadowStrength, projection[2][2], projection[3][2],
+                                         ssao.width(), ssao.height());
+    } else if (useSceneFbo) {
+        sceneTarget.setAmbientOcclusion(0, ssaoStrength);
+    }
+
+    // Copy the scene to the default framebuffer. Identity when no effect is applied.
+    if (useSceneFbo) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, windowWidth, windowHeight);
+        sceneTarget.compositeToDefault();
+    }
+
     // --- PHASE 8.5: EDITOR HUD & GLOBAL STATUS OVERLAYS ---
-    if (editMode || isSavingState) {
+    if (editMode || isSavingState || vegetationMasksVisible) {
         // Set up 2D projection
         glMatrixMode(GL_PROJECTION);
         glPushMatrix();
@@ -2447,6 +2745,73 @@ void Game::render() {
         // Enable transparency
         glEnable(GL_BLEND);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        if (vegetationMasksVisible && terrain) {
+            const unsigned int maskTexture =
+                terrain->ensureVegetationDebugTexture(vegetationDebugMode);
+            const float panelSize = std::min(
+                360.0f, std::min((float)windowWidth, (float)windowHeight) * 0.38f);
+            const float panelX = (float)windowWidth - panelSize - 18.0f;
+            const float panelY = (float)windowHeight - panelSize - 18.0f;
+            static const char* layerNames[] = {
+                "habitat", "density", "exclusions", "composite"
+            };
+            const int layerIndex = std::clamp(vegetationDebugMode, 0, 3);
+
+            drawRect(panelX - 8, panelY - 32, panelSize + 16, panelSize + 58,
+                     0.05f, 0.05f, 0.05f, 0.88f);
+            drawRectOutline(panelX - 8, panelY - 32, panelSize + 16,
+                            panelSize + 58, 0.35f, 0.35f, 0.35f);
+            drawStr(panelX, panelY - 14,
+                    std::string("VEGETATION MASKS - ") + layerNames[layerIndex] +
+                        "  " + std::to_string((int)vegetationDebugWindowMeters) +
+                        "m  (F11 hide, F12 layer)",
+                    0.92f, 0.82f, 0.45f);
+
+            if (maskTexture != 0) {
+                float u0 = 0.0f, v0 = 0.0f, u1 = 1.0f, v1 = 1.0f;
+                const vegetation::VegetationMasks& masks =
+                    terrain->getVegetationMasks();
+                if (masks.ready() && masks.width() > 0) {
+                    const float spanX = masks.maxX() - masks.minX();
+                    const float spanZ = masks.maxZ() - masks.minZ();
+                    const float halfWindow =
+                        vegetationDebugWindowMeters * 0.5f;
+                    const Vec3 eye = camera ? camera->getPosition()
+                                           : player->getPosition();
+                    u0 = std::clamp((eye.x - halfWindow - masks.minX()) / spanX,
+                                    0.0f, 1.0f);
+                    u1 = std::clamp((eye.x + halfWindow - masks.minX()) / spanX,
+                                    0.0f, 1.0f);
+                    v0 = std::clamp((eye.z - halfWindow - masks.minZ()) / spanZ,
+                                    0.0f, 1.0f);
+                    v1 = std::clamp((eye.z + halfWindow - masks.minZ()) / spanZ,
+                                    0.0f, 1.0f);
+                }
+
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, maskTexture);
+                glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_MODULATE);
+                glColor4f(1.0f, 1.0f, 1.0f, 0.94f);
+                glBegin(GL_QUADS);
+                glTexCoord2f(u0, v0);
+                glVertex2f(panelX, panelY + panelSize);
+                glTexCoord2f(u1, v0);
+                glVertex2f(panelX + panelSize, panelY + panelSize);
+                glTexCoord2f(u1, v1);
+                glVertex2f(panelX + panelSize, panelY);
+                glTexCoord2f(u0, v1);
+                glVertex2f(panelX, panelY);
+                glEnd();
+                glBindTexture(GL_TEXTURE_2D, 0);
+                glDisable(GL_TEXTURE_2D);
+            }
+            drawRectOutline(panelX, panelY, panelSize, panelSize,
+                            0.5f, 0.5f, 0.5f);
+            drawStr(panelX, panelY + panelSize + 16,
+                    "0 habitat  1 density  2 exclusions  3 composite",
+                    0.65f, 0.65f, 0.65f);
+        }
 
         if (editMode) {
 
@@ -2547,6 +2912,9 @@ void Game::render() {
                 {"5  Angle Slope",          "Direction + Grade set the slope"},
                 {"6  Fit To Curved Road",   "re-grades ground under the road mesh"},
                 {"7  Add Geometry + Smooth","subdivides, then smooths the new vertices"},
+                {"8  Straighten Shoreline", "click two points; brush width is the blend"},
+                {"9  Flatten",              "levels the ground to where you press"},
+                {"10 Level",                "flattens toward the local average height"},
             };
             for (int i = 0; i < SculptPanel::kToolCount; ++i) {
                 const float btnY = lpY + SculptPanel::kToolsTop + i * SculptPanel::kToolRowH;
@@ -2566,13 +2934,14 @@ void Game::render() {
 
             struct SliderSpec { const char* name; float value; float lo; float hi;
                                 const char* unit; const char* help; };
-            const SliderSpec sliders[4] = {
+            const SliderSpec sliders[SculptPanel::kSliderCount] = {
                 {"Radius",    brushRadius,        GameEditorUtils::BrushConfig::RADIUS_MIN,   GameEditorUtils::BrushConfig::RADIUS_MAX,   "m",   "footprint of the brush"},
                 {"Strength",  brushStrength,      GameEditorUtils::BrushConfig::STRENGTH_MIN, GameEditorUtils::BrushConfig::STRENGTH_MAX, "",    "how hard it applies per frame"},
+                {"Hardness",  sculptHardness,     GameEditorUtils::FalloffConfig::HARDNESS_MIN, GameEditorUtils::FalloffConfig::HARDNESS_MAX, "", "hard core + soft rim"},
                 {"Direction", sculptAngleDegrees, 0.0f,                     360.0f,                    "deg", "Angle Slope only"},
                 {"Grade",     sculptGradeDegrees, 0.0f,                     60.0f,                     "deg", "Angle Slope only"},
             };
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < SculptPanel::kSliderCount; ++i) {
                 const float capY = lpY + SculptPanel::kSliderTop + i * SculptPanel::kSliderPitch;
                 const float trackY = capY + 6.0f;
                 const SliderSpec& s = sliders[i];
@@ -2585,6 +2954,26 @@ void Game::render() {
                 const float norm = glm::clamp((s.value - s.lo) / (s.hi - s.lo), 0.0f, 1.0f);
                 drawRect(lpX + 15 + norm * (lpW - 40), trackY - 3, 10, SculptPanel::kSliderTrackH + 6,
                          0.89f, 0.36f, 0.13f, 1.0f);
+            }
+
+            // ── Falloff shape ────────────────────────────────────────────────
+            {
+                const float fy = lpY + SculptPanel::kFalloffTop;
+                drawStr(lpX + 15, fy, "FALLOFF", 0.82f, 0.82f, 0.82f);
+                static const char* kFalloffNames[GameEditorUtils::FalloffConfig::MODE_COUNT] = {
+                    "Smooth", "Linear", "Sphere", "Const"
+                };
+                for (int m = 0; m < GameEditorUtils::FalloffConfig::MODE_COUNT; ++m) {
+                    const bool on = (sculptFalloffMode == m);
+                    const float bx2 = lpX + 15 + m * 72;
+                    drawRect(bx2, fy + SculptPanel::kFalloffBtnY, 66, SculptPanel::kFalloffBtnH - 4,
+                             on ? 0.89f : 0.16f, on ? 0.36f : 0.16f, on ? 0.13f : 0.16f,
+                             on ? 0.95f : 0.6f);
+                    drawRectOutline(bx2, fy + SculptPanel::kFalloffBtnY, 66, SculptPanel::kFalloffBtnH - 4,
+                                    0.25f, 0.25f, 0.25f);
+                    drawStr(bx2 + 8, fy + SculptPanel::kFalloffBtnY + 13, kFalloffNames[m],
+                            on ? 1.0f : 0.72f, on ? 1.0f : 0.72f, on ? 1.0f : 0.72f);
+                }
             }
 
             // ── Detail (Add Geometry only) ───────────────────────────────────
@@ -3517,6 +3906,7 @@ void Game::performSave() {
     if (terrain) {
         terrain->saveTerrain();
         terrain->saveRoadsToJSON("assets/roads/roads_manual.json");
+        terrain->rebuildVegetationMasks();
     }
     std::cout << "[Editor] Saved level layout, terrain and road graph!\n";
 }
@@ -3768,6 +4158,49 @@ void Game::keyDown(int key) {
         std::cout << "[Teleport] Train Station Countryside\n";
         return;
     }
+    if (key == GLFW_KEY_F11) {
+        vegetationMasksVisible = !vegetationMasksVisible;
+        if (vegetationMasksVisible && terrain &&
+            (!terrain->vegetationMasksReady() || SousseMapData::layoutDirty)) {
+            terrain->rebuildVegetationMasks();
+        }
+        std::cout << "[Vegetation] Mask overlay "
+                  << (vegetationMasksVisible ? "shown" : "hidden")
+                  << " (F11 toggles, F12 cycles layers)\n";
+        return;
+    }
+    if (key == GLFW_KEY_F12) {
+        vegetationMasksVisible = true;
+        vegetationDebugMode = (vegetationDebugMode + 1) % 4;
+        std::cout << "[Vegetation] Mask layer " << vegetationDebugMode
+                  << " (0 habitat, 1 density, 2 exclusions, 3 composite)\n";
+        return;
+    }
+
+    // Ctrl+Z undo, Ctrl+Y / Ctrl+Shift+Z redo for terrain sculpting. The stack is
+    // edge-triggered (keyDown fires once per press), so holding the key repeats at
+    // the OS key-repeat rate, which is a reasonable scrub speed.
+    if ((key == GLFW_KEY_Z || key == GLFW_KEY_Y) && terrain && terrain->terrainManager) {
+        GLFWwindow* undoWin = glfwGetCurrentContext();
+        const bool ctrl = undoWin && (glfwGetKey(undoWin, GLFW_KEY_LEFT_CONTROL) == GLFW_PRESS ||
+                                      glfwGetKey(undoWin, GLFW_KEY_RIGHT_CONTROL) == GLFW_PRESS);
+        if (ctrl) {
+            const bool shift = undoWin && (glfwGetKey(undoWin, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS ||
+                                           glfwGetKey(undoWin, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+            const bool doRedo = (key == GLFW_KEY_Y) || shift;
+            const bool changed = doRedo ? terrain->terrainManager->redo()
+                                        : terrain->terrainManager->undo();
+            if (changed) {
+                waterTerrainEdited = true;
+                std::cout << "[Editor] Terrain " << (doRedo ? "redo" : "undo")
+                          << " (" << terrain->terrainManager->undoDepth() << " undo, "
+                          << terrain->terrainManager->redoDepth() << " redo)\n";
+            } else {
+                std::cout << "[Editor] Nothing to " << (doRedo ? "redo" : "undo") << "\n";
+            }
+            return;
+        }
+    }
 
     if (editMode) {
         // Handle Editor specific inputs
@@ -3991,12 +4424,24 @@ void Game::keyDown(int key) {
         }
 
         if (key == GLFW_KEY_B) {
+            // Global brush ids are 0..10 (0 Select, 1-10 sculpt, 8-10 also paint).
+            // Keep the modulus to the 11 names below; the shoreline tool shares id 8
+            // with Paint Road and Flatten/Level share 9/10 with the paint brushes;
+            // their sculpt-mode meanings are relabelled below.
             editorBrushMode = (editorBrushMode + 1) % 11;
             std::string modeNames[] = {
                 "Select / Move", "Sculpt Raise", "Sculpt Lower", "Sculpt Smooth", "Sculpt Erode (Hydraulic)", "Sculpt Angle Slope",
                 "Fit Terrain Under Roads", "Add Geometry + Smooth", "Paint Road (Gravel)", "Paint River (Wet Mud)", "Paint Erase"
             };
-            std::cout << "[Brush] Mode changed to: " << modeNames[editorBrushMode] << "\n";
+            // Ids 8-10 are shared between sculpt and paint; relabel them in sculpt mode.
+            std::string label = modeNames[editorBrushMode];
+            if (activeEditorMode == 2) {
+                if (editorBrushMode == 8) label = "Straighten Shoreline";
+                else if (editorBrushMode == 9) label = "Sculpt Flatten";
+                else if (editorBrushMode == 10) label = "Sculpt Level";
+            }
+            shorelineHasFirstPoint = false;
+            std::cout << "[Brush] Mode changed to: " << label << "\n";
             return;
         }
         if (key == GLFW_KEY_N) {

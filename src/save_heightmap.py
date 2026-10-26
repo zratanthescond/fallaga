@@ -54,13 +54,15 @@ try:
     # IEND chunk
     png += make_chunk(b'IEND', b'')
     
-    png_path = "assets/terrain/heightmap.png"
+    # Editable runtime copy of the c.1930s pack heightmap. The source in
+    # heightmapAssets remains untouched when the terrain editor saves changes.
+    png_path = "assets/terrain/heightmap_sousse_pack_active.png"
     print(f"[Python] Writing {png_path}...")
     with open(png_path, "wb") as f:
         f.write(png)
         
     os.remove(raw_path)
-    print("[Python] Successfully saved 16-bit heightmap.png (dependency-free).")
+    print("[Python] Successfully saved 16-bit heightmap_sousse_pack_active.png (dependency-free).")
     
 except Exception as e:
     print("[Python Error]", e)

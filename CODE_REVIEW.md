@@ -183,7 +183,7 @@ A 7-state scripted test harness lives inside `Game::update()` (`Game.cpp:1180-13
 
 **P7. `Shader` uniform setters pass `const std::string&` and call `glGetUniformLocation` every time** (`Shader.h:16-27, 97-111`). Every uniform write constructs a `std::string` from a `const char*` literal and performs a GL string lookup. `TerrainManager::render` alone issues ~10 per frame; the editor HUD issues hundreds. Cache locations in a map keyed once.
 
-**P8. Immediate-mode OpenGL is still the primary geometry path for UI and editor overlays** — **184** `glBegin`/`glVertex3f`/`glMatrixMode`/`glRasterPos` call sites, concentrated in `Game.cpp:1691-1897, 1947-1998, 2859-2900`, `Terrain.cpp:1770-1879` and `ObjectModel.cpp:429-666`. This forces `GLFW_OPENGL_COMPAT_PROFILE` (`main.cpp:106`), which caps the engine at OpenGL 3.3 compatibility with no path to core profile.
+**P8. Immediate-mode OpenGL remains in UI and editor overlays** — **184** `glBegin`/`glVertex3f`/`glMatrixMode`/`glRasterPos` call sites, concentrated in `Game.cpp:1691-1897, 1947-1998, 2859-2900`, `Terrain.cpp:1770-1879` and `ObjectModel.cpp:429-666`. The game now requests an OpenGL 4.6 compatibility context; these calls still prevent a core-profile migration until the overlays are converted to VAO/VBO rendering.
 
 **P9. The performance numbers in the log cannot be trusted.** `game_output.log` (stale, 2026-09-20) shows a metronomic 16.68–16.71 ms across 36 samples — that is a **vsync lock at 60 FPS**, not a measurement of headroom. It tells you nothing about where the time goes, because a capped frame is spent in `Swp`. The profiler also prints two always-zero fields (`waterStepMs`/`waterUploadMs` are never written, `Game.cpp:144-145, 1369-1370`).
 

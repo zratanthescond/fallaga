@@ -20,6 +20,21 @@ struct BrushConfig {
     static constexpr float STRENGTH_MAX = 50.0f;
 };
 
+// Falloff / hardness used by the sculpt brushes.
+struct FalloffConfig {
+    static constexpr float HARDNESS_MIN = 0.0f;
+    static constexpr float HARDNESS_MAX = 0.95f;
+    static constexpr int   MODE_COUNT = 4;
+    static const char* modeName(int mode) {
+        switch (mode) {
+            case 1: return "Linear";
+            case 2: return "Sphere";
+            case 3: return "Const";
+            default: return "Smooth";
+        }
+    }
+};
+
 // Water level configuration
 struct WaterLevelConfig {
     static constexpr float MIN = -80.0f;
@@ -48,13 +63,18 @@ constexpr float kToolsTop    = 48.0f;
 // Row must clear two text baselines: the tool name at +11 and its hint at +21, both
 // of which are ~10 px tall. 30 px overlapped the next row and clipped the hint.
 constexpr float kToolRowH    = 34.0f;
-constexpr int   kToolCount   = 7;
-constexpr float kToolsBottom = kToolsTop + kToolRowH * kToolCount;   // 286
+constexpr int   kToolCount   = 10;
+constexpr float kToolsBottom = kToolsTop + kToolRowH * kToolCount;   // 388
 constexpr float kSliderLabelY = kToolsBottom + 14.0f;
 constexpr float kSliderTop    = kToolsBottom + 34.0f;
-constexpr float kSliderPitch  = 44.0f;
+constexpr float kSliderPitch  = 40.0f;
+constexpr int   kSliderCount  = 5;   // radius, strength, hardness, direction, grade
 constexpr float kSliderTrackH = 12.0f;
-constexpr float kDetailTop    = kSliderTop + 4 * kSliderPitch;
+// Falloff shape picker sits between the sliders and the Add Geometry detail row.
+constexpr float kFalloffTop   = kSliderTop + kSliderCount * kSliderPitch;
+constexpr float kFalloffBtnY  = 20.0f;  // button top, below the caption
+constexpr float kFalloffBtnH  = 24.0f;
+constexpr float kDetailTop    = kFalloffTop + kFalloffBtnY + kFalloffBtnH + 18.0f;
 constexpr float kDetailBtnH   = 24.0f;
 constexpr float kDetailHelpY  = 14.0f;   // help line, below the caption
 constexpr float kDetailBtnY   = 20.0f;   // button top, below the help line
@@ -71,14 +91,16 @@ namespace GameEditorUtils {
 inline void updateBrushSliders(float mouseX, float mouseY,
                                 float lpX, float lpY, float lpW,
                                 float& outBrushRadius, float& outBrushStrength,
-                                bool sculptLayout = false, float* outSculptDirection = nullptr,
+                                bool sculptLayout = false, float* outSculptHardness = nullptr,
+                                float* outSculptDirection = nullptr,
                                 float* outSculptGrade = nullptr) {
     const float SLIDER_WIDTH = lpW - 30.0f;
     const float SLIDER_X_START = lpX + 15.0f;
 
     if (sculptLayout) {
         // Positions come from SculptPanel so they cannot drift from the drawing code.
-        for (int i = 0; i < 4; ++i) {
+        // Rows: 0 Radius, 1 Strength, 2 Hardness, 3 Direction, 4 Grade.
+        for (int i = 0; i < SculptPanel::kSliderCount; ++i) {
             const float capY = lpY + SculptPanel::kSliderTop + i * SculptPanel::kSliderPitch;
             if (mouseY < capY + 6.0f || mouseY > capY + 6.0f + SculptPanel::kSliderTrackH)
                 continue;
@@ -87,9 +109,11 @@ inline void updateBrushSliders(float mouseX, float mouseY,
                 outBrushRadius = BrushConfig::RADIUS_MIN + norm * (BrushConfig::RADIUS_MAX - BrushConfig::RADIUS_MIN);
             else if (i == 1)
                 outBrushStrength = BrushConfig::STRENGTH_MIN + norm * (BrushConfig::STRENGTH_MAX - BrushConfig::STRENGTH_MIN);
-            else if (i == 2 && outSculptDirection)
+            else if (i == 2 && outSculptHardness)
+                *outSculptHardness = FalloffConfig::HARDNESS_MIN + norm * (FalloffConfig::HARDNESS_MAX - FalloffConfig::HARDNESS_MIN);
+            else if (i == 3 && outSculptDirection)
                 *outSculptDirection = norm * 360.0f;
-            else if (i == 3 && outSculptGrade)
+            else if (i == 4 && outSculptGrade)
                 *outSculptGrade = norm * 60.0f;
         }
         return;

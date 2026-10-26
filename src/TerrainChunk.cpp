@@ -14,7 +14,8 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
                                 float worldMinX, float worldMaxX, float worldMinZ, float worldMaxZ,
                                 const std::vector<unsigned char>* roadMaskData, int roadW, int roadH,
                                 const std::function<int(int, int)>* refineLevel,
-                                const HeightFn& sampleHeight) {
+                                const HeightFn& sampleHeight,
+                                int lod, bool addSkirt, float skirtDepth) {
     // Keep this in sync with Terrain.cpp's WATER_BASE. Subdivide only cells the
     // sea-level contour crosses; sample their existing bilinear height surface so
     // the shoreline gains geometric resolution without editing the heightmap.
@@ -79,19 +80,82 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
     // A cell intersecting sea level needs a few more vertices to represent the
     // continuous shoreline between source pixels. Other cells keep the original
     // path unless they were explicitly refined by the terrain editor.
+    const bool useCoarse = lod > 0;
     bool anyRefined = false;
-    for (int row = 0; row + 1 < size && !anyRefined; ++row)
-        for (int col = 0; col + 1 < size; ++col) {
-            const int gx = std::min(startCol + col, globalW - 1);
-            const int gz = std::min(startRow + row, globalH - 1);
-            const bool editorRefined = refineLevel && (*refineLevel)(gx, gz) > 0;
-            if (editorRefined || crossesShoreline(gx, gz)) {
-                anyRefined = true;
-                break;
+    if (!useCoarse) {
+        for (int row = 0; row + 1 < size && !anyRefined; ++row)
+            for (int col = 0; col + 1 < size; ++col) {
+                const int gx = std::min(startCol + col, globalW - 1);
+                const int gz = std::min(startRow + row, globalH - 1);
+                const bool editorRefined = refineLevel && (*refineLevel)(gx, gz) > 0;
+                if (editorRefined || crossesShoreline(gx, gz)) {
+                    anyRefined = true;
+                    break;
+                }
+            }
+    }
+
+    // Perimeter dimensions of the top surface, recorded so the skirt can be built from
+    // the outer ring. The refined path leaves them at 0 and never carries a skirt (the
+    // manager keeps refined chunks and their neighbours at LOD0, where no seam exists).
+    int gridNx = 0, gridNz = 0;
+    bool canSkirt = false;
+
+    if (useCoarse) {
+        // ── Coarse LOD path ─────────────────────────────────────────────────
+        // Columns/rows are the chunk's grid samples every 1<<lod apart, always ending
+        // exactly on the chunk's last sample so a coarse chunk meets its neighbour at
+        // the same corner positions. Heights come straight from the grid (no
+        // refinement at coarse levels).
+        const int step = 1 << lod;
+        const int endCol = std::min(startCol + size - 1, globalW - 1);
+        const int endRow = std::min(startRow + size - 1, globalH - 1);
+        std::vector<int> cols, rows;
+        for (int g = startCol; g < endCol; g += step) cols.push_back(g);
+        cols.push_back(endCol);
+        for (int g = startRow; g < endRow; g += step) rows.push_back(g);
+        rows.push_back(endRow);
+
+        const int nx = (int)cols.size(), nz = (int)rows.size();
+        for (int r = 0; r < nz; ++r) {
+            const int gRow = rows[r];
+            const float uz = (float)gRow / (globalH - 1);
+            for (int c = 0; c < nx; ++c) {
+                const int gCol = cols[c];
+                const float ux = (float)gCol / (globalW - 1);
+                const float wx = worldMinX + ux * worldWidth;
+                const float wz = worldMinZ + uz * worldHeight;
+                const float wy = globalHeights[gRow * globalW + gCol];
+
+                // Normal from the coarse grid's own step, matching the uniform form.
+                const int gL = std::max(startCol, gCol - step);
+                const int gR = std::min(endCol, gCol + step);
+                const int gU = std::max(startRow, gRow - step);
+                const int gD = std::min(endRow, gRow + step);
+                const float hL = globalHeights[gRow * globalW + gL];
+                const float hR = globalHeights[gRow * globalW + gR];
+                const float hS = globalHeights[gU * globalW + gCol];
+                const float hN = globalHeights[gD * globalW + gCol];
+                const float sx = (float)std::max(1, gR - gL) * pixelSpacingX;
+                const float sz = (float)std::max(1, gD - gU) * pixelSpacingZ;
+                glm::vec3 normal = glm::normalize(glm::vec3(
+                    (hL - hR) / (2.0f * sx), 1.0f, (hS - hN) / (2.0f * sz)));
+
+                vertices.push_back({ glm::vec3(wx, wy, wz), normal, glm::vec2(ux, uz) });
+                minB.x = std::min(minB.x, wx); minB.y = std::min(minB.y, wy); minB.z = std::min(minB.z, wz);
+                maxB.x = std::max(maxB.x, wx); maxB.y = std::max(maxB.y, wy); maxB.z = std::max(maxB.z, wz);
             }
         }
-
-    if (!anyRefined) {
+        for (int r = 0; r + 1 < nz; ++r) {
+            for (int c = 0; c + 1 < nx; ++c) {
+                const unsigned int tl = (unsigned int)(r * nx + c), tr = tl + 1;
+                const unsigned int bl = tl + (unsigned int)nx, br = bl + 1;
+                indices.push_back(tl); indices.push_back(bl); indices.push_back(tr);
+                indices.push_back(tr); indices.push_back(bl); indices.push_back(br);
+            }
+        }
+        gridNx = nx; gridNz = nz; canSkirt = true;
+    } else if (!anyRefined) {
         // ── Original uniform path, unchanged ────────────────────────────────
         for (int row = 0; row < size; ++row) {
             for (int col = 0; col < size; ++col) {
@@ -141,6 +205,7 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
                 indices.push_back(tr); indices.push_back(bl); indices.push_back(br);
             }
         }
+        gridNx = size; gridNz = size; canSkirt = true;
     } else {
         // ── Refined path ────────────────────────────────────────────────────
         // Each cell is emitted as its own (n+1)x(n+1) sub-grid, where
@@ -191,6 +256,41 @@ void TerrainChunk::generateMesh(const std::vector<float>& globalHeights, int glo
                     }
                 }
             }
+        }
+    }
+
+    // ── Skirt ─────────────────────────────────────────────────────────────────
+    // Walk the top surface's outer ring and duplicate it downward by `skirtDepth`.
+    // Every seam has a skirt on at least one side; a chunk only gets one when the
+    // manager reports a differing level next door. The apron is deliberately kept out
+    // of minBounds/maxBounds so culling still measures the surface, not the wall.
+    if (addSkirt && canSkirt && skirtDepth > 0.0f && gridNx > 1 && gridNz > 1) {
+        std::vector<unsigned int> loop;
+        loop.reserve((std::size_t)(2 * (gridNx + gridNz)));
+        for (int c = 0; c < gridNx; ++c) loop.push_back((unsigned int)c);                       // top row, left→right
+        for (int r = 1; r < gridNz; ++r) loop.push_back((unsigned int)(r * gridNx + gridNx - 1)); // right col, top→bottom
+        for (int c = gridNx - 2; c >= 0; --c) loop.push_back((unsigned int)((gridNz - 1) * gridNx + c)); // bottom row, right→left
+        for (int r = gridNz - 2; r >= 1; --r) loop.push_back((unsigned int)(r * gridNx));       // left col, bottom→top
+
+        const float cx = (worldMinX + worldMaxX) * 0.5f;
+        const float cz = (worldMinZ + worldMaxZ) * 0.5f;
+        const unsigned int base = (unsigned int)vertices.size();
+        const int ln = (int)loop.size();
+        for (int i = 0; i < ln; ++i) {
+            Vertex v = vertices[loop[i]];
+            v.pos.y -= skirtDepth;
+            glm::vec3 out(v.pos.x - cx, 0.0f, v.pos.z - cz);
+            const float len = glm::length(out);
+            v.normal = (len > 0.0001f) ? out / len : glm::vec3(0.0f, 1.0f, 0.0f);
+            vertices.push_back(v);
+        }
+        for (int i = 0; i < ln; ++i) {
+            const unsigned int a = loop[i];
+            const unsigned int b = loop[(i + 1) % ln];
+            const unsigned int a2 = base + (unsigned int)i;
+            const unsigned int b2 = base + (unsigned int)((i + 1) % ln);
+            indices.push_back(a);  indices.push_back(a2); indices.push_back(b);
+            indices.push_back(b);  indices.push_back(a2); indices.push_back(b2);
         }
     }
 

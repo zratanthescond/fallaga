@@ -7,7 +7,10 @@
 #include <iostream>
 #include <limits>
 #include <cmath>
+#include <cstdint>
 #include <map>
+#include <unordered_map>
+#include <algorithm>
 #include <assimp/Exporter.hpp>
 #define GLM_ENABLE_EXPERIMENTAL
 // 🌟 FIX: STB_IMAGE_IMPLEMENTATION moved to stb_impl.cpp 🌟
@@ -16,6 +19,7 @@
 #include <assimp/Importer.hpp>
 #include <assimp/postprocess.h> 
 #include <assimp/config.h>
+#include <assimp/GltfMaterial.h>
 #include "Vec3.h"
 #include "Shader.h"
 #include <glm/glm.hpp>
@@ -93,7 +97,162 @@ void ObjModel::getMinMaxY(float& minY, float& maxY) const {
 // ===============================
 // Texture Loading (Kept)
 // ===============================
-void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& textureID) {
+static void configureModelTextureSampling() {
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    if (GLEW_EXT_texture_filter_anisotropic) {
+        GLfloat maxAnisotropy = 1.0f;
+        glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAnisotropy);
+        if (maxAnisotropy > 1.0f) {
+            glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT,
+                            std::min(maxAnisotropy, 8.0f));
+        }
+    }
+}
+
+static float srgbByteToLinear(unsigned char value) {
+    const float encoded = value / 255.0f;
+    return encoded <= 0.04045f
+        ? encoded / 12.92f
+        : std::pow((encoded + 0.055f) / 1.055f, 2.4f);
+}
+
+static unsigned char linearToSrgbByte(float value) {
+    value = std::clamp(value, 0.0f, 1.0f);
+    const float encoded = value <= 0.0031308f
+        ? value * 12.92f
+        : 1.055f * std::pow(value, 1.0f / 2.4f) - 0.055f;
+    return static_cast<unsigned char>(std::clamp(encoded * 255.0f + 0.5f,
+                                                  0.0f, 255.0f));
+}
+
+static float alphaCoverage(const std::vector<unsigned char>& rgba,
+                           float cutoff, float scale = 1.0f) {
+    if (rgba.empty()) return 0.0f;
+    const float cutoffByte = cutoff * 255.0f;
+    size_t covered = 0;
+    for (size_t i = 3; i < rgba.size(); i += 4) {
+        if (rgba[i] * scale >= cutoffByte) ++covered;
+    }
+    return static_cast<float>(covered) / static_cast<float>(rgba.size() / 4);
+}
+
+static std::vector<unsigned char> downsampleRgba(const std::vector<unsigned char>& source,
+                                                 int width, int height,
+                                                 int nextWidth, int nextHeight,
+                                                 bool srgb) {
+    std::vector<unsigned char> next(static_cast<size_t>(nextWidth) * nextHeight * 4);
+    for (int y = 0; y < nextHeight; ++y) {
+        for (int x = 0; x < nextWidth; ++x) {
+            const int x0 = std::min(x * 2, width - 1);
+            const int x1 = std::min(x0 + 1, width - 1);
+            const int y0 = std::min(y * 2, height - 1);
+            const int y1 = std::min(y0 + 1, height - 1);
+            const int sourceIndices[4] = {
+                (y0 * width + x0) * 4, (y0 * width + x1) * 4,
+                (y1 * width + x0) * 4, (y1 * width + x1) * 4
+            };
+            float alphaSum = 0.0f;
+            float premultiplied[3] = {0.0f, 0.0f, 0.0f};
+            for (int sourceIndex : sourceIndices) {
+                const float alpha = source[sourceIndex + 3] / 255.0f;
+                alphaSum += alpha;
+                for (int channel = 0; channel < 3; ++channel) {
+                    const float color = srgb
+                        ? srgbByteToLinear(source[sourceIndex + channel])
+                        : source[sourceIndex + channel] / 255.0f;
+                    premultiplied[channel] += color * alpha;
+                }
+            }
+
+            const size_t destination = (static_cast<size_t>(y) * nextWidth + x) * 4;
+            const float averageAlpha = alphaSum * 0.25f;
+            for (int channel = 0; channel < 3; ++channel) {
+                const float color = alphaSum > 1e-6f
+                    ? premultiplied[channel] / alphaSum : 0.0f;
+                next[destination + channel] = srgb
+                    ? linearToSrgbByte(color)
+                    : static_cast<unsigned char>(std::clamp(color * 255.0f + 0.5f,
+                                                             0.0f, 255.0f));
+            }
+            next[destination + 3] = static_cast<unsigned char>(
+                std::clamp(averageAlpha * 255.0f + 0.5f, 0.0f, 255.0f));
+        }
+    }
+    return next;
+}
+
+static float alphaCoverageScale(const std::vector<unsigned char>& rgba,
+                                float cutoff, float targetCoverage) {
+    float bestScale = 0.0f;
+    float bestError = std::abs(targetCoverage);
+    float low = 0.0f;
+    float high = 255.0f;
+    for (int iteration = 0; iteration < 24; ++iteration) {
+        const float scale = 0.5f * (low + high);
+        const float coverage = alphaCoverage(rgba, cutoff, scale);
+        const float error = std::abs(coverage - targetCoverage);
+        if (error < bestError) {
+            bestError = error;
+            bestScale = scale;
+        }
+        if (coverage < targetCoverage) low = scale;
+        else high = scale;
+    }
+    for (float scale : {low, high}) {
+        const float error = std::abs(alphaCoverage(rgba, cutoff, scale) - targetCoverage);
+        if (error < bestError) {
+            bestError = error;
+            bestScale = scale;
+        }
+    }
+    return bestScale;
+}
+
+static void uploadModelTexture(int width, int height, const unsigned char* rgba,
+                               GLint internalFormat, bool srgb,
+                               float alphaCoverageCutoff) {
+    glTexImage2D(GL_TEXTURE_2D, 0, internalFormat, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    if (!(alphaCoverageCutoff > 0.0f && alphaCoverageCutoff <= 1.0f)) {
+        glGenerateMipmap(GL_TEXTURE_2D);
+        return;
+    }
+
+    // Standard mipmap averaging shrinks alpha-tested leaves as projected size
+    // changes. Preserve the source mask's covered-pixel ratio at each level,
+    // and downsample RGB in premultiplied alpha to avoid color fringes at leaf
+    // edges when the camera sees the cards obliquely.
+    std::vector<unsigned char> source(rgba, rgba + static_cast<size_t>(width) * height * 4);
+    const float targetCoverage = alphaCoverage(source, alphaCoverageCutoff);
+    int sourceWidth = width;
+    int sourceHeight = height;
+    int level = 1;
+    while (sourceWidth > 1 || sourceHeight > 1) {
+        const int mipWidth = std::max(1, sourceWidth / 2);
+        const int mipHeight = std::max(1, sourceHeight / 2);
+        std::vector<unsigned char> rawMip = downsampleRgba(
+            source, sourceWidth, sourceHeight, mipWidth, mipHeight, srgb);
+        std::vector<unsigned char> uploadMip = rawMip;
+        const float scale = alphaCoverageScale(uploadMip, alphaCoverageCutoff,
+                                               targetCoverage);
+        for (size_t i = 3; i < uploadMip.size(); i += 4) {
+            uploadMip[i] = static_cast<unsigned char>(std::clamp(
+                uploadMip[i] * scale + 0.5f, 0.0f, 255.0f));
+        }
+        glTexImage2D(GL_TEXTURE_2D, level, internalFormat, mipWidth, mipHeight, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, uploadMip.data());
+        source = std::move(rawMip);
+        sourceWidth = mipWidth;
+        sourceHeight = mipHeight;
+        ++level;
+    }
+}
+
+void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& textureID,
+                           bool srgb, float alphaCoverageCutoff) {
     if (textureFilename.empty()) {
         textureID = 0;
         return;
@@ -102,7 +261,7 @@ void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& tex
     // Try primary path
     std::string path1 = basepath + textureFilename;
     int width, height, nrChannels;
-    unsigned char* data = stbi_load(path1.c_str(), &width, &height, &nrChannels, 0);
+    unsigned char* data = stbi_load(path1.c_str(), &width, &height, &nrChannels, STBI_rgb_alpha);
     std::string loadedPath = path1;
 
     // Fallback: extract basename and look in local "textures/" or model base directory
@@ -114,12 +273,12 @@ void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& tex
         }
         
         std::string path2 = basepath + "textures/" + basename;
-        data = stbi_load(path2.c_str(), &width, &height, &nrChannels, 0);
+        data = stbi_load(path2.c_str(), &width, &height, &nrChannels, STBI_rgb_alpha);
         loadedPath = path2;
 
         if (!data) {
             std::string path3 = basepath + basename;
-            data = stbi_load(path3.c_str(), &width, &height, &nrChannels, 0);
+            data = stbi_load(path3.c_str(), &width, &height, &nrChannels, STBI_rgb_alpha);
             loadedPath = path3;
         }
     }
@@ -127,15 +286,12 @@ void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& tex
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    configureModelTextureSampling();
 
     if (data) {
-        GLenum format = (nrChannels == 1) ? GL_RED : (nrChannels == 3 ? GL_RGB : GL_RGBA);
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
+        const GLint internalFormat = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+        uploadModelTexture(width, height, data, internalFormat, srgb,
+                           alphaCoverageCutoff);
         std::cout << "Texture loaded successfully: " << loadedPath << std::endl;
     } else {
         std::cerr << "Failed to load texture (tried fallbacks): " << textureFilename << std::endl;
@@ -144,34 +300,48 @@ void ObjModel::loadTexture(const std::string& textureFilename, unsigned int& tex
     stbi_image_free(data);
 }
 
-void ObjModel::loadTextureFromMemory(const aiTexture* embeddedTexture, unsigned int& textureID) {
+void ObjModel::loadTextureFromMemory(const aiTexture* embeddedTexture,
+                                     unsigned int& textureID, bool srgb,
+                                     float alphaCoverageCutoff) {
     glGenTextures(1, &textureID);
     glBindTexture(GL_TEXTURE_2D, textureID);
 
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    configureModelTextureSampling();
 
     int width, height, nrChannels;
     unsigned char* data = nullptr;
+    std::vector<unsigned char> rawRGBA;
+    bool stbiOwned = false;
 
     if (embeddedTexture->mHeight == 0) {
-        // Compressed format (png, jpg) - most common for FBX
+        // Compressed PNG/JPEG payload, as used by the scanned GLB.
         data = stbi_load_from_memory(reinterpret_cast<unsigned char*>(embeddedTexture->pcData), 
-                                     embeddedTexture->mWidth, &width, &height, &nrChannels, 0);
+                                     embeddedTexture->mWidth, &width, &height,
+                                     &nrChannels, STBI_rgb_alpha);
+        stbiOwned = true;
     } else {
-        // Uncompressed format (raw RGBA)
-        data = stbi_load_from_memory(reinterpret_cast<unsigned char*>(embeddedTexture->pcData), 
-                                     embeddedTexture->mWidth * embeddedTexture->mHeight, &width, &height, &nrChannels, 0);
+        // Assimp stores uncompressed embedded images as aiTexel BGRA structs,
+        // not as PNG/JPEG byte streams.
+        width = static_cast<int>(embeddedTexture->mWidth);
+        height = static_cast<int>(embeddedTexture->mHeight);
+        nrChannels = 4;
+        rawRGBA.resize(static_cast<size_t>(width) * height * 4);
+        for (int i = 0; i < width * height; ++i) {
+            const aiTexel& texel = embeddedTexture->pcData[i];
+            rawRGBA[static_cast<size_t>(i) * 4 + 0] = texel.r;
+            rawRGBA[static_cast<size_t>(i) * 4 + 1] = texel.g;
+            rawRGBA[static_cast<size_t>(i) * 4 + 2] = texel.b;
+            rawRGBA[static_cast<size_t>(i) * 4 + 3] = texel.a;
+        }
+        data = rawRGBA.data();
     }
 
     if (data) {
-        GLenum format = (nrChannels == 1) ? GL_RED : (nrChannels == 3 ? GL_RGB : GL_RGBA);
-        glTexImage2D(GL_TEXTURE_2D, 0, format, width, height, 0, format, GL_UNSIGNED_BYTE, data);
-        glGenerateMipmap(GL_TEXTURE_2D);
+        const GLint internalFormat = srgb ? GL_SRGB8_ALPHA8 : GL_RGBA8;
+        uploadModelTexture(width, height, data, internalFormat, srgb,
+                           alphaCoverageCutoff);
         std::cout << "Embedded texture loaded successfully from memory, channels: " << nrChannels << std::endl;
-        stbi_image_free(data);
+        if (stbiOwned) stbi_image_free(data);
     } else {
         std::cerr << "Failed to load embedded texture from memory." << std::endl;
         textureID = 0;
@@ -197,17 +367,34 @@ void ObjModel::processMaterials() {
         } else {
             currentMtl.name = "default_material_" + std::to_string(i);
         }
+        // Keep the source glTF alpha-mask threshold. The scanned plant pack
+        // uses cutoffs around 0.08-0.29; the old shader's fixed 0.45 removed
+        // thin leaves and grass blades from these textures.
+        material->Get(AI_MATKEY_GLTF_ALPHACUTOFF, currentMtl.alphaCutoff);
+        currentMtl.alphaCutoff = std::clamp(currentMtl.alphaCutoff, 0.0f, 1.0f);
+        const bool scannedFoliagePack =
+            filename.find("scanned_plants_and_grass_free_download.glb") != std::string::npos;
+        const float alphaCoverageCutoff = scannedFoliagePack
+            ? currentMtl.alphaCutoff : -1.0f;
         
-        // 2. Get and Load Texture (Diffuse Map)
+        // 2. Get and Load Texture. glTF stores foliage color images as PBR base
+        // color textures; older OBJ/FBX assets usually expose diffuse textures.
         aiString texturePath;
-        if (material->GetTexture(aiTextureType_DIFFUSE, 0, &texturePath) == AI_SUCCESS) {
-            std::cout << "  Material " << i << " (" << currentMtl.name << ") has diffuse texture: " << texturePath.C_Str() << std::endl;
+        aiReturn textureResult = material->GetTexture(aiTextureType_BASE_COLOR, 0, &texturePath);
+        if (textureResult != AI_SUCCESS)
+            textureResult = material->GetTexture(aiTextureType_DIFFUSE, 0, &texturePath);
+        currentMtl.textureSRGB =
+            filename.find("scanned_plants_and_grass_free_download.glb") != std::string::npos;
+        if (textureResult == AI_SUCCESS) {
+            std::cout << "  Material " << i << " (" << currentMtl.name << ") has color texture: " << texturePath.C_Str() << std::endl;
             const aiTexture* embeddedTexture = scene->GetEmbeddedTexture(texturePath.C_Str());
             if (embeddedTexture) {
                 std::cout << "  Detected EMBEDDED texture in ObjModel. Loading from memory..." << std::endl;
-                loadTextureFromMemory(embeddedTexture, currentMtl.textureID);
+                loadTextureFromMemory(embeddedTexture, currentMtl.textureID,
+                                      currentMtl.textureSRGB, alphaCoverageCutoff);
             } else {
-                loadTexture(texturePath.C_Str(), currentMtl.textureID); 
+                loadTexture(texturePath.C_Str(), currentMtl.textureID,
+                            currentMtl.textureSRGB, alphaCoverageCutoff);
             }
         } else {
             currentMtl.textureID = 0;
@@ -229,6 +416,13 @@ void ObjModel::processMaterials() {
             currentMtl.diffuse[0] = color.r;
             currentMtl.diffuse[1] = color.g;
             currentMtl.diffuse[2] = color.b;
+        }
+        aiColor4D baseColor;
+        if (AI_SUCCESS == material->Get(AI_MATKEY_BASE_COLOR, baseColor)) {
+            currentMtl.diffuse[0] = baseColor.r;
+            currentMtl.diffuse[1] = baseColor.g;
+            currentMtl.diffuse[2] = baseColor.b;
+            currentMtl.diffuse[3] = baseColor.a;
         }
 
         // Specular Color (Ks)
@@ -287,16 +481,142 @@ glm::vec3 ObjModel::getNormalAt(float x, float z) {
 // ===============================
 // Scene Traversal (Kept)
 // ===============================
-void ObjModel::processNode(aiNode* node) {
+void ObjModel::processNode(aiNode* node, const aiMatrix4x4& parentTransform) {
+    const bool normalizeScannedPlants =
+        filename.find("scanned_plants_and_grass_free_download.glb") != std::string::npos;
+    const aiMatrix4x4 absoluteTransform = parentTransform * node->mTransformation;
     // Process all the node's meshes
     for (unsigned int i = 0; i < node->mNumMeshes; i++) {
         aiMesh* mesh = scene->mMeshes[node->mMeshes[i]];
+
+        GLenum primitiveMode = 0;
+        if (mesh->mPrimitiveTypes & aiPrimitiveType_TRIANGLE)
+            primitiveMode = GL_TRIANGLES;
+        else if (mesh->mPrimitiveTypes & aiPrimitiveType_LINE)
+            primitiveMode = GL_LINES;
+        else if (mesh->mPrimitiveTypes & aiPrimitiveType_POINT)
+            primitiveMode = GL_POINTS;
+        if (primitiveMode == 0) {
+            std::cerr << "[ObjModel] Skipping unsupported primitive mesh: "
+                      << mesh->mName.C_Str() << std::endl;
+            continue;
+        }
+
+        // The scan pack is authored in large source-scene units. Normalize
+        // each individual object around its footprint and place its base at Y=0
+        // so the existing instance transforms scatter it correctly on terrain.
+        // Bake the GLB node hierarchy first: this pack has a non-identity root
+        // axis transform, which must be applied before measuring its up axis.
+        if (normalizeScannedPlants && mesh->HasPositions() && mesh->mNumVertices > 0) {
+            const aiMatrix3x3 linearTransform(absoluteTransform);
+            aiMatrix3x3 normalTransform(linearTransform);
+            normalTransform.Inverse().Transpose();
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                mesh->mVertices[v] = absoluteTransform * mesh->mVertices[v];
+                if (mesh->HasNormals()) {
+                    mesh->mNormals[v] = normalTransform * mesh->mNormals[v];
+                    mesh->mNormals[v].Normalize();
+                }
+                if (mesh->HasTangentsAndBitangents()) {
+                    mesh->mTangents[v] = linearTransform * mesh->mTangents[v];
+                    mesh->mTangents[v].Normalize();
+                    mesh->mBitangents[v] = linearTransform * mesh->mBitangents[v];
+                    mesh->mBitangents[v].Normalize();
+                }
+            }
+
+            glm::vec3 sourceMin(std::numeric_limits<float>::max());
+            glm::vec3 sourceMax(-std::numeric_limits<float>::max());
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                const aiVector3D& p = mesh->mVertices[v];
+                sourceMin = glm::min(sourceMin, glm::vec3(p.x, p.y, p.z));
+                sourceMax = glm::max(sourceMax, glm::vec3(p.x, p.y, p.z));
+            }
+            const glm::vec3 sourceSize = sourceMax - sourceMin;
+            const unsigned int materialIndex = mesh->mMaterialIndex;
+            const std::string materialName = materialIndex < materials.size()
+                ? materials[materialIndex].name : std::string();
+            const bool isStandaloneFlowerHead =
+                materialName.find("white_flower") != std::string::npos;
+
+            float targetHeight = 0.58f;
+            float targetFootprint = 0.85f;
+            if (materialName.find("Grass_Blades") != std::string::npos) {
+                targetHeight = 0.58f; targetFootprint = 0.90f;
+            } else if (materialName.find("Grass_Cloves") != std::string::npos) {
+                targetHeight = 0.52f; targetFootprint = 0.82f;
+            } else if (materialName.find("5_leaf_ground_plant") != std::string::npos) {
+                targetHeight = 0.55f; targetFootprint = 0.85f;
+            } else if (materialName.find("Ground_Cover_Bunch") != std::string::npos) {
+                targetHeight = 0.70f; targetFootprint = 1.05f;
+            } else if (materialName.find("Purple_Flower") != std::string::npos) {
+                targetHeight = 0.68f; targetFootprint = 0.85f;
+            } else if (materialName.find("dandelion") != std::string::npos) {
+                targetHeight = 0.55f; targetFootprint = 0.72f;
+            }
+
+            const float sourceHeight = sourceSize.y;
+            const float sourceFootprint = std::max(sourceSize.x, sourceSize.z);
+            // The 9-vertex white_flower mesh is only a flower head, not a full
+            // plant. Preserve its authored dimensions so it cannot inflate
+            // into a broad white patch when placed as a scatter variant.
+            // Fit the footprint and plant height independently. A uniform fit
+            // let a wide, shallow specimen dictate its height, flattening a few
+            // grass meshes until they were visible only from overhead.
+            float scaleXZ = isStandaloneFlowerHead || sourceFootprint <= 1e-5f
+                ? 1.0f : targetFootprint / sourceFootprint;
+            float scaleY = isStandaloneFlowerHead || sourceHeight <= 1e-5f
+                ? 1.0f : targetHeight / sourceHeight;
+            scaleXZ = std::clamp(scaleXZ, 0.005f, 10.0f);
+            scaleY = std::clamp(scaleY, 0.005f, 10.0f);
+
+            // Apply the inverse-transpose for normals and the geometry
+            // transform for tangents before changing vertex positions.
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                if (mesh->HasNormals()) {
+                    aiVector3D& n = mesh->mNormals[v];
+                    n.x /= scaleXZ;
+                    n.y /= scaleY;
+                    n.z /= scaleXZ;
+                    n.Normalize();
+                }
+                if (mesh->HasTangentsAndBitangents()) {
+                    aiVector3D& t = mesh->mTangents[v];
+                    aiVector3D& b = mesh->mBitangents[v];
+                    t.x *= scaleXZ; t.y *= scaleY; t.z *= scaleXZ;
+                    b.x *= scaleXZ; b.y *= scaleY; b.z *= scaleXZ;
+                    t.Normalize();
+                    b.Normalize();
+                }
+            }
+
+            const float centerX = 0.5f * (sourceMin.x + sourceMax.x);
+            const float centerZ = 0.5f * (sourceMin.z + sourceMax.z);
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                aiVector3D& p = mesh->mVertices[v];
+                p.x = (p.x - centerX) * scaleXZ;
+                p.y = (p.y - sourceMin.y) * scaleY;
+                p.z = (p.z - centerZ) * scaleXZ;
+            }
+        }
         
         Mesh newMesh;
         newMesh.assimpMesh = mesh;
+        newMesh.primitiveMode = primitiveMode;
         newMesh.materialIndex = mesh->mMaterialIndex;
         newMesh.name = mesh->mName.C_Str();
         newMesh.nodeName = node->mName.C_Str();
+        if (mesh->HasTextureCoords(0) && mesh->mNumVertices > 0) {
+            glm::vec2 uvMin(std::numeric_limits<float>::max());
+            glm::vec2 uvMax(-std::numeric_limits<float>::max());
+            for (unsigned int v = 0; v < mesh->mNumVertices; ++v) {
+                const aiVector3D& uv = mesh->mTextureCoords[0][v];
+                uvMin = glm::min(uvMin, glm::vec2(uv.x, uv.y));
+                uvMax = glm::max(uvMax, glm::vec2(uv.x, uv.y));
+            }
+            const glm::vec2 uvRange = uvMax - uvMin;
+            newMesh.hasUsableTexCoords = uvRange.x > 1e-5f || uvRange.y > 1e-5f;
+        }
 
         // Calculate AABB for this mesh
         newMesh.minBound = glm::vec3(std::numeric_limits<float>::max());
@@ -325,7 +645,7 @@ void ObjModel::processNode(aiNode* node) {
     
     // Recurse for all children
     for (unsigned int i = 0; i < node->mNumChildren; i++) {
-        processNode(node->mChildren[i]);
+        processNode(node->mChildren[i], absoluteTransform);
     }
 }
 
@@ -340,13 +660,15 @@ ObjModel::ObjModel(const std::string& filename) : scene(nullptr), displayList(0)
     size_t lastSlash = filename.find_last_of("/\\");
     basepath = (lastSlash == std::string::npos) ? "" : filename.substr(0, lastSlash + 1);
  // importer.SetPropertyString(AI_CONFIG_PP_LMW_MATERIAL_PATH, basepath);
-    scene = importer.ReadFile(filename, 
-        aiProcess_Triangulate |      // Mandatory: ensures all faces are triangles
-        aiProcess_GenSmoothNormals | // Generates smooth normals if none are provided
-        aiProcess_CalcTangentSpace | // Calculates tangents/bitangents
-        aiProcess_FlipUVs           // Useful for most OpenGL applications
-        // aiProcess_PreTransformVertices   // REMOVED: Too slow for large terrains
-    );
+    unsigned int importFlags = aiProcess_Triangulate |
+                               aiProcess_GenSmoothNormals |
+                               aiProcess_CalcTangentSpace |
+                               aiProcess_FlipUVs;
+    // Keep every scanned GLB mesh separate so all plant variants survive
+    // Assimp import. Its node transforms are identity and vertices are
+    // node transforms are baked individually in processNode(), preserving all
+    // 17 mesh variants without PreTransformVertices merging same-material ones.
+    scene = importer.ReadFile(filename, importFlags);
     std::cout << "Assimp::Importer::ReadFile finished." << std::endl;
     
     // Check for errors
@@ -363,7 +685,7 @@ ObjModel::ObjModel(const std::string& filename) : scene(nullptr), displayList(0)
     
     // 2. Process Nodes/Meshes
     std::cout << "Processing nodes..." << std::endl;
-    processNode(scene->mRootNode);
+    processNode(scene->mRootNode, aiMatrix4x4());
     std::cout << "Nodes processed." << std::endl;
 
     // 3. REMOVED: Inefficient temporary vertex list population
@@ -414,7 +736,7 @@ void ObjModel::setupDisplayList() {
         glMaterialfv(GL_FRONT_AND_BACK, GL_SPECULAR, mtl.specular);
         glMaterialf(GL_FRONT_AND_BACK, GL_SHININESS, mtl.shininess);
 
-        if (mtl.textureID) {
+        if (mtl.textureID && mesh.hasUsableTexCoords) {
             glEnable(GL_TEXTURE_2D);
             glBindTexture(GL_TEXTURE_2D, mtl.textureID);
             
@@ -426,7 +748,7 @@ void ObjModel::setupDisplayList() {
             glDisable(GL_TEXTURE_2D);
         }
 
-        glBegin(GL_TRIANGLES);
+        glBegin(mesh.primitiveMode);
         const aiMesh* aimesh = mesh.assimpMesh;
         for (unsigned int index : mesh.indices) {
             if (aimesh->HasNormals()) {
@@ -526,6 +848,7 @@ float ObjModel::getHeightAt(float x, float z) const {
     
     // Iterate over ALL meshes
     for (const auto& mesh : meshes) {
+        if (mesh.primitiveMode != GL_TRIANGLES) continue;
         // Optimization: Skip meshes whose AABB doesn't contain (x, z)
         if (x < mesh.minBound.x || x > mesh.maxBound.x || z < mesh.minBound.z || z > mesh.maxBound.z) {
             continue;
@@ -567,17 +890,21 @@ float ObjModel::getHeightAt(float x, float z) const {
 void ObjModel::render(Shader& shader, unsigned int overrideTextureID) const {
     for (const auto& mesh : meshes) {
         const Material& mtl = getMaterial(mesh.materialIndex);
+        shader.setFloat("alphaCutoff", mtl.alphaCutoff);
         
         shader.setVec3("diffuseColor", glm::vec3(mtl.diffuse[0], mtl.diffuse[1], mtl.diffuse[2]));
         
-        unsigned int texID = overrideTextureID ? overrideTextureID : mtl.textureID;
+        unsigned int texID = mesh.hasUsableTexCoords
+            ? (overrideTextureID ? overrideTextureID : mtl.textureID) : 0;
         if (texID) {
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, texID);
             shader.setInt("texture_diffuse1", 0);
             shader.setBool("hasTexture", true);
+            shader.setBool("textureIsSRGB", !overrideTextureID && mtl.textureSRGB);
         } else {
             shader.setBool("hasTexture", false);
+            shader.setBool("textureIsSRGB", false);
         }
         
         if (mtl.normalMapID) {
@@ -592,14 +919,14 @@ void ObjModel::render(Shader& shader, unsigned int overrideTextureID) const {
         // Use GPU buffers if available, else fallback to display list per-mesh
         if (mesh.VAO != 0) {
             glBindVertexArray(mesh.VAO);
-            glDrawElements(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0);
+            glDrawElements(mesh.primitiveMode, mesh.indexCount, GL_UNSIGNED_INT, 0);
             glBindVertexArray(0);
         } else {
             // Fallback: immediate mode per mesh
             const aiMesh* aimesh = mesh.assimpMesh;
             if (!aimesh) continue;
             
-            glBegin(GL_TRIANGLES);
+            glBegin(mesh.primitiveMode);
             for (unsigned int index : mesh.indices) {
                 if (aimesh->HasNormals()) {
                     const aiVector3D& n = aimesh->mNormals[index];
@@ -621,16 +948,19 @@ void ObjModel::renderMesh(int meshIndex, Shader& shader) const {
     if (meshIndex < 0 || meshIndex >= (int)meshes.size()) return;
     const auto& mesh = meshes[meshIndex];
     const Material& mtl = getMaterial(mesh.materialIndex);
+    shader.setFloat("alphaCutoff", mtl.alphaCutoff);
     
     shader.setVec3("diffuseColor", glm::vec3(mtl.diffuse[0], mtl.diffuse[1], mtl.diffuse[2]));
     
-    if (mtl.textureID) {
+    if (mtl.textureID && mesh.hasUsableTexCoords) {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, mtl.textureID);
         shader.setInt("texture_diffuse1", 0);
         shader.setBool("hasTexture", true);
+        shader.setBool("textureIsSRGB", mtl.textureSRGB);
     } else {
         shader.setBool("hasTexture", false);
+        shader.setBool("textureIsSRGB", false);
     }
     
     if (mtl.normalMapID) {
@@ -644,13 +974,13 @@ void ObjModel::renderMesh(int meshIndex, Shader& shader) const {
     
     if (mesh.VAO != 0) {
         glBindVertexArray(mesh.VAO);
-        glDrawElements(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0);
+        glDrawElements(mesh.primitiveMode, mesh.indexCount, GL_UNSIGNED_INT, 0);
         glBindVertexArray(0);
     } else {
         const aiMesh* aimesh = mesh.assimpMesh;
         if (!aimesh) return;
         
-        glBegin(GL_TRIANGLES);
+        glBegin(mesh.primitiveMode);
         for (unsigned int index : mesh.indices) {
             if (aimesh->HasNormals()) {
                 const aiVector3D& n = aimesh->mNormals[index];
@@ -667,45 +997,342 @@ void ObjModel::renderMesh(int meshIndex, Shader& shader) const {
     }
 }
 
-void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& instanceMatrices, bool forceUpdate) const {
+void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& instanceMatrices,
+                               bool forceUpdate,
+                               std::function<float(float, float)> riparianAt,
+                               glm::vec3 cameraPosition) const {
     if (instanceMatrices.empty()) return;
 
     bool isGrassPack = (filename.find("grass") != std::string::npos ||
                         filename.find("Grass") != std::string::npos) &&
                        (meshes.size() > 1);
+    const bool isScannedPlantPack =
+        filename.find("scanned_plants_and_grass_free_download.glb") != std::string::npos;
 
     if (isGrassPack) {
-        static const int NUM_GRASS_VARIANTS = 8;
-        static std::vector<int> grassMeshIndices;
-        if (grassMeshIndices.empty()) {
+        // Keep detailed scanned specimens for a capped number of nearby
+        // accents; the ordinary scattered field uses the lighter variants.
+        // Per-model state, keyed by filename. These used to be plain
+        // function-local statics, which meant they were computed once for the
+        // first grass-pack model and then silently reused for every later one:
+        // mesh indices no longer matched that model's mesh array (out-of-range
+        // read), and an instance count that happened to equal the previous
+        // model's skipped the buffer upload, leaving the model invisible.
+        struct GrassVariant {
+            int meshIndex = -1;
+            float baseWeight = 1.0f;
+            float riparianWeight = 0.0f;
+            float scale = 1.0f;
+            bool highDetail = false;
+            bool componentOnly = false;
+            std::string family;
+        };
+        static std::unordered_map<std::string, std::vector<GrassVariant>> variantsByFile;
+        std::vector<GrassVariant>& grassVariants = variantsByFile[filename];
+        if (grassVariants.empty()) {
             int totalMeshes = (int)meshes.size();
-            int step = std::max(1, totalMeshes / NUM_GRASS_VARIANTS);
-            for (int i = 0; i < NUM_GRASS_VARIANTS && i * step < totalMeshes; ++i) {
-                grassMeshIndices.push_back(i * step);
+            int triBudget = isScannedPlantPack ? 60000 : 1000;
+            if (!isScannedPlantPack) {
+                if (const char* e = std::getenv("FALLAGA_GRASS_TRIS")) {
+                    int v = atoi(e); if (v > 0) triBudget = v;
+                }
             }
-            std::cout << "[GrassOptim] Selected " << grassMeshIndices.size() 
-                      << " representative meshes from " << totalMeshes << " total." << std::endl;
+            // The supplied GLB is a curated 17-mesh pack; register every mesh
+            // as a variant. High-triangle meshes are still limited to nearby
+            // representatives below, so this does not multiply their cost
+            // across the full scatter field.
+            int maxVariants = isScannedPlantPack ? totalMeshes : 12;
+            // Cache cheap species metadata once per model. Repeatedly searching
+            // mesh names for every instance caused avoidable work on camera moves.
+            auto appendVariant = [&](int mi) {
+                GrassVariant variant;
+                variant.meshIndex = mi;
+                const std::string& name = isScannedPlantPack
+                    ? getMaterial(meshes[mi].materialIndex).name : meshes[mi].name;
+                variant.family = name;
+                variant.highDetail = isScannedPlantPack &&
+                                     meshes[mi].primitiveMode == GL_TRIANGLES &&
+                                     meshes[mi].indexCount / 3 > 1000;
+                variant.componentOnly = isScannedPlantPack &&
+                    name.find("white_flower") != std::string::npos;
+                if (isScannedPlantPack) {
+                    // The scanned GLB names meshes Object_0..Object_16. Its
+                    // material names carry the actual vegetation category.
+                    if (name.find("Grass_Blades") != std::string::npos) {
+                        variant.baseWeight = 4.0f;
+                        variant.riparianWeight = 1.0f;
+                        variant.scale = 1.0f;
+                    } else if (name.find("Grass_Cloves") != std::string::npos) {
+                        variant.baseWeight = 1.2f;
+                        variant.riparianWeight = 2.0f;
+                        variant.scale = 0.95f;
+                    } else if (name.find("5_leaf_ground_plant") != std::string::npos) {
+                        variant.baseWeight = 0.65f;
+                        variant.riparianWeight = 1.1f;
+                        variant.scale = 0.90f;
+                    } else if (name.find("Ground_Cover_Bunch") != std::string::npos) {
+                        variant.baseWeight = 0.85f;
+                        variant.riparianWeight = 1.45f;
+                        variant.scale = 0.92f;
+                    } else if (name.find("Purple_Flower") != std::string::npos) {
+                        variant.baseWeight = 0.45f;
+                        variant.riparianWeight = 0.35f;
+                        variant.scale = 0.95f;
+                    } else if (name.find("dandelion") != std::string::npos) {
+                        variant.baseWeight = 0.55f;
+                        variant.riparianWeight = 0.45f;
+                        variant.scale = 0.95f;
+                    } else if (name.find("white_flower") != std::string::npos) {
+                        variant.baseWeight = 0.35f;
+                        variant.riparianWeight = 0.3f;
+                        variant.scale = 0.95f;
+                    }
+                } else if (name.find("Grass_Blades_Bunch") != std::string::npos) {
+                    variant.baseWeight = 5.0f;
+                    variant.riparianWeight = 1.0f;
+                    variant.scale = 0.85f;
+                } else if (name.find("Grass_Blades.001") != std::string::npos) {
+                    variant.baseWeight = 2.2f;
+                    variant.riparianWeight = 1.0f;
+                    variant.scale = 1.25f;
+                } else if (name.find("Grass_Blades") != std::string::npos) {
+                    variant.baseWeight = 2.2f;
+                    variant.riparianWeight = 1.0f;
+                    variant.scale = 1.10f;
+                } else if (name.find("Ground_Cloves") != std::string::npos) {
+                    variant.baseWeight = 0.8f;
+                    variant.riparianWeight = 2.4f;
+                    variant.scale = 1.15f;
+                } else if (name.find("5_leaf") != std::string::npos) {
+                    variant.baseWeight = 0.55f;
+                    variant.riparianWeight = 1.4f;
+                    variant.scale = 0.65f;
+                } else if (name.find("dandelion") != std::string::npos) {
+                    variant.baseWeight = 0.75f;
+                    variant.riparianWeight = 0.45f;
+                    variant.scale = 0.60f;
+                }
+                grassVariants.push_back(variant);
+            };
+            // Keep every non-empty scan mesh eligible. Loose flower heads stay
+            // in the pack and are attached to complete flowering plants below.
+            for (int mi = 0; mi < totalMeshes; ++mi) {
+                const Mesh& candidate = meshes[mi];
+                const int primitiveCount = candidate.primitiveMode == GL_TRIANGLES
+                    ? static_cast<int>(candidate.indexCount / 3)
+                    : candidate.primitiveMode == GL_LINES
+                        ? static_cast<int>(candidate.indexCount / 2)
+                        : static_cast<int>(candidate.indexCount);
+                const int tris = candidate.primitiveMode == GL_TRIANGLES
+                    ? primitiveCount : 0;
+                if (primitiveCount > 0 &&
+                    (isScannedPlantPack || tris <= triBudget) &&
+                    (int)grassVariants.size() < maxVariants) {
+                    appendVariant(mi);
+                }
+            }
+            if (grassVariants.empty()) {
+                for (int i = 0; i < totalMeshes; ++i) appendVariant(i);
+            }
+            if (isScannedPlantPack) {
+                // Several scan meshes are alternate specimens of one material
+                // family. Divide family weight across those specimens so the
+                // large Ground_Cover_Bunch family does not drown out flowers.
+                std::unordered_map<std::string, int> familyCounts;
+                for (const GrassVariant& variant : grassVariants) {
+                    if (variant.componentOnly) continue;
+                    const std::string key = variant.family +
+                        (variant.highDetail ? "#detail" : "#regular");
+                    ++familyCounts[key];
+                }
+                for (GrassVariant& variant : grassVariants) {
+                    if (variant.componentOnly) continue;
+                    const std::string key = variant.family +
+                        (variant.highDetail ? "#detail" : "#regular");
+                    const float divisor = static_cast<float>(
+                        std::max(1, familyCounts[key]));
+                    variant.baseWeight /= divisor;
+                    variant.riparianWeight /= divisor;
+                }
+            }
+            size_t totalPrimitives = 0;
+            for (const GrassVariant& variant : grassVariants) {
+                const Mesh& selected = meshes[variant.meshIndex];
+                totalPrimitives += selected.primitiveMode == GL_TRIANGLES
+                    ? selected.indexCount / 3
+                    : selected.primitiveMode == GL_LINES
+                        ? selected.indexCount / 2
+                        : selected.indexCount;
+            }
+            std::cout << "[GrassOptim] Selected " << grassVariants.size()
+                      << " of " << totalMeshes << " meshes"
+                      << (isScannedPlantPack ? " (all specimens eligible; flower heads become accents)."
+                                             : " within the configured triangle budget.")
+                      << " primitives/mesh-pack=" << totalPrimitives
+                      << " (avg " << (totalPrimitives / std::max<size_t>(1, grassVariants.size())) << " primitives/mesh). Objects:";
+            for (const GrassVariant& variant : grassVariants)
+                std::cout << " " << meshes[variant.meshIndex].name;
+            std::cout << std::endl;
         }
 
-        static size_t lastGrassTotalCount = 0;
+        static std::unordered_map<std::string, size_t> lastCountByFile;
+        size_t& lastGrassTotalCount = lastCountByFile[filename];
         bool grassNeedsUpdate = forceUpdate || (instanceMatrices.size() != lastGrassTotalCount);
 
         if (grassNeedsUpdate) {
-            // Group instances into the 8 buckets using spatial hash
-            static std::vector<std::vector<glm::mat4>> meshInstances;
-            meshInstances.resize(grassMeshIndices.size());
+            // Group instances into buckets by deterministic weighted hash.
+            static std::unordered_map<std::string, std::vector<std::vector<glm::mat4>>> meshByFile;
+            std::vector<std::vector<glm::mat4>>& meshInstances = meshByFile[filename];
+            meshInstances.resize(grassVariants.size());
             for (auto& v : meshInstances) v.clear();
+            std::vector<float> cumulativeWeights(grassVariants.size(), 0.0f);
+            std::vector<size_t> regularBuckets;
+            std::vector<size_t> detailBuckets;
+            size_t flowerHeadBucket = std::numeric_limits<size_t>::max();
+            for (size_t i = 0; i < grassVariants.size(); ++i) {
+                if (grassVariants[i].componentOnly) {
+                    flowerHeadBucket = i;
+                    continue;
+                }
+                (grassVariants[i].highDetail ? detailBuckets : regularBuckets).push_back(i);
+            }
+            if (regularBuckets.empty()) regularBuckets = detailBuckets;
+            const auto speciesHash01 = [](const glm::vec3& pos) {
+                const std::uint32_t x = static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(std::floor(pos.x * 4.0f)));
+                const std::uint32_t z = static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(std::floor(pos.z * 4.0f)));
+                std::uint32_t h = x * 0x8DA6B343u ^ z * 0xD8163841u;
+                h ^= h >> 16;
+                h *= 0x7FEB352Du;
+                h ^= h >> 15;
+                h *= 0x846CA68Bu;
+                h ^= h >> 16;
+                return static_cast<float>(h >> 8) * (1.0f / 16777216.0f);
+            };
 
-            for (const auto& mat : instanceMatrices) {
-                glm::vec3 pos(mat[3]);
-                unsigned int hash = (unsigned int)(abs(pos.x * 12.9898f + pos.z * 78.233f + pos.y * 43.123f));
-                int bucket = hash % (int)grassMeshIndices.size();
-                meshInstances[bucket].push_back(mat);
+            const auto addFlowerHeadAccent = [&](const glm::vec3& plantPos,
+                                                  size_t plantBucket,
+                                                  const glm::mat4& plantMatrix) {
+                if (!isScannedPlantPack ||
+                    flowerHeadBucket == std::numeric_limits<size_t>::max())
+                    return;
+                const std::string& family = grassVariants[plantBucket].family;
+                if (family.find("dandelion") == std::string::npos &&
+                    family.find("Purple_Flower") == std::string::npos)
+                    return;
+
+                // This 9-vertex source mesh is a blossom without a stem. Place
+                // it on a small share of complete flowering plants instead of
+                // scattering a flat flower head directly on the soil.
+                if (speciesHash01(plantPos + glm::vec3(73.0f, 0.0f, -41.0f)) > 0.12f)
+                    return;
+
+                const Mesh& plantMesh = meshes[grassVariants[plantBucket].meshIndex];
+                const float plantUpScale = glm::length(glm::vec3(plantMatrix[1]));
+                glm::mat4 headMatrix = plantMatrix;
+                headMatrix[3].y += plantMesh.maxBound.y * plantUpScale * 0.88f;
+                const float headScale = grassVariants[flowerHeadBucket].scale;
+                headMatrix[0] *= headScale;
+                headMatrix[1] *= headScale;
+                headMatrix[2] *= headScale;
+                meshInstances[flowerHeadBucket].push_back(headMatrix);
+            };
+
+            struct DetailCandidate {
+                size_t instanceIndex;
+                float distanceSquared;
+            };
+            std::vector<DetailCandidate> detailCandidates;
+            const float heroRadiusSquared = 30.0f * 30.0f;
+            const size_t noBucket = std::numeric_limits<size_t>::max();
+            std::vector<size_t> detailBucketForInstance(instanceMatrices.size(), noBucket);
+
+            // Every scanned mesh gets a nearby representative whenever the
+            // field has enough placements. Interleave detail and light meshes
+            // so all 17 supplied specimens are visible around the player, while
+            // each still replaces the ordinary model at that location.
+            if (isScannedPlantPack && !detailBuckets.empty()) {
+                for (size_t i = 0; i < instanceMatrices.size(); ++i) {
+                    const glm::vec3 pos(instanceMatrices[i][3]);
+                    const glm::vec3 delta = pos - cameraPosition;
+                    const float distanceSquared = glm::dot(delta, delta);
+                    if (distanceSquared <= heroRadiusSquared)
+                        detailCandidates.push_back({i, distanceSquared});
+                }
+                std::sort(detailCandidates.begin(), detailCandidates.end(),
+                    [](const DetailCandidate& a, const DetailCandidate& b) {
+                        return a.distanceSquared < b.distanceSquared;
+                    });
+                std::vector<size_t> visibleBuckets;
+                visibleBuckets.reserve(grassVariants.size());
+                for (size_t i = 0; i < std::max(detailBuckets.size(), regularBuckets.size()); ++i) {
+                    if (i < detailBuckets.size()) visibleBuckets.push_back(detailBuckets[i]);
+                    if (i < regularBuckets.size()) visibleBuckets.push_back(regularBuckets[i]);
+                }
+                const size_t selectedCount =
+                    std::min(detailCandidates.size(), visibleBuckets.size());
+                for (size_t i = 0; i < selectedCount; ++i) {
+                    const size_t bucket = visibleBuckets[i];
+                    detailBucketForInstance[detailCandidates[i].instanceIndex] = bucket;
+                }
             }
 
-            for (size_t bIdx = 0; bIdx < grassMeshIndices.size(); ++bIdx) {
+            for (size_t instanceIndex = 0; instanceIndex < instanceMatrices.size(); ++instanceIndex) {
+                const auto& mat = instanceMatrices[instanceIndex];
+                glm::vec3 pos(mat[3]);
+                const size_t selectedDetailBucket = detailBucketForInstance[instanceIndex];
+                if (selectedDetailBucket != noBucket) {
+                    glm::mat4 speciesMatrix = mat;
+                    const float speciesScale = grassVariants[selectedDetailBucket].scale;
+                    if (speciesScale != 1.0f) {
+                        speciesMatrix[0] *= speciesScale;
+                        speciesMatrix[1] *= speciesScale;
+                        speciesMatrix[2] *= speciesScale;
+                    }
+                    meshInstances[selectedDetailBucket].push_back(speciesMatrix);
+                    addFlowerHeadAccent(pos, selectedDetailBucket, speciesMatrix);
+                    continue;
+                }
+
+                const float riparian = riparianAt
+                    ? std::clamp(riparianAt(pos.x, pos.z), 0.0f, 1.0f) : 0.0f;
+                float weightTotal = 0.0f;
+                for (size_t bucketIndex = 0; bucketIndex < regularBuckets.size(); ++bucketIndex) {
+                    const GrassVariant& variant = grassVariants[regularBuckets[bucketIndex]];
+                    const float weight = variant.baseWeight +
+                                         variant.riparianWeight * riparian;
+                    weightTotal += weight;
+                    cumulativeWeights[bucketIndex] = weightTotal;
+                }
+                // Fractional parts of large world-space floats have poor
+                // precision and clustered values, which underused some of the
+                // 12 supplied species. Hash quantized coordinates to a uniform,
+                // reproducible 24-bit choice instead.
+                const float unit = speciesHash01(pos);
+                const auto pick = std::lower_bound(
+                    cumulativeWeights.begin(), cumulativeWeights.begin() + regularBuckets.size(),
+                    unit * weightTotal);
+                int selectableBucket = static_cast<int>(
+                    pick - cumulativeWeights.begin());
+                selectableBucket = std::clamp(selectableBucket, 0,
+                    static_cast<int>(regularBuckets.size()) - 1);
+                size_t bucket = regularBuckets[selectableBucket];
+                const float speciesScale = grassVariants[bucket].scale;
+                glm::mat4 speciesMatrix = mat;
+                if (speciesScale != 1.0f) {
+                    speciesMatrix[0] *= speciesScale;
+                    speciesMatrix[1] *= speciesScale;
+                    speciesMatrix[2] *= speciesScale;
+                }
+                meshInstances[bucket].push_back(speciesMatrix);
+                addFlowerHeadAccent(pos, bucket, speciesMatrix);
+
+            }
+
+            for (size_t bIdx = 0; bIdx < grassVariants.size(); ++bIdx) {
                 const auto& matricesForMesh = meshInstances[bIdx];
-                int mIdx = grassMeshIndices[bIdx];
+                int mIdx = grassVariants[bIdx].meshIndex;
                 const auto& mesh = meshes[mIdx];
                 if (mesh.VAO == 0) continue;
 
@@ -736,31 +1363,70 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
         }
 
         shader.setBool("isInstanced", true);
+        shader.setFloat("grassLod", 1.0f);
+        shader.setBool("hasTexture2", false);
 
-        for (size_t bIdx = 0; bIdx < grassMeshIndices.size(); ++bIdx) {
-            int mIdx = grassMeshIndices[bIdx];
+        // Grass blades are authored with a consistent winding, so back-face
+        // culling can roughly halve the fragmented area (and thus fill-rate
+        // load) versus the engine-wide two-sided default. Measured gain is only
+        // ~15%, and the pack's winding is not guaranteed, so this is opt-in via
+        // FALLAGA_GRASS_CULL=1 to avoid silently dropping faces.
+        static const bool grassCull = [](){ const char* e = std::getenv("FALLAGA_GRASS_CULL"); return e && atoi(e) != 0; }();
+        const bool cullWasEnabled = glIsEnabled(GL_CULL_FACE) == GL_TRUE;
+        GLint previousCullMode = GL_BACK;
+        glGetIntegerv(GL_CULL_FACE_MODE, &previousCullMode);
+        if (isScannedPlantPack) {
+            // Every scanned GLB material is double-sided. Never apply the
+            // optional back-face optimization to these cards: their authored
+            // winding varies between specimens, so it makes them vanish while
+            // orbiting the camera.
+            glDisable(GL_CULL_FACE);
+        } else if (grassCull) {
+            glEnable(GL_CULL_FACE);
+            glCullFace(GL_BACK);
+        }
+
+        for (size_t bIdx = 0; bIdx < grassVariants.size(); ++bIdx) {
+            int mIdx = grassVariants[bIdx].meshIndex;
             const auto& mesh = meshes[mIdx];
             if (mesh.VAO == 0 || mesh.instanceVBO == 0 || mesh.lastUploadedSize == 0) continue;
 
             const Material& mtl = getMaterial(mesh.materialIndex);
-            shader.setVec3("diffuseColor", glm::vec3(mtl.diffuse[0], mtl.diffuse[1], mtl.diffuse[2]));
+            shader.setFloat("alphaCutoff", mtl.alphaCutoff);
+            glm::vec3 diffuseColor(mtl.diffuse[0], mtl.diffuse[1], mtl.diffuse[2]);
+            if (isScannedPlantPack && !mesh.hasUsableTexCoords &&
+                mtl.name.find("Grass_Blades") != std::string::npos) {
+                // Object_2 has collapsed UVs; sample no texture and give the
+                // small untextured blade mesh a foliage-colored fallback.
+                diffuseColor = glm::vec3(0.24f, 0.42f, 0.12f);
+            }
+            shader.setVec3("diffuseColor", diffuseColor);
 
-            if (mtl.textureID) {
+            if (mtl.textureID && mesh.hasUsableTexCoords) {
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, mtl.textureID);
                 shader.setInt("texture_diffuse1", 0);
                 shader.setBool("hasTexture", true);
+                shader.setBool("textureIsSRGB", mtl.textureSRGB);
             } else {
                 shader.setBool("hasTexture", false);
+                shader.setBool("textureIsSRGB", false);
             }
             shader.setBool("hasNormalMap", false);
 
             glBindVertexArray(mesh.VAO);
-            glDrawElementsInstanced(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mesh.lastUploadedSize);
+            glDrawElementsInstanced(mesh.primitiveMode, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mesh.lastUploadedSize);
             glBindVertexArray(0);
         }
 
+        if (isScannedPlantPack || grassCull) {
+            glCullFace(static_cast<GLenum>(previousCullMode));
+            if (cullWasEnabled) glEnable(GL_CULL_FACE);
+            else glDisable(GL_CULL_FACE);
+        }
+
         shader.setBool("isInstanced", false);
+        shader.setFloat("grassLod", 0.0f);
 
     } else {
         shader.setBool("isInstanced", true);
@@ -788,15 +1454,18 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
             }
 
             const Material& mtl = getMaterial(mesh.materialIndex);
+            shader.setFloat("alphaCutoff", mtl.alphaCutoff);
             shader.setVec3("diffuseColor", glm::vec3(mtl.diffuse[0], mtl.diffuse[1], mtl.diffuse[2]));
 
-            if (mtl.textureID) {
+            if (mtl.textureID && mesh.hasUsableTexCoords) {
                 glActiveTexture(GL_TEXTURE0);
                 glBindTexture(GL_TEXTURE_2D, mtl.textureID);
                 shader.setInt("texture_diffuse1", 0);
                 shader.setBool("hasTexture", true);
+                shader.setBool("textureIsSRGB", mtl.textureSRGB);
             } else {
                 shader.setBool("hasTexture", false);
+                shader.setBool("textureIsSRGB", false);
             }
 
             if (mtl.normalMapID) {
@@ -808,7 +1477,7 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
                 shader.setBool("hasNormalMap", false);
             }
 
-            glDrawElementsInstanced(GL_TRIANGLES, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mutableMesh.lastUploadedSize);
+            glDrawElementsInstanced(mesh.primitiveMode, mesh.indexCount, GL_UNSIGNED_INT, 0, (GLsizei)mutableMesh.lastUploadedSize);
             glBindVertexArray(0);
         }
 

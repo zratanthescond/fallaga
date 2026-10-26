@@ -14,6 +14,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <utility>
 #include <GL/glew.h>
 #include <glm/glm.hpp>
 #include "Shader.h"
@@ -106,6 +107,10 @@ public:
     float cellSizeZ() const {
         return (m_h > 1) ? (m_mapper.bounds.maxZ - m_mapper.bounds.minZ) / float(m_h - 1) : 0.0f;
     }
+    int heightmapW() const { return m_w; }
+    int heightmapH() const { return m_h; }
+    const float* heightData() const { return m_heights; }
+    const TerrainCoordinateMapper& mapperRef() const { return m_mapper; }
 
     bool isValid() const { return m_heights != nullptr; }
 
@@ -336,6 +341,8 @@ private:
 
 namespace RoadSpline {
     inline constexpr float kCrownHeight = 0.08f;
+    inline constexpr float kCurbU = 0.15f;         // sidewalk fraction of ribbon width, per side
+    inline constexpr float kSidewalkRaise = 0.12f; // metres
     // Catmull-Rom spline evaluation from 2D control points.
     // Samples heightmap for Y, then smooths elevation.
     // Straight stretches resample every (1/samplesPerMeter) meters; curved
@@ -526,6 +533,12 @@ private:
     void stampMetricUV();
     std::vector<RoadVertex>  m_vertices;
     std::vector<uint32_t>    m_indices;
+    // Vertex indices whose metricUV is the road-following (lateral metres, distance
+    // along the segment) coordinate rather than the world-XZ stamp. Filled by the
+    // ribbon ring emitter and re-applied after stampMetricUV() so the carriageway
+    // surface follows the road direction around bends. Junction pads, end caps and
+    // arc fans are intentionally left on the world-XZ projection.
+    std::vector<std::pair<uint32_t, glm::vec2>> m_ribbonMetricUV;
     std::vector<RoadJoinShaderStroke> m_joinShaderStrokes;
     std::vector<RoadJoinShaderContact> m_joinShaderContacts;
 

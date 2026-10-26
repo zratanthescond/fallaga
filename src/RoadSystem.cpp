@@ -28,6 +28,18 @@ constexpr float kRoadBedFlatReach = 34.0f;
 // mouth; short enough that it does not reshape a road.
 constexpr float kJunctionHeightBlend = 18.0f;
 
+// How far the brick sidewalk band sits above the carriageway and the terrain, metres.
+// The ribbon already has vertices on both sides of each kerb line (kCross 0.146 / 0.154),
+// so this lift turns the kerb into a real step with a lit face. street.vert must NOT lift
+// the band again (set its CURB_HEIGHT_M to 0.0). TerrainManager::conformTerrainToRoadMesh
+// subtracts this lift again (kSidewalkRaise there must match) so the ground is graded to the
+// road bed, not to the kerb step.
+constexpr float kSidewalkRaise = RoadSpline::kSidewalkRaise;
+
+// Fraction of ribbon width taken by the raised sidewalk on EACH side
+// (matches kCross 0.146/0.154 and 0.846/0.854, and CURB_U in street.frag).
+constexpr float kRoadCurbU = RoadSpline::kCurbU;
+
 // How much of its own ground height the ribbon adopts across its width.
 //
 // 1.0 means the carriageway follows the graded bed exactly, which is what makes the
@@ -1385,8 +1397,26 @@ void RoadNavigationGraph::build(const RoadGraph &roads) {
     positions.reserve(distances.size());
     for (float distance : distances) {
       RawRoadSample raw = sourceAt(seg, distance);
-      const glm::vec2 pos(raw.center.x + raw.right.x * lateralOffset,
-                          raw.center.z + raw.right.z * lateralOffset);
+      // On bends the mesh narrows the inner side (meshHalfWidth). Squeeze the lane
+      // offset by the same ratio so lane centres stay on the carriageway there too.
+      float bendScale = 1.0f;
+      if (lateralOffset != 0.0f && seg.width > 0.1f && seg.splinePoints.size() >= 3) {
+        const size_t sn = seg.splinePoints.size();
+        auto up = std::upper_bound(seg.cumulativeDist.begin(),
+                                   seg.cumulativeDist.end(), distance);
+        const size_t i1 = up == seg.cumulativeDist.end() ? sn - 1
+                                                         : size_t(up - seg.cumulativeDist.begin());
+        const size_t i0 = i1 > 0 ? i1 - 1 : 0;
+        const float fullHalf = seg.width * 0.5f;
+        const float sideSign = lateralOffset < 0.0f ? -1.0f : 1.0f;
+        const float hwLocal = std::min(
+            RoadSpline::meshHalfWidth(seg, int(i0), seg.closed, sideSign, fullHalf),
+            RoadSpline::meshHalfWidth(seg, int(i1), seg.closed, sideSign, fullHalf));
+        bendScale = glm::clamp(hwLocal / fullHalf, 0.1f, 1.0f);
+      }
+      const float laneOffset = lateralOffset * bendScale;
+      const glm::vec2 pos(raw.center.x + raw.right.x * laneOffset,
+                          raw.center.z + raw.right.z * laneOffset);
       if (!positions.empty() && glm::length(pos - positions.back()) < 0.05f)
         continue;
       // A tight inner offset can fold back on itself even when the centreline
@@ -1418,7 +1448,8 @@ void RoadNavigationGraph::build(const RoadGraph &roads) {
     const float roadWidth = std::max(seg.width, 2.0f);
     const int lanesPerDirection = std::clamp(defaults.lanesPerDirection, 1, 8);
     const int directionCount = seg.oneWay ? 1 : 2;
-    const float laneWidth = roadWidth / float(lanesPerDirection * directionCount);
+    const float carriageWidth = roadWidth * (1.0f - 2.0f * kRoadCurbU);
+    const float laneWidth = carriageWidth / float(lanesPerDirection * directionCount);
     const float fullLength = centerlineLengths[segmentIndex];
 
     std::vector<std::pair<SegmentAnchor, SegmentAnchor>> sections;
@@ -1440,7 +1471,7 @@ void RoadNavigationGraph::build(const RoadGraph &roads) {
         const bool forward = directionIndex == 0;
         for (int laneIndex = 0; laneIndex < lanesPerDirection; ++laneIndex) {
           const float lateralOffset = seg.oneWay
-              ? (-roadWidth * 0.5f + (float(laneIndex) + 0.5f) * laneWidth)
+              ? (-carriageWidth * 0.5f + (float(laneIndex) + 0.5f) * laneWidth)
               : (float(laneIndex) + 0.5f) * laneWidth * (forward ? 1.0f : -1.0f);
           RoadLane lane;
           lane.id = (uint32_t)m_lanes.size();
@@ -1474,8 +1505,7 @@ void RoadNavigationGraph::build(const RoadGraph &roads) {
         walk.startNodeId = seg.closed ? kInvalidRoadNodeId : low.nodeId;
         walk.endNodeId = seg.closed ? kInvalidRoadNodeId : high.nodeId;
         walk.side = (int8_t)side;
-        const float offset = float(side) * (roadWidth * 0.5f +
-            std::max(seg.shoulderWidth, 0.0f) + defaults.sidewalkWidth * 0.5f);
+        const float offset = float(side) * roadWidth * (0.5f - 0.5f * kRoadCurbU);
         walk.samples = makeOffsetPath(seg, low.distance, high.distance,
                                       offset, false, seg.closed);
         if (walk.samples.size() >= 2) {
@@ -2747,6 +2777,7 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   m_indices.clear();
   m_joinShaderStrokes.clear();
   m_joinShaderContacts.clear();
+  m_ribbonMetricUV.clear();
   m_shoulderQuads = 0;
 
   // Bring every junction's arms to one height before anything is emitted, so the ribbon,
@@ -2820,26 +2851,19 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
   // three vertices plus the centroid is sufficient; the caller passes the half-extents
   // of the triangles the vertex belongs to, and the offsets below are scaled to them.
   auto groundMaxOverFootprint = [&](const glm::vec3 &at, float halfAlong, float halfAcross) {
-    if (!sampler.isValid())
-      return at.y;
-    float g = sampler.renderedGround(at.x, at.z);
-    const float r = std::max(halfAlong, halfAcross);
-    if (r <= 1e-4f)
-      return g;
-    // A 5x5 pattern at 1/4, 1/2, 3/4 and full extents. The full extent matters: on
-    // this DEM a terrain cell is 22.25 m while a road is 8-40 m wide, so a terrain
-    // triangle can lean through the ribbon's interior and its highest corner can sit a
-    // full cell away from the vertex being clamped. Density matters too: that highest
-    // corner lies anywhere in the footprint, not on an axis, so a coarse pattern
-    // undersamples the interior. Reach alone got 5911 offenders down to 178; reach plus
-    // this density took it to 42.
-    for (int k = -4; k <= 4; ++k)
-      for (int m = -4; m <= 4; ++m) {
-        if (k == 0 && m == 0) continue;
-        g = std::max(g, sampler.renderedGround(at.x + 0.25f * (float)m * halfAcross,
-                                               at.z + 0.25f * (float)k * halfAlong));
-      }
+  if (!sampler.isValid())
+    return at.y;
+  float g = sampler.renderedGround(at.x, at.z);
+  const float r = std::max(halfAlong, halfAcross);
+  if (r <= 1e-4f)
     return g;
+  for (int k = -4; k <= 4; ++k)
+    for (int m = -4; m <= 4; ++m) {
+      if (k == 0 && m == 0) continue;
+      g = std::max(g, sampler.renderedGround(at.x + 0.25f * (float)m * halfAcross,
+                                             at.z + 0.25f * (float)k * halfAlong));
+    }
+  return g;
   };
   // Clamp a ribbon vertex against its whole footprint. halfAlong is roughly the ring
   // spacing along the road, halfAcross roughly the pillar gap across it.
@@ -2866,7 +2890,12 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
     // floating road. The ribbon's own triangle extent is the ring step along the road and
     // the pillar step across it, so that is the honest search distance -- extending
     // beyond the triangles a vertex belongs to raises it for terrain it never covers.
-    const float ground = groundMaxOverFootprint(at, halfAlong, halfAcross);
+    // A terrain triangle can lean into the ribbon from up to one cell away. The DEM is
+    // ~11 m per cell, so a footprint smaller than half a cell can miss the high corner
+    // that buries the asphalt on a coastal cut (the port rim measured 0.41 m under).
+    const float cellReach = 0.5f * std::max(sampler.cellSizeX(), sampler.cellSizeZ());
+    const float ground = groundMaxOverFootprint(
+        at, std::max(halfAlong, cellReach), std::max(halfAcross, cellReach));
     return std::max(surfaceY, ground + kMinClearance);
   };
   // Endpoint clustering tolerance, metres. Shared with RoadGraph::buildTopology
@@ -2884,12 +2913,16 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
       0.000f, // left rim
       0.055f, // left edge-line outer
       0.105f, // left edge-line inner
+      0.146f, // left kerb, sidewalk side (raised)   -- brackets CURB_U = 0.15
+      0.154f, // left kerb, carriageway side (ground)
       0.435f, // center zone
       0.455f, // double-yellow left outer
       0.495f, // double-yellow left inner
       0.505f, // double-yellow right inner
       0.545f, // double-yellow right outer
       0.565f, // center zone
+      0.846f, // right kerb, carriageway side (ground)
+      0.854f, // right kerb, sidewalk side (raised)
       0.895f, // right edge-line inner
       0.945f, // right edge-line outer
       1.000f  // right rim
@@ -4090,6 +4123,11 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         mark = 0.0f;
       const float along =
           (i < (int)seg.cumulativeDist.size()) ? seg.cumulativeDist[i] : 0.0f;
+      // Distance along the segment in metres, origin at its first ring. Drives the
+      // road-following v of the carriageway surface texture (see the ring emitter).
+      const float alongMetres =
+          along - (seg.cumulativeDist.empty() ? 0.0f
+                                              : seg.cumulativeDist.front());
       for (const BranchContact &contact : branchContacts) {
         if (contact.seg != s)
           continue;
@@ -4104,6 +4142,18 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
 
       const uint32_t ringVertexBase = (uint32_t)m_vertices.size();
       std::array<glm::vec3, kCrossCount> ringPositions{};
+      // The raised sidewalk meets the flat junction pad at a cut ring, so it comes back down to
+      // the carriageway over the same kJunctionWearFade run the paint fades over, and is flat at
+      // the cut ring itself (no step or crack against the pad).
+      float cutLift = 1.0f;
+      if (i < (int)cutDistAt[s].size() && cutDistAt[s][i] < kJunctionWearFade) {
+        if (isCutRing[s][i] != 0) {
+          cutLift = 0.0f;
+        } else {
+          const float x = std::clamp(cutDistAt[s][i] / kJunctionWearFade, 0.0f, 1.0f);
+          cutLift = x * x * (3.0f - 2.0f * x);
+        }
+      }
       for (int j = 0; j < kCrossCount; ++j) {
         const float uc = kCross[j];
         const float off = uc * 2.0f - 1.0f;
@@ -4119,19 +4169,59 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         // Clear the WHOLE footprint these vertices' triangles cover, not just the
         // vertex point: a terrain triangle leaning through the ribbon's interior can be
         // half a metre above the ground sampled under the ribbon's own corners.
-        // halfAlong is the ring spacing, halfAcross the pillar gap across the road.
-        float halfAlong = 0.5f * (seg.cumulativeDist.size() > 1
-                                      ? std::max(1.0f, seg.cumulativeDist[std::min(
-                                            i + 1, (int)seg.cumulativeDist.size() - 1)] -
-                                                           seg.cumulativeDist[i])
-                                      : 2.0f);
-        const float halfAcross = 0.5f * std::max(1.0f, useHw * (1.0f / (float)(kCrossCount - 1)));
+        // A vertex belongs to the quads on BOTH sides of its ring and pillar, so the
+        // half-extent of the geometry it brackets is the full ring spacing and the full
+        // pillar gap. Passing only half of those left the high corner of the neighbouring
+        // terrain cell outside the 5x5 search on steep ground (port rim, ~0.42 m buried).
+        const float halfAlong = seg.cumulativeDist.size() > 1
+                                    ? std::max(1.0f, seg.cumulativeDist[std::min(
+                                          i + 1, (int)seg.cumulativeDist.size() - 1)] -
+                                                         seg.cumulativeDist[i])
+                                    : 2.0f;
+        const float halfAcross = std::max(1.0f, useHw * 2.0f / (float)(kCrossCount - 1));
         pos.y = minSurfaceYFootprint(pos, y + Z_BIAS + crown + stripLift,
                                      halfAlong, halfAcross);
 
+        // Raised brick sidewalk (urban / colonial streets only). Pillars j = 1..3 and
+        // 12..14 sit on the sidewalk side of the kerb; the rims (j = 0, last) stay on the
+        // ground so the outer edge slopes back down to the terrain instead of hovering.
+        // The lift fades out with the paint mask (dead ends / attached branch ends) and
+        // drops to zero across the mouth of a side street (a dropped kerb), mirroring
+        // the pavement suppression street.frag applies there.
+        if ((int)rtype <= 1) {
+          const bool raisedPillar =
+              (j >= 1 && j <= 3) || (j >= kCrossCount - 4 && j <= kCrossCount - 2);
+          if (raisedPillar) {
+            float mouth = 1.0f;
+            for (const BranchContact &c : branchContacts) {
+              if (c.host != s)
+                continue;
+              const glm::vec2 hostT = glm::normalize(c.hostTangent);
+              const glm::vec2 hostR(hostT.y, -hostT.x);
+              const glm::vec2 d(pos.x - c.hostPosition.x, pos.z - c.hostPosition.y);
+              if (glm::dot(d, hostR) * c.hostSide <= 0.0f)
+                continue; // other side of the host from the side street
+              const float half =
+                  segments[c.seg].width * 0.5f + branchFilletRadius(c);
+              mouth = std::min(
+                  mouth, glm::smoothstep(half, half + 2.0f,
+                                         std::fabs(glm::dot(d, hostT))));
+            }
+            pos.y += kSidewalkRaise * mark * mouth * cutLift;
+          }
+        }
+
         ringPositions[j] = pos;
-        // metricUV is stamped centrally from world XZ after the whole mesh is built
-        // (stampMetricUV); the field here is a placeholder overwritten by that pass.
+        // The carriageway surface texture follows the road: metricUV here is
+        // (lateral distance in metres from the left rim, distance in metres along
+        // the segment), so the cobble/asphalt courses run with the road instead of
+        // staying locked to the world axes and shearing across every bend. It is
+        // recorded and re-applied after stampMetricUV(), which fills the junction
+        // pads / caps / arc fans with the world-XZ projection; those keep it.
+        const glm::vec2 ribbonMetricUV(
+            off * useHw + std::max(0.0f, seg.width) * 0.5f,
+            alongMetres);
+        m_ribbonMetricUV.emplace_back((uint32_t)m_vertices.size(), ribbonMetricUV);
         m_vertices.push_back(
             {pos, glm::vec3(0.0f, 1.0f, 0.0f), glm::vec2(uc, v), rtype,
              std::max(0.0f, seg.width) * 0.1f + std::max(0.0f, 5.0f - rtype),
@@ -4287,14 +4377,15 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
         float ang = float(k) / float(M) * PI;
         glm::vec3 d =
             -right * hw * std::cos(ang) + outward * hw * std::sin(ang);
-        glm::vec3 pos = P + d;
-        float y = yC;
-        // renderedGround already contains the baked bed offset; no deformation term.
-        if (sampler.isValid())
-          y = yC + (sampler.renderedGround(pos.x, pos.z) - yC) * EDGE_CONFORM;
-        const float lateral = std::cos(ang);
-        const float crown = crownHeight * (1.0f - lateral * lateral);
-        pos.y = minSurfaceYFootprint(pos, y + Z_BIAS + crown + stripLift, hw, hw);
+      glm::vec3 pos = P + d;
+      float y = yC;
+      // renderedGround already contains the baked bed offset; no deformation term.
+      if (sampler.isValid())
+        y = yC + (sampler.renderedGround(pos.x, pos.z) - yC) * EDGE_CONFORM;
+      const float lateral = std::cos(ang);
+      const float crown = crownHeight * (1.0f - lateral * lateral);
+      pos.y = minSurfaceYFootprint(pos, y + Z_BIAS + crown + stripLift,
+                                   std::max(hw * 0.5f, 2.0f), std::max(hw * 0.5f, 2.0f));
         if (k == 0)
           arcL = pos;
         if (k == M)
@@ -5010,8 +5101,19 @@ void RoadMeshBuilder::build(std::vector<RoadSegment> segments,
 // Deriving it from the position rather than carrying it through each emitter makes
 // that guarantee structural.
 void RoadMeshBuilder::stampMetricUV() {
+  // World-XZ projection first, for every vertex not emitted by the ribbon ring
+  // emitter: junction pads, end caps and the arc fans. A constant coordinate would
+  // sample a single texel and collapse them to a flat, untextured polygon (the old
+  // junction-pad defect), so they need a real world-space coordinate.
   for (RoadVertex &v : m_vertices)
     v.metricUV = glm::vec2(v.position.x, v.position.z);
+
+  // Then restore the road-following coordinate on the carriageway ribbons so the
+  // surface texture turns with the road instead of staying locked to the world axes.
+  for (const auto &ribbon : m_ribbonMetricUV) {
+    if (ribbon.first < m_vertices.size())
+      m_vertices[ribbon.first].metricUV = ribbon.second;
+  }
 }
 
 void RoadMeshBuilder::upload() {

@@ -1,0 +1,82 @@
+# Universal Ripgrep / Agent Ignore Rules
+# Exclude heavy binaries, assets, models, and caches to minimize token consumption
+
+# 1. Heavy Asset Folders (1.85 GB+)
+assets/
+TerrainTextureGenerator/textures/
+TerrainTextureGenerator/output/
+TerrainTextureGenerator/input/
+
+# 2. Build Artifacts & Temporary Directories
+build/
+bin/
+obj/
+cache/
+output/
+scratch/
+st/
+.claude/
+.vs/
+x64/
+Debug/
+Release/
+
+# 3. Third-party Giant Single-Header Libraries (~1,000,000 tokens)
+src/miniaudio.h
+
+# 4. 3D Model & Mesh Files
+*.obj
+*.fbx
+*.blend
+*.dae
+*.stl
+*.3ds
+
+# 5. Media & Texture Files
+*.png
+*.jpg
+*.jpeg
+*.dds
+*.ytd
+*.tga
+*.bmp
+*.ico
+*.wav
+*.mp3
+*.ogg
+
+# 6. Compiled Binaries & Archives
+*.exe
+*.dll
+*.lib
+*.pdb
+*.zip
+*.tar
+*.gz
+*.7z
+*.rar
+
+# 7. Raw Point Cloud & Heavy Data Dumps
+coast_vertices.txt
+terrain_mask_data.txt
+vertices_sample.txt
+coast_points_final.txt
+coast_polygon_points.txt
+coast_raw_data.csv
+coastline.csv
+precise_coast.txt
+precise_segments.txt
+
+# 8. Logs & Crash Dumps
+*.log
+*.stackdump
+build_errors.txt
+build_build.log
+decoded_diff.txt
+
+# 9. Python Bytecode & Environments
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/

@@ -42,12 +42,18 @@ public:
         const std::size_t total = (std::size_t)dim_ * (std::size_t)dim_;
         heights_.assign(total, kUnset);
         present_.assign(total, 0);
+        ++levelRev_; // invalidate any cached level summaries
     }
 
     bool empty() const { return levels_.empty(); }
     int dim() const { return dim_; }
     int cellW() const { return cellW_; }
     int cellH() const { return cellH_; }
+
+    // Bumped whenever a cell's subdivision level changes (add/setLevel). Consumers that
+    // summarise levels over a region (the chunk LOD) can cache against it instead of
+    // rescanning the whole grid every frame.
+    unsigned int levelRevision() const { return levelRev_; }
 
     int levelAt(int cellX, int cellZ) const {
         if (cellX < 0 || cellZ < 0 || cellX >= cellW_ || cellZ >= cellH_) return 0;
@@ -57,6 +63,20 @@ public:
     bool any() const {
         for (unsigned char l : levels_)
             if (l > 0) return true;
+        return false;
+    }
+
+    // True if any cell in the inclusive cell box has added geometry. Used by the
+    // chunk LOD to keep refined chunks (and their neighbours) at full resolution.
+    bool anyLevelInBox(int minCellX, int minCellZ, int maxCellX, int maxCellZ) const {
+        if (empty()) return false;
+        const int loX = std::max(0, minCellX), hiX = std::min(cellW_ - 1, maxCellX);
+        const int loZ = std::max(0, minCellZ), hiZ = std::min(cellH_ - 1, maxCellZ);
+        for (int z = loZ; z <= hiZ; ++z) {
+            const std::size_t row = (std::size_t)z * (std::size_t)cellW_;
+            for (int x = loX; x <= hiX; ++x)
+                if (levels_[row + (std::size_t)x] > 0) return true;
+        }
         return false;
     }
 
@@ -82,6 +102,25 @@ public:
         if (idx >= heights_.size()) return;
         heights_[idx] = value;
         present_[idx] = 1;
+    }
+
+    // Undo support: clear a fine vertex back to "unset" (as it was before the
+    // brush seeded it) and set a cell's subdivision level directly. Both are the
+    // exact inverses of the writes add()/smooth()/set() make.
+    void clearSample(int fgx, int fgz) {
+        if (dim_ <= 0 || fgx < 0 || fgz < 0 || fgx >= dim_ || fgz >= dim_) return;
+        const std::size_t idx = (std::size_t)fgz * (std::size_t)dim_ + (std::size_t)fgx;
+        if (idx >= present_.size()) return;
+        present_[idx] = 0;
+        heights_[idx] = kUnset;
+    }
+
+    void setLevel(int cellX, int cellZ, int level) {
+        if (cellX < 0 || cellZ < 0 || cellX >= cellW_ || cellZ >= cellH_) return;
+        unsigned char& slot =
+            levels_[(std::size_t)cellZ * (std::size_t)cellW_ + (std::size_t)cellX];
+        const unsigned char v = (unsigned char)std::clamp(level, 0, kMaxLevel);
+        if (slot != v) { slot = v; ++levelRev_; }
     }
 
     // Reads the base height grid at an arbitrary grid position, bilinearly. `baseW`
@@ -141,6 +180,7 @@ public:
                 // later must not disturb vertices already sculpted at the old level.
                 const bool seed = (lvl == 0);
                 lvl = (unsigned char)level;
+                ++levelRev_;
                 ++gained;
                 gMinX = std::min(gMinX, cxi); gMaxX = std::max(gMaxX, cxi);
                 gMinZ = std::min(gMinZ, czi); gMaxZ = std::max(gMaxZ, czi);
@@ -284,6 +324,7 @@ public:
 private:
     static constexpr float kUnset = std::numeric_limits<float>::quiet_NaN();
     int cellW_ = 0, cellH_ = 0, dim_ = 0;
+    unsigned int levelRev_ = 0;
     std::vector<unsigned char> levels_;
     std::vector<float> heights_;
     std::vector<unsigned char> present_;

@@ -1,4 +1,4 @@
-#version 330 core
+#version 460 core
 out vec4 FragColor;
 
 in vec2  TexCoords;
@@ -26,6 +26,8 @@ uniform sampler2D normalMap1;
 uniform sampler2D normalMap2;
 uniform sampler2D foamTexture;
 uniform sampler2D roadMask;
+uniform sampler2D environmentMap;
+uniform vec4 environmentMapWorldRect;
 
 // Fast procedural noise for organic wave fronts and foam variation
 float hash21(vec2 p) {
@@ -49,6 +51,8 @@ void main() {
     float sunElev = lightDir.y;
     float sunVisibility = smoothstep(-0.15, 0.25, sunElev);
     float dist = length(viewPos - FragPos);
+    vec2 envUV = (FragPos.xz - environmentMapWorldRect.xy) / max(environmentMapWorldRect.zw, vec2(0.001));
+    vec4 shoreState = texture(environmentMap, envUV);
 
     // ── 1. TERRAIN & WATER DEPTH QUERY ────────────────────────────────────────
     float terrainH   = -100.0;
@@ -67,11 +71,31 @@ void main() {
 
         if (u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0) {
             vec4 waterState = texture(waterMapTex, vec2(u, v));
-            simulatedCoverage = clamp(waterState.g, 0.0, 1.0);
             simulatedKind = waterState.b;
             simulatedFlowSpeed = waterState.a;
+
+            float conn = clamp(waterState.g, 0.0, 1.0);
+            // The connected-sea mask is coarse (~55 m/cell), so extend only sea
+            // connectivity by one cell and let the fine terrain-height test set
+            // its shoreline. Explicit pools and trickles already carry fractional
+            // coverage; expanding those would flood their banks with phantom water.
+            if (simulatedKind < 1.5) {
+                vec2 wTexel = 1.0 / vec2(textureSize(waterMapTex, 0));
+                vec4 nPosX = texture(waterMapTex, vec2(u, v) + vec2(wTexel.x, 0.0));
+                vec4 nNegX = texture(waterMapTex, vec2(u, v) - vec2(wTexel.x, 0.0));
+                vec4 nPosY = texture(waterMapTex, vec2(u, v) + vec2(0.0, wTexel.y));
+                vec4 nNegY = texture(waterMapTex, vec2(u, v) - vec2(0.0, wTexel.y));
+                if (nPosX.b >= 0.5 && nPosX.b < 1.5) conn = max(conn, nPosX.g);
+                if (nNegX.b >= 0.5 && nNegX.b < 1.5) conn = max(conn, nNegX.g);
+                if (nPosY.b >= 0.5 && nPosY.b < 1.5) conn = max(conn, nPosY.g);
+                if (nNegY.b >= 0.5 && nNegY.b < 1.5) conn = max(conn, nNegY.g);
+            }
+            simulatedCoverage = clamp(conn, 0.0, 1.0);
             if (simulatedCoverage <= 0.001) discard;
-            surfaceLevel = waterState.r;
+            // Where only a dilated neighbour is connected, the centre sample holds dry
+            // ground height rather than a water surface: keep the surface flat at sea
+            // level so the depth test below is measured against real water, not land.
+            surfaceLevel = (waterState.g > 0.001) ? waterState.r : waterLevel;
 
             float normElev = texture(heightmapTex, vec2(u, v)).r;
             terrainH = hmMinElev + normElev * (hmMaxElev - hmMinElev);
@@ -260,7 +284,7 @@ void main() {
     waterLit += sunGlitter * fresnel;
 
     // ── 11. ORGANIC SHORELINE SURF WASH & DYNAMIC FOAM ────────────────────────
-    float foamTotal = 0.0;
+        float foamTotal = 0.0;
 
     if (useHeightmap == 1) {
         // Organic shoreline wave runup: waves advance towards the beach (waterDepth -> 0)
@@ -303,6 +327,9 @@ void main() {
         rawFoam = mix(rawFoam, riverRiffle, smoothstep(0.2, 0.7, isRiver));
 
         rawFoam *= (0.45 + 0.55 * foamTexturePattern);
+        // Keep the wave wash tied to the shared shoreline raster used by terrain
+        // sand and vegetation density. The wet channel remains present on water.
+        rawFoam *= mix(0.75, 1.15, max(shoreState.r, shoreState.g * 0.18));
 
         // Distance fade for foam
         float foamDistFade = 1.0 - smoothstep(100.0, 350.0, dist);
@@ -330,8 +357,9 @@ void main() {
     finalAlpha *= smoothstep(0.0, 0.6, simulatedCoverage);
 
     // ── 13. ATMOSPHERIC HORIZON FOG (Seamlessly blends water into sky) ────────
-    float oceanFogAmt = smoothstep(1200.0, 5500.0, dist);
-    oceanFogAmt = pow(oceanFogAmt, 1.35);
+    // Matches the terrain's exponential haze so the waterline, city and horizon
+    // all dissolve at the same rate. Held off to ~1.2 km like the terrain.
+    float oceanFogAmt = clamp(1.0 - exp(-max(dist - 1200.0, 0.0) * 0.0004), 0.0, 1.0);
     finalColor = mix(finalColor, skyHorizon, oceanFogAmt);
     finalAlpha = mix(finalAlpha, 1.0, oceanFogAmt);
 

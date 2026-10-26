@@ -6,6 +6,8 @@
 #include "Sky.h"
 #include "WaterSimulation.h"
 #include "WaterLevel.h"
+#include "SceneTarget.h"
+#include "SSAO.h"
 #include <unordered_map>
 
 class Game {
@@ -28,17 +30,28 @@ public:
     int activeTextureLayer = 0; // 0 = Layer 1, 1 = Layer 2
     float previewScale = 1.0f;
     float previewAngle = 0.0f;
-    int editorBrushMode = 0; // 0=Select; 1-5 sculpt; 6=Fit to road; 7=Add geometry; 8-10 paint
+    int editorBrushMode = 0; // 0=Select; 1-5 sculpt; 6=Fit to road; 7=Add geometry; 9=Flatten; 10=Level; 8-10 shared with paint
     // Subdivision exponent used by the Add Geometry brush: 1 makes each 22 m cell
     // four, 2 makes it sixteen. Exposed so it can be dialled with the brush.
     int addGeomLevel = 1;
     float brushRadius = 30.0f;
     float brushStrength = 5.0f;
+    // Brush feel: which radial falloff shape to use and how hard its core is.
+    // 0=Smooth 1=Linear 2=Spherical 3=Constant (see SculptTools::FalloffMode).
+    int sculptFalloffMode = 0;
+    float sculptHardness = 0.0f;
     float sculptAngleDegrees = 20.0f;
     float sculptGradeDegrees = 20.0f;
     glm::vec3 lastRayHitPos = glm::vec3(0.0f, -1000.0f, 0.0f);
     bool rayHitTerrain = false;
     float waterLevelAdjust = TerrainConfig::kBaseWaterLevel; // Real-time sea level in world metres
+    // Shoreline straighten tool (sculpt id 8): first endpoint captured on click one;
+    // click two applies the straightening.
+    bool shorelineHasFirstPoint = false;
+    glm::vec2 shorelineFirstPoint = glm::vec2(0.0f);
+    // Set whenever a brush/terrain edit changes heights near the coast, so the
+    // periodic water update knows to re-derive the sea mask (see WaterSimulation).
+    bool waterTerrainEdited = false;
     // ── Road Edit mode state ──
     int roadToolMode = 0;              // 0=Select Road, 1=Draw Road, 2=Edit Points
     int selectedRoadIdx = -1;
@@ -48,6 +61,9 @@ public:
     bool roadScalingSelected = false;  // select-tool: scaling selected road with = / - keys
     bool roadGraphDirty = false;
     bool roadNavigationDebugVisible = false;
+    bool vegetationMasksVisible = false;
+    int vegetationDebugMode = 0;
+    float vegetationDebugWindowMeters = 1200.0f;
     bool roadNavLanesVisible = true;
     bool roadNavConnectorsVisible = true;
     bool roadNavConflictsVisible = true;
@@ -128,6 +144,25 @@ public:
     WaterSimulation waterSim;
     int windowWidth;
     int windowHeight;
+    // Off-screen scene target that the screen-space effects (SSAO, next step) read
+    // from. When FALLAGA_SCENEFBO=0 it is bypassed and the scene renders straight to
+    // the default framebuffer, which is the A/B reference for the composite.
+    SceneTarget sceneTarget;
+    // Runtime toggle for the target (set from FALLAGA_SCENEFBO in setup()). Exposed so
+    // the capture harness can render the same frame both ways in one process, which is
+    // the only way to A/B it: separate runs are not pixel-stable.
+    bool sceneFboEnabled = true;
+    // Screen-space AO, computed from the scene target's depth texture each frame when
+    // enabled. Falls back to an identity composite whenever it cannot be set up.
+    SSAO ssao;
+    bool ssaoEnabled = true;
+    // View-space units: the terrain/roads are built on a ~4000-unit plan grid, so a
+    // sub-unit radius only catches tightly-touching geometry. 2.0 reads as contact
+    // shading at building bases and object silhouettes without washing out flat ground.
+    float ssaoRadius = 2.0f;
+    float ssaoBias = 0.03f;
+    float ssaoPower = 1.0f;
+    float ssaoStrength = 1.0f;
     double lastFrameTime;
     double deltaTime;
     double totalTime;
