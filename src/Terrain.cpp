@@ -2162,6 +2162,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           else if (isDebris) { maxDist = 350.0f; radius = 6.0f; }
 
           float maxDistSq = maxDist * maxDist;
+          const float nearKeepSq = isGrass ? (15.0f * 15.0f) : 0.0f;
           for (const auto& mat : matrices) {
               glm::vec3 pos(mat[3]); // Column 3 contains translation vector
               if ((isTree || isDebris) && environmentMap.ready()) {
@@ -2182,11 +2183,14 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
               }
               float distSq = glm::dot(pos - cam, pos - cam);
               if (distSq < maxDistSq) {
-                  bool inFrustum = true;
-                  for (int p = 0; p < 6; ++p) {
-                      if (glm::dot(glm::vec3(planes[p]), pos) + planes[p].w < -radius) {
-                          inFrustum = false;
-                          break;
+                  bool inFrustum = distSq < nearKeepSq;
+                  if (!inFrustum) {
+                      inFrustum = true;
+                      for (int p = 0; p < 6; ++p) {
+                          if (glm::dot(glm::vec3(planes[p]), pos) + planes[p].w < -radius) {
+                              inFrustum = false;
+                              break;
+                          }
                       }
                   }
                   if (inFrustum) {

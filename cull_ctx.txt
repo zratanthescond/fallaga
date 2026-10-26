@@ -1,0 +1,106 @@
+===PRE===
+ if (pos.y < waterLevelRuntime - 1.0f) continue;
+                float distSq = glm::dot(pos - cam, pos - cam);
+                if (distSq < maxDistSq) {
+                    bool inFrustum = true;
+                    for (int p = 0; p < 6; ++p) {
+                        if (glm::dot(glm::vec3(planes[p]), pos) + planes[p].w < -25.0f) {
+                            inFrustum = false;
+                            break;
+                        }
+                    }
+                    if (inFrustum) {
+                        reflMatrices.push_back(mat);
+                    }
+                }
+            }
+            if (!reflMatrices.empty()) {
+                modelShader->setFloat("vegetation", 0.0f);
+                m->renderInstanced(*modelShader, reflMatrices);
+            }
+            continue;
+        }
+
+        bool needsThisBatchRefresh = needsCullRefresh ||
+            cachedCulledBatches.find(path) == cachedCulledBatches.end();
+
+        if (needsThisBatchRefresh) {
+          
+===CURR===
+// Perform distance and frustum-based culling for ALL meshes
+          std::vector<glm::mat4> culledMatrices;
+          culledMatrices.reserve(matrices.size());
+
+          float maxDist = 2000.0f;
+          float radius = 35.0f;
+          if (isGrass) {
+            // Cull distant alpha cards before they become fill-rate waste; the
+            // placement field extends beyond this to avoid popping on movement.
+            static const float grassDrawDist = [] {
+              if (const char* e = std::getenv("FALLAGA_GRASS_DRAW_DISTANCE")) {
+                const float v = std::strtof(e, nullptr);
+                if (v > 0.0f) return v;
+              }
+              if (const char* e = std::getenv("FALLAGA_GRASS_RADIUS")) {
+                const float v = std::strtof(e, nullptr);
+                if (v > 0.0f) return v + 20.0f;
+              }
+              // Alpha-tested plant cards are fill-rate bound at this scale.
+              // Let terrain haze carry the distant landscape instead of drawing
+              // thousands of nearly sub-pixel leaves past the useful range.
+              return 76.0f;
+            }();
+            maxDist = grassDrawDist;
+            radius = 3.0f;
+          }
+          else if (isTree) {
+            static const float treeDrawDist = [] {
+              if (const char* e = std::getenv("FALLAGA_TREE_RADIUS")) {
+                const float value = std::strtof(e, nullptr);
+                if (value > 0.0f) return value;
+              }
+              return 1600.0f; // terrain haze is already strong beyond this range
+            }();
+            maxDist = treeDrawDist;
+            radius = 25.0f;
+          }
+          else if (isDebris) { maxDist = 350.0f; radius = 6.0f; }
+
+          float maxDistSq = maxDist * maxDist;
+          for (const auto& mat : matrices) {
+              glm::vec3 pos(mat[3]); // Column 3 contains translation vector
+              if ((isTree || isDebris) && environmentMap.ready()) {
+                  const float waterFactor =
+                      environmentMap.vegetationFactor(pos.x, pos.z);
+                  if (waterFactor <= 0.01f) continue;
+                  // Existing procedural/cache batches can outlive a shore-map
+                  // rebuild. Apply the same deterministic beach thinning at
+                  // visibility refresh so stale trees cannot remain on sand.
+                  const int plantX = static_cast<int>(std::floor(pos.x * 10.0f));
+                  const int plantZ = static_cast<int>(std::floor(pos.z * 10.0f));
+                  if (waterFactor < 1.0f &&
+                      grassHash01(plantX, plantZ, 71u) > waterFactor)
+                      continue;
+                  if (vegetationMasks.ready() &&
+                      vegetationMasks.blockedAt(pos.x, pos.z))
+                      continue;
+              }
+              float distSq = glm::dot(pos - cam, pos - cam);
+              if (distSq < maxDistSq) {
+                  bool inFrustum = true;
+                  for (int p = 0; p < 6; ++p) {
+                      if (glm::dot(glm::vec3(planes[p]), pos) + planes[p].w < -radius) {
+                          inFrustum = false;
+                          break;
+                      }
+                  }
+                  if (inFrustum) {
+                      culledMatrices.push_back(mat);
+                  }
+              }
+          }
+
+          cachedCulledBatches[path] = std::move(culledMatrices);
+        }
+
+        std::v
