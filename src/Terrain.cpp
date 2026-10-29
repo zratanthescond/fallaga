@@ -2044,8 +2044,8 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     // matter, or periodically as a fallback (catches rotation-only changes
     // that a position-only check would miss). Otherwise reuse last frame's
     // culled instance lists and skip re-uploading GPU buffers entirely.
-    const float CULL_REFRESH_DIST = 8.0f;
-    const int CULL_REFRESH_MAX_FRAMES = 12;
+    const float CULL_REFRESH_DIST = 3.0f;
+    const int CULL_REFRESH_MAX_FRAMES = 4;
     // A position-only cache misses camera turns: the frustum changes while the
     // player is stationary, leaving the old foliage visibility set in place.
     // Refresh after a small accumulated turn so nearby plants enter/leave the
@@ -2061,8 +2061,8 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
     }
     bool needsCullRefresh = !isReflectionPass && (dataChanged || cachedCulledBatches.empty() ||
                             glm::distance(cam, lastCullCamPos) > CULL_REFRESH_DIST ||
-                            (cullViewChanged && cullFrameCounter >= 2) ||
-                            cullFrameCounter >= CULL_REFRESH_MAX_FRAMES);
+                            cullViewChanged ||
+                            cullFrameCounter >= 2);
     if (needsCullRefresh && !isReflectionPass) {
       lastCullCamPos = cam;
       lastCullCamForward = camForward;
@@ -2080,8 +2080,9 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
                          path.find("rubble") != std::string::npos);
         bool isTree = (path.find("Tree") != std::string::npos ||
                        path.find("tree") != std::string::npos);
-        bool isGrass = (path.find("grass") != std::string::npos ||
-                        path.find("Grass") != std::string::npos);
+        std::string lowerPath = path;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::tolower);
+        bool isGrass = (lowerPath.find("grass") != std::string::npos);
 
         // In water reflection, skip grass, clutter, and trees entirely (only reflect city structures)
         if (isReflectionPass && (isGrass || isDebris || isTree)) {
@@ -2122,33 +2123,33 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
             cachedCulledBatches.find(path) == cachedCulledBatches.end();
 
         if (needsThisBatchRefresh) {
-          // Perform distance and frustum-based culling for ALL meshes
-          std::vector<glm::mat4> culledMatrices;
-          culledMatrices.reserve(matrices.size());
+        // Perform distance and frustum-based culling for ALL meshes
+        std::vector<glm::mat4> culledMatrices;
+        culledMatrices.reserve(matrices.size());
 
-          float maxDist = 2000.0f;
-          float radius = 35.0f;
-          if (isGrass) {
-            // Cull distant alpha cards before they become fill-rate waste; the
-            // placement field extends beyond this to avoid popping on movement.
-            static const float grassDrawDist = [] {
-              if (const char* e = std::getenv("FALLAGA_GRASS_DRAW_DISTANCE")) {
-                const float v = std::strtof(e, nullptr);
-                if (v > 0.0f) return v;
-              }
-              if (const char* e = std::getenv("FALLAGA_GRASS_RADIUS")) {
-                const float v = std::strtof(e, nullptr);
-                if (v > 0.0f) return v + 20.0f;
-              }
-              // Alpha-tested plant cards are fill-rate bound at this scale.
-              // Let terrain haze carry the distant landscape instead of drawing
-              // thousands of nearly sub-pixel leaves past the useful range.
-              return 76.0f;
-            }();
-            maxDist = grassDrawDist;
-            radius = 3.0f;
-          }
-          else if (isTree) {
+        float maxDist = 2000.0f;
+        float radius = 35.0f;
+        if (isGrass) {
+          // Cull distant alpha cards before they become fill-rate waste; the
+          // placement field extends beyond this to avoid popping on movement.
+          static const float grassDrawDist = [] {
+            if (const char* e = std::getenv("FALLAGA_GRASS_DRAW_DISTANCE")) {
+              const float v = std::strtof(e, nullptr);
+              if (v > 0.0f) return v;
+            }
+            if (const char* e = std::getenv("FALLAGA_GRASS_RADIUS")) {
+              const float v = std::strtof(e, nullptr);
+              if (v > 0.0f) return v + 20.0f;
+            }
+            // Alpha-tested plant cards are fill-rate bound at this scale.
+            // Let terrain haze carry the distant landscape instead of drawing
+            // thousands of nearly sub-pixel leaves past the useful range.
+            return 120.0f;
+          }();
+          maxDist = grassDrawDist;
+          radius = 12.0f;
+        }
+        else if (isTree) {
             static const float treeDrawDist = [] {
               if (const char* e = std::getenv("FALLAGA_TREE_RADIUS")) {
                 const float value = std::strtof(e, nullptr);
@@ -2162,7 +2163,7 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
           else if (isDebris) { maxDist = 350.0f; radius = 6.0f; }
 
           float maxDistSq = maxDist * maxDist;
-          const float nearKeepSq = isGrass ? (15.0f * 15.0f) : 0.0f;
+          const float nearKeepSq = isGrass ? (60.0f * 60.0f) : 0.0f;
           for (const auto& mat : matrices) {
               glm::vec3 pos(mat[3]); // Column 3 contains translation vector
               if ((isTree || isDebris) && environmentMap.ready()) {
@@ -2219,10 +2220,10 @@ void Terrain::renderOpaque(const glm::mat4 &proj, const glm::mat4 &view,
         modelShader->setFloat("vegetation", (isGrass || isTree) ? 1.0f : 0.0f);
         modelShader->setBool("treeWind", isTree);
         if (isGrass) {
-          m->renderInstanced(*modelShader, culledMatrices, needsThisBatchRefresh,
-                             [this](float x, float z) {
-                               return environmentMap.riparian(x, z);
-                             }, cam);
+        m->renderInstanced(*modelShader, culledMatrices, true,
+                           [this](float x, float z) {
+                             return environmentMap.riparian(x, z);
+                           }, cam);
         } else {
           m->renderInstanced(*modelShader, culledMatrices, needsThisBatchRefresh);
         }
@@ -3402,7 +3403,7 @@ bool Terrain::updateGrassField(const glm::vec3& cam,
   const float cellDensityScale = glm::clamp((0.72f / cell) * (0.72f / cell),
                                             0.10f, 2.5f);
   const float density = std::min(1.0f, envf("FALLAGA_GRASS_DENSITY", 0.72f));
-  const float rebuild = envf("FALLAGA_GRASS_REBUILD", 70.0f);
+  const float rebuild = envf("FALLAGA_GRASS_REBUILD", 200.0f);
   const bool useMasks = envf("FALLAGA_GRASS_MASKS", 1.0f) > 0.5f;
   const float farThin = std::min(1.0f, envf("FALLAGA_GRASS_FARTHIN", 0.18f));
   const int maxInstances = static_cast<int>(envf("FALLAGA_GRASS_MAX", 400000.0f));
@@ -3425,14 +3426,8 @@ bool Terrain::updateGrassField(const glm::vec3& cam,
 
     grassBuildActive = true;
     // Build ahead of camera to reduce popping while moving.
-    const float buildAhead = envf("FALLAGA_GRASS_BUILD_AHEAD", 0.30f);
+    const float buildAhead = envf("FALLAGA_GRASS_BUILD_AHEAD", 0.10f);
     glm::vec3 buildCenter = cam;
-    // Approximate forward if we don't have it; just offset along movement dir or
-    // keep camera. Use velocity-less offset: shift along +z in local? Or just move
-    // build point slightly forward by radius*buildAhead along camera's view; we
-    // don't have view here, so offset along current velocity direction using last
-    // movement? Alternatively just use cam and rely on rebuild threshold; better
-    // offset based on movement direction.
     if (mdx * mdx + mdz * mdz > 1e-4f) {
       const float len = std::sqrt(mdx * mdx + mdz * mdz);
       buildCenter = cam + glm::vec3(mdx / len, 0.0f, mdz / len) * radius * buildAhead;

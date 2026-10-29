@@ -1239,42 +1239,29 @@ void ObjModel::renderInstanced(Shader& shader, const std::vector<glm::mat4>& ins
                 meshInstances[flowerHeadBucket].push_back(headMatrix);
             };
 
-            struct DetailCandidate {
-                size_t instanceIndex;
-                float distanceSquared;
-            };
-            std::vector<DetailCandidate> detailCandidates;
-            const float heroRadiusSquared = 30.0f * 30.0f;
+            // Hero specimens: a FIXED subset of instances chosen by world-position
+            // hash, so the choice never changes when the camera moves.
+            const float heroRadiusSquared = 90.0f * 90.0f;
+            const float heroFraction = 0.02f;
             const size_t noBucket = std::numeric_limits<size_t>::max();
             std::vector<size_t> detailBucketForInstance(instanceMatrices.size(), noBucket);
 
-            // Every scanned mesh gets a nearby representative whenever the
-            // field has enough placements. Interleave detail and light meshes
-            // so all 17 supplied specimens are visible around the player, while
-            // each still replaces the ordinary model at that location.
             if (isScannedPlantPack && !detailBuckets.empty()) {
-                for (size_t i = 0; i < instanceMatrices.size(); ++i) {
-                    const glm::vec3 pos(instanceMatrices[i][3]);
-                    const glm::vec3 delta = pos - cameraPosition;
-                    const float distanceSquared = glm::dot(delta, delta);
-                    if (distanceSquared <= heroRadiusSquared)
-                        detailCandidates.push_back({i, distanceSquared});
-                }
-                std::sort(detailCandidates.begin(), detailCandidates.end(),
-                    [](const DetailCandidate& a, const DetailCandidate& b) {
-                        return a.distanceSquared < b.distanceSquared;
-                    });
                 std::vector<size_t> visibleBuckets;
                 visibleBuckets.reserve(grassVariants.size());
                 for (size_t i = 0; i < std::max(detailBuckets.size(), regularBuckets.size()); ++i) {
                     if (i < detailBuckets.size()) visibleBuckets.push_back(detailBuckets[i]);
                     if (i < regularBuckets.size()) visibleBuckets.push_back(regularBuckets[i]);
                 }
-                const size_t selectedCount =
-                    std::min(detailCandidates.size(), visibleBuckets.size());
-                for (size_t i = 0; i < selectedCount; ++i) {
-                    const size_t bucket = visibleBuckets[i];
-                    detailBucketForInstance[detailCandidates[i].instanceIndex] = bucket;
+                for (size_t i = 0; i < instanceMatrices.size(); ++i) {
+                    const glm::vec3 pos(instanceMatrices[i][3]);
+                    const glm::vec3 delta = pos - cameraPosition;
+                    if (glm::dot(delta, delta) > heroRadiusSquared) continue;
+                    if (speciesHash01(pos + glm::vec3(31.0f, 0.0f, 17.0f)) >= heroFraction) continue;
+                    const float pick = speciesHash01(pos + glm::vec3(-53.0f, 0.0f, 89.0f));
+                    detailBucketForInstance[i] = visibleBuckets[std::min(
+                        visibleBuckets.size() - 1,
+                        static_cast<size_t>(pick * static_cast<float>(visibleBuckets.size())))];
                 }
             }
 
